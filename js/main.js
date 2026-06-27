@@ -58,8 +58,10 @@ import {
 // Register callbacks for websocket.js
 // (avoids circular dependency: websocket -> panel -> websocket)
 import { configFiles } from './panel.js';
+import { initLidarPanel } from './lidar.js';
 registerSetActiveDevice(setActiveDevice);
 registerAvailableConfigs(configFiles);
+try { initLidarPanel(); } catch (e) { console.error('LiDAR panel init failed:', e); }
 
 // Start collision Web Worker (falls back to main thread if unavailable)
 initCollisionWorker();

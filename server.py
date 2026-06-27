@@ -218,6 +218,14 @@ def create_app(config_path=None):
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/", index_handler)
 
+    # LiDAR workflow API (cloud/splat generation, projects) — registered before
+    # the static catch-all so the /api/* routes win.
+    try:
+        import lidar_jobs
+        lidar_jobs.register_routes(app)
+    except Exception as e:  # pragma: no cover - keep the viewer usable if jobs fail to load
+        logging.getLogger("server").warning(f"LiDAR workflow routes unavailable: {e}")
+
     app.router.add_static("/", ROOT, show_index=False)
     return app
 

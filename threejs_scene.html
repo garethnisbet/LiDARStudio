@@ -3,11 +3,18 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Meca500 Robot - Three.js FK/IK Viewer</title>
+<title>LidarStudio — Point Cloud &amp; Splat Editor</title>
 <link rel="stylesheet" href="viewer.css">
+<style>
+  /* LidarStudio is forked from a robot viewer; hide the robot-only controls.
+     (Kept in the DOM so existing JS getElementById calls don't break.) */
+  #device-manager, #primary-model-row, #add-device-row, #device-parent,
+  #panel-title, #joint-sliders, #virtual-angles-container,
+  #resetBtn, #demoBtn, #ikBtn, #ik-panel { display: none !important; }
+</style>
 </head>
 <body>
-<div id="loading">Loading robot model...</div>
+<div id="loading">Loading…</div>
 <canvas id="nav-gizmo"></canvas>
 <div id="ws-status" title="Click for connection info"><span class="dot off" id="ws-dot"></span><span id="ws-text">API: not connected</span></div>
 <div id="ws-info-panel" hidden>
