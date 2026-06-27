@@ -5,8 +5,13 @@
 
 import { loadPLYFile } from './stl.js';
 import * as State from './state.js';
+import * as THREE from 'three';
 
 const DEFAULT_PROJECT = '/home/gareth';
+
+// Maps an in-scene object name -> its server-side .ply path, so edits can be
+// run on the full file in Python (objects loaded from disk only).
+const objPaths = {};
 
 async function api(path, body) {
   const res = await fetch(path, {
@@ -26,8 +31,9 @@ async function loadPlyFromServer(path, name) {
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`load failed: ${resp.status}`);
   const blob = await resp.blob();
-  const file = new File([blob], name || path.split('/').pop(),
-                        { type: 'application/octet-stream' });
+  const fname = name || path.split('/').pop();
+  const file = new File([blob], fname, { type: 'application/octet-stream' });
+  objPaths[fname.replace(/\.ply$/i, '')] = path;   // entry.name is the basename
   loadPLYFile(file);
   State.requestRender && State.requestRender();
 }
@@ -48,11 +54,11 @@ export function initLidarPanel() {
   if (document.getElementById('lidar-panel')) return;
 
   const css = `
-  #lidar-toggle{position:fixed;top:10px;left:10px;z-index:30;background:#1b2330;color:#cfe;
-    border:1px solid #3a4a63;border-radius:6px;padding:6px 12px;font:600 13px system-ui;cursor:pointer}
-  #lidar-panel{position:fixed;top:46px;left:10px;z-index:30;width:310px;max-height:86vh;overflow:auto;
-    background:rgba(20,26,36,.96);color:#cdd6e3;border:1px solid #3a4a63;border-radius:8px;
-    padding:12px;font:13px system-ui;display:none}
+  #lidar-head{cursor:pointer;user-select:none;display:flex;justify-content:space-between;
+    align-items:center;font:700 12px system-ui;letter-spacing:.04em;text-transform:uppercase;
+    color:#9cf;padding:6px 0}
+  #lidar-panel{color:#cdd6e3;font:13px system-ui;padding-bottom:10px;margin-bottom:8px;
+    border-bottom:1px solid #2a3344}
   #lidar-panel h4{margin:10px 0 6px;font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:#8aa}
   #lidar-panel input,#lidar-panel select{width:100%;box-sizing:border-box;background:#0f1620;color:#dfe;
     border:1px solid #324a5e;border-radius:5px;padding:6px;margin:3px 0;font:12px monospace}
@@ -70,10 +76,6 @@ export function initLidarPanel() {
   #ls-log{font:10px/1.4 monospace;color:#9fb;background:#0c121b;border-radius:5px;padding:6px;
     margin-top:6px;max-height:120px;overflow:auto;white-space:pre-wrap;display:none}`;
   document.head.append(el('style', {}, css));
-
-  const toggle = el('button', { id: 'lidar-toggle',
-    onclick: () => { panel.style.display = panel.style.display === 'none' ? 'block' : 'none'; } },
-    'LiDAR');
 
   // ── Library (existing outputs) ──
   const projectInput = el('input', { id: 'ls-project', value: DEFAULT_PROJECT });
@@ -144,6 +146,72 @@ export function initLidarPanel() {
     } catch (err) { setBar(0, 'ERROR: ' + err.message); genBtn.disabled = false; }
   };
 
+  // ── Edit (operates on the selected cloud/splat) ──
+  const editOp = el('select', {},
+    el('option', { value: 'decimate' }, 'Decimate (keep 1-in-N)'),
+    el('option', { value: 'denoise_sor' }, 'Denoise (remove outliers)'),
+    el('option', { value: 'crop' }, 'Crop to box'));
+  const facInput = el('input', { type: 'number', min: '2', step: '1', value: '2' });
+  const sorNb = el('input', { type: 'number', min: '4', step: '1', value: '20' });
+  const sorStd = el('input', { type: 'number', min: '0.5', step: '0.25', value: '2' });
+  const cMin = ['x', 'y', 'z'].map(() => el('input', { type: 'number', step: '0.1' }));
+  const cMax = ['x', 'y', 'z'].map(() => el('input', { type: 'number', step: '0.1' }));
+  const invCb = el('input', { type: 'checkbox' });
+  const editStat = el('div', { class: 'muted' }, 'Select a loaded object to edit.');
+
+  const pDec = el('div', { class: 'row' }, el('label', { class: 'muted', style: 'flex:1' }, 'N', facInput));
+  const pSor = el('div', { class: 'row' },
+    el('label', { class: 'muted', style: 'flex:1' }, 'neighbours', sorNb),
+    el('label', { class: 'muted', style: 'flex:1' }, 'std', sorStd));
+  const fillBtn = el('button', { class: 'act', style: 'margin-top:2px',
+    onclick: () => {
+      const e = State.selectedSTL;
+      if (!e) { editStat.textContent = 'Select an object first.'; return; }
+      const b = new THREE.Box3().setFromObject(e.mesh);
+      if (b.isEmpty()) { editStat.textContent = 'Could not read bounds; enter manually.'; return; }
+      cMin.forEach((inp, i) => inp.value = b.min.getComponent(i).toFixed(2));
+      cMax.forEach((inp, i) => inp.value = b.max.getComponent(i).toFixed(2));
+    } }, 'Fill bounds from selection');
+  const pCrop = el('div', {},
+    el('div', { class: 'row' }, el('span', { class: 'muted', style: 'width:28px' }, 'min'), ...cMin),
+    el('div', { class: 'row' }, el('span', { class: 'muted', style: 'width:28px' }, 'max'), ...cMax),
+    el('label', { class: 'muted' }, invCb, ' keep outside (delete inside)'),
+    fillBtn);
+  const showOp = () => {
+    pDec.style.display = editOp.value === 'decimate' ? 'flex' : 'none';
+    pSor.style.display = editOp.value === 'denoise_sor' ? 'flex' : 'none';
+    pCrop.style.display = editOp.value === 'crop' ? 'block' : 'none';
+  };
+  editOp.addEventListener('change', showOp);
+  const applyEditBtn = el('button', { class: 'act' }, 'Apply edit');
+
+  applyEditBtn.onclick = async () => {
+    const entry = State.selectedSTL;
+    if (!entry) { editStat.textContent = 'Select an object in the list first.'; return; }
+    const srcPath = objPaths[entry.name];
+    if (!srcPath) { editStat.textContent = 'Edit needs a file: load it from the Library or generate it.'; return; }
+    const op = editOp.value;
+    let params = {};
+    if (op === 'decimate') params = { factor: parseInt(facInput.value) || 2 };
+    else if (op === 'denoise_sor') params = { nb_neighbors: parseInt(sorNb.value) || 20, std_ratio: parseFloat(sorStd.value) || 2 };
+    else if (op === 'crop') params = {
+      min: cMin.map(i => parseFloat(i.value)), max: cMax.map(i => parseFloat(i.value)),
+      invert: invCb.checked,
+    };
+    if (op === 'crop' && params.min.concat(params.max).some(v => !isFinite(v))) {
+      editStat.textContent = 'Fill in the crop box bounds first.'; return;
+    }
+    applyEditBtn.disabled = true; editStat.textContent = `Applying ${op}…`;
+    const li = State.selectedListItem;
+    try {
+      const r = await api('/api/edit/apply', { path: srcPath, op, params });
+      editStat.textContent = `Kept ${r.kept.toLocaleString()} / ${r.total.toLocaleString()} — reloading`;
+      await loadPlyFromServer(r.output, r.output.split('/').pop());
+      if (li) li.querySelector('button[title="Remove"]')?.click();  // drop the pre-edit object
+    } catch (e) { editStat.textContent = 'Error: ' + e.message; }
+    applyEditBtn.disabled = false;
+  };
+
   const panel = el('div', { id: 'lidar-panel' },
     el('h4', {}, 'Library'),
     projectInput,
@@ -155,8 +223,22 @@ export function initLidarPanel() {
     el('div', { class: 'row' },
       el('label', { class: 'muted', style: 'flex:1' }, 'voxel', voxelInput),
       el('label', { class: 'muted', style: 'flex:1' }, 'noise σ', sorInput)),
-    genBtn, barWrap, logBox);
+    genBtn, barWrap, logBox,
+    el('h4', {}, 'Edit selected'),
+    editStat, editOp, pDec, pSor, pCrop, applyEditBtn);
+  showOp();
 
-  document.body.append(toggle, panel);
+  // Mount inside the existing right-side control panel as a collapsible section
+  // (no separate floating bar).
+  const arrow = el('span', {}, '▾');
+  const head = el('div', { id: 'lidar-head', onclick: () => {
+    const hidden = panel.style.display === 'none';
+    panel.style.display = hidden ? 'block' : 'none';
+    arrow.textContent = hidden ? '▾' : '▸';
+  } }, el('span', {}, 'LiDAR Workflow'), arrow);
+
+  const host = document.getElementById('panel') || document.body;
+  host.insertBefore(panel, host.firstChild);
+  host.insertBefore(head, panel);
   refresh();
 }

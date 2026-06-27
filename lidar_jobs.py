@@ -587,11 +587,42 @@ async def project_outputs_handler(request):
     return web.json_response(_list_outputs(p))
 
 
+async def edit_apply_handler(request):
+    """POST /api/edit/apply — run one edit op on a cloud/splat PLY.
+
+    Body: {path, op, params, [output]}.  Writes a sibling *_edited.ply (chained
+    edits overwrite it) and returns the edit summary so the UI can reload it.
+    """
+    data = await request.json()
+    path = (data.get("path") or "").strip()
+    op = data.get("op")
+    params = data.get("params", {})
+    if not path or not op:
+        return web.json_response({"error": "path and op required"}, status=400)
+    src = Path(path)
+    if not src.exists():
+        return web.json_response({"error": "file not found"}, status=404)
+
+    # <name>_edited.ply, re-editing the edited file in place (original untouched).
+    stem = src.stem[:-7] if src.stem.endswith("_edited") else src.stem
+    out = data.get("output") or str(src.with_name(f"{stem}_edited.ply"))
+
+    try:
+        import edit_ops
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, edit_ops.apply_edit, str(src), out, op, params)
+        return web.json_response(result)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
 # ── Route registration ──────────────────────────────────────────────────────
 # LidarStudio hosts the viewer at "/" and owns the static handler, so we attach
 # only the LiDAR workflow's /api/* endpoints onto the shared aiohttp app.
 
 def register_routes(app: web.Application) -> None:
+    app.router.add_post("/api/edit/apply", edit_apply_handler)
     app.router.add_post("/api/browse", browse_handler)
     app.router.add_post("/api/browse/dir", browse_dir_handler)
     app.router.add_post("/api/project/create", project_create_handler)

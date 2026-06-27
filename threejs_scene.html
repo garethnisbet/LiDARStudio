@@ -10,7 +10,10 @@
      (Kept in the DOM so existing JS getElementById calls don't break.) */
   #device-manager, #primary-model-row, #add-device-row, #device-parent,
   #panel-title, #joint-sliders, #virtual-angles-container,
-  #resetBtn, #demoBtn, #ikBtn, #ik-panel { display: none !important; }
+  #resetBtn, #demoBtn, #ikBtn, #ik-panel,
+  /* robot-control API status bar + robot/scene toggles not needed for editing */
+  #ws-status, #ws-info-panel,
+  #labelBtn, #chainBtn, #originsBtn, #collisionBtn, #floorCollisionBtn { display: none !important; }
 </style>
 </head>
 <body>
