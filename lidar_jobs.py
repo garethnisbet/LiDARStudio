@@ -617,12 +617,35 @@ async def edit_apply_handler(request):
         return web.json_response({"error": str(exc)}, status=500)
 
 
+async def edit_recolour_handler(request):
+    """POST /api/edit/recolour — re-project a scan's photos onto a cloud/splat."""
+    data = await request.json()
+    path = (data.get("path") or "").strip()
+    scan = (data.get("scan_path") or "").strip()
+    if not path or not scan:
+        return web.json_response({"error": "path and scan_path required"}, status=400)
+    src = Path(path)
+    if not src.exists():
+        return web.json_response({"error": "file not found"}, status=404)
+    stem = src.stem[:-12] if src.stem.endswith("_recoloured") else src.stem
+    out = data.get("output") or str(src.with_name(f"{stem}_recoloured.ply"))
+    try:
+        import edit_ops
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, edit_ops.recolour, str(src), out, scan)
+        return web.json_response(result)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
 # ── Route registration ──────────────────────────────────────────────────────
 # LidarStudio hosts the viewer at "/" and owns the static handler, so we attach
 # only the LiDAR workflow's /api/* endpoints onto the shared aiohttp app.
 
 def register_routes(app: web.Application) -> None:
     app.router.add_post("/api/edit/apply", edit_apply_handler)
+    app.router.add_post("/api/edit/recolour", edit_recolour_handler)
     app.router.add_post("/api/browse", browse_handler)
     app.router.add_post("/api/browse/dir", browse_dir_handler)
     app.router.add_post("/api/project/create", project_create_handler)

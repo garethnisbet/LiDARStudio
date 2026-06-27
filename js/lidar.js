@@ -150,7 +150,8 @@ export function initLidarPanel() {
   const editOp = el('select', {},
     el('option', { value: 'decimate' }, 'Decimate (keep 1-in-N)'),
     el('option', { value: 'denoise_sor' }, 'Denoise (remove outliers)'),
-    el('option', { value: 'crop' }, 'Crop to box'));
+    el('option', { value: 'crop' }, 'Crop to box'),
+    el('option', { value: 'recolour' }, 'Recolour from scan photos'));
   const facInput = el('input', { type: 'number', min: '2', step: '1', value: '2' });
   const sorNb = el('input', { type: 'number', min: '4', step: '1', value: '20' });
   const sorStd = el('input', { type: 'number', min: '0.5', step: '0.25', value: '2' });
@@ -177,10 +178,14 @@ export function initLidarPanel() {
     el('div', { class: 'row' }, el('span', { class: 'muted', style: 'width:28px' }, 'max'), ...cMax),
     el('label', { class: 'muted' }, invCb, ' keep outside (delete inside)'),
     fillBtn);
+  const pRecol = el('div', { class: 'muted' },
+    'Re-projects the photos from the Scan folder (Generate section) onto the '
+    + 'selected cloud using its saved trajectory. Set that field first.');
   const showOp = () => {
     pDec.style.display = editOp.value === 'decimate' ? 'flex' : 'none';
     pSor.style.display = editOp.value === 'denoise_sor' ? 'flex' : 'none';
     pCrop.style.display = editOp.value === 'crop' ? 'block' : 'none';
+    pRecol.style.display = editOp.value === 'recolour' ? 'block' : 'none';
   };
   editOp.addEventListener('change', showOp);
   const applyEditBtn = el('button', { class: 'act' }, 'Apply edit');
@@ -191,6 +196,22 @@ export function initLidarPanel() {
     const srcPath = objPaths[entry.name];
     if (!srcPath) { editStat.textContent = 'Edit needs a file: load it from the Library or generate it.'; return; }
     const op = editOp.value;
+
+    if (op === 'recolour') {
+      const scan = scanInput.value.trim();
+      if (!scan) { editStat.textContent = 'Set the Scan folder (Generate section) first.'; return; }
+      applyEditBtn.disabled = true; editStat.textContent = 'Recolouring (multi-view)…';
+      const li = State.selectedListItem;
+      try {
+        const r = await api('/api/edit/recolour', { path: srcPath, scan_path: scan });
+        editStat.textContent = `Coloured ${r.coloured.toLocaleString()} / ${r.total.toLocaleString()} — reloading`;
+        await loadPlyFromServer(r.output, r.output.split('/').pop());
+        if (li) li.querySelector('button[title="Remove"]')?.click();
+      } catch (e) { editStat.textContent = 'Error: ' + e.message; }
+      applyEditBtn.disabled = false;
+      return;
+    }
+
     let params = {};
     if (op === 'decimate') params = { factor: parseInt(facInput.value) || 2 };
     else if (op === 'denoise_sor') params = { nb_neighbors: parseInt(sorNb.value) || 20, std_ratio: parseFloat(sorStd.value) || 2 };
@@ -225,7 +246,7 @@ export function initLidarPanel() {
       el('label', { class: 'muted', style: 'flex:1' }, 'noise σ', sorInput)),
     genBtn, barWrap, logBox,
     el('h4', {}, 'Edit selected'),
-    editStat, editOp, pDec, pSor, pCrop, applyEditBtn);
+    editStat, editOp, pDec, pSor, pCrop, pRecol, applyEditBtn);
   showOp();
 
   // Mount inside the existing right-side control panel as a collapsible section

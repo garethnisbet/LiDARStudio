@@ -67,3 +67,61 @@ def apply_edit(in_path, out_path, op, params):
 
     return {"kind": kind, "total": int(n), "kept": int(len(keep)),
             "removed": int(n - len(keep)), "output": str(out_path)}
+
+
+def _find_traj(path):
+    """Locate the trajectory sidecar for a cloud/splat (handles _edited names)."""
+    p = Path(path)
+    base = p.stem
+    for suf in ("_edited", "_recoloured"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+    for cand in (Path(str(p) + ".traj.npz"),
+                 p.with_name(base + ".ply.traj.npz")):
+        if cand.exists():
+            return cand
+    return None
+
+
+def recolour(in_path, out_path, scan_path, camera="front",
+             image_rot="ccw", colour_range=20.0):
+    """Re-project the scan's photos onto a cloud/splat (multi-view, occlusion-aware).
+
+    Uses the saved KISS-ICP trajectory + the scan's fisheye images — the same
+    colouring the generator does, so an edited/trimmed cloud can be recoloured.
+    """
+    import numpy as np
+    import process_pointcloud as ppc
+
+    pts, kind, obj = _load(in_path)
+    traj_path = _find_traj(in_path)
+    if traj_path is None:
+        raise FileNotFoundError("no trajectory sidecar found for this cloud "
+                                "(recolour needs the generated cloud's .traj.npz)")
+    traj = np.load(traj_path)
+    poses, ts = traj["poses"], traj["ts"]
+
+    scan = Path(scan_path)
+    calib = ppc.load_calibration(scan / "calibration", camera)
+    img_bags = sorted(scan.glob("IMAGE_*.bag")) or sorted(scan.glob("*.bag"))
+    img_bag = next((b for b in img_bags if "IMAGE" in b.name.upper()), None)
+    if img_bag is None:
+        raise FileNotFoundError(f"no IMAGE_*.bag in {scan}")
+
+    rgb, n_col = ppc.colour_points_multiview(
+        pts, poses, ts, img_bag, calib, camera=camera,
+        image_rot=image_rot, max_range=colour_range)
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    if kind == "splat":
+        from splat_io import save_splat
+        data = obj.copy()
+        dc = ((rgb.astype(np.float32) / 255.0) - 0.5) / 0.28209479177387814
+        for i in range(3):
+            data[f"f_dc_{i}"] = dc[:, i]
+        save_splat(out_path, data)
+    else:
+        ppc.write_ply(Path(out_path), pts, rgb)
+
+    return {"kind": kind, "total": int(len(pts)), "coloured": int(n_col),
+            "output": str(out_path)}
