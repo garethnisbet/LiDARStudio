@@ -1,0 +1,24 @@
+[project]
+name = "robot-visualisation"
+version = "0.1.0"
+description = "Meca500 Robot 3D Visualisation — Three.js WebSocket viewer"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9",
+]
+
+[project.scripts]
+robot-vis = "server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+include = [
+    "server.py",
+    "threejs_scene.html",
+    "robot_scene.glb",
+    "stl_files/**",
+]

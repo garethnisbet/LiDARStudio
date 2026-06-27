@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Meca500 Robot - Three.js FK/IK Viewer</title>
+<link rel="stylesheet" href="viewer.css">
+</head>
+<body>
+<div id="loading">Loading robot model...</div>
+<canvas id="nav-gizmo"></canvas>
+<div id="ws-status" title="Click for connection info"><span class="dot off" id="ws-dot"></span><span id="ws-text">API: not connected</span></div>
+<div id="ws-info-panel" hidden>
+  <div class="wsi-row">
+    <span class="wsi-label">Session ID</span>
+    <code id="wsi-session" class="wsi-val"></code>
+    <button class="wsi-copy" data-copy="wsi-session" title="Copy">⎘</button>
+  </div>
+  <div class="wsi-row">
+    <span class="wsi-label">Example</span>
+    <code id="wsi-cmd" class="wsi-val"></code>
+    <button class="wsi-copy" data-copy="wsi-cmd" title="Copy">⎘</button>
+  </div>
+  <div class="wsi-divider"></div>
+  <a id="wsi-download" href="/RemoteAPI.zip" download="RemoteAPI.zip">
+    ↓ Download RemoteAPI.zip
+  </a>
+</div>
+<div id="panel">
+  <button id="exitVRBtn" style="display:none; background:#622; border-color:#944; color:#faa;">Exit VR</button>
+  <div id="device-manager">
+    <div id="primary-model-row">
+      <label style="font-size:11px; color:#889;">Primary:</label>
+      <select id="primaryModelSelect"></select>
+    </div>
+    <div id="device-list"></div>
+    <div id="add-device-row">
+      <select id="addDeviceSelect"></select>
+      <button id="addDeviceBtn" title="Add device to scene">+</button>
+    </div>
+    <button id="moveDeviceBtn" style="margin-top:4px;">Move Device Origin</button>
+    <div id="device-mode" style="display:none; margin-top:4px;">
+      <div style="display:flex; gap:4px;">
+        <button id="devModeT" class="active" style="flex:1; margin:0;">Move</button>
+        <button id="devModeR" style="flex:1; margin:0;">Rotate</button>
+        <button id="devSpaceBtn" style="flex:1; margin:0;">World</button>
+      </div>
+      <div style="display:flex; gap:4px; margin-top:4px;">
+        <button id="devResetPos" style="flex:1; margin:0; padding:4px 0; font-size:11px;">Reset Position</button>
+        <button id="devResetOri" style="flex:1; margin:0; padding:4px 0; font-size:11px;">Reset Orientation</button>
+      </div>
+      <div id="dev-numeric" style="margin-top:6px; font-size:11px; color:#889;">
+        <div style="display:grid; grid-template-columns:18px 1fr 18px 1fr 18px 1fr; align-items:center; gap:2px 4px; margin-bottom:3px;">
+          <span style="color:#f88;">X</span><input class="val-input" id="devPosX" type="number" step="1" style="width:100%;min-width:0;">
+          <span style="color:#8f8;">Y</span><input class="val-input" id="devPosY" type="number" step="1" style="width:100%;min-width:0;">
+          <span style="color:#88f;">Z</span><input class="val-input" id="devPosZ" type="number" step="1" style="width:100%;min-width:0;">
+        </div>
+        <div style="display:grid; grid-template-columns:18px 1fr 18px 1fr 18px 1fr; align-items:center; gap:2px 4px;">
+          <span style="color:#f88;">Rx</span><input class="val-input" id="devRotX" type="number" step="1" style="width:100%;min-width:0;">
+          <span style="color:#8f8;">Ry</span><input class="val-input" id="devRotY" type="number" step="1" style="width:100%;min-width:0;">
+          <span style="color:#88f;">Rz</span><input class="val-input" id="devRotZ" type="number" step="1" style="width:100%;min-width:0;">
+        </div>
+        <div style="display:flex; gap:4px; margin-top:3px; color:#556; font-size:10px;">
+          <span style="flex:1; text-align:center;">mm</span>
+          <span style="flex:1; text-align:center;">deg</span>
+        </div>
+      </div>
+    </div>
+    <div id="device-parent" style="margin-top:4px;">
+      <label style="font-size:11px; color:#889;">Parent:</label>
+      <select id="deviceParentSelect">
+        <option value="">World</option>
+      </select>
+    </div>
+  </div>
+  <h2 id="panel-title">Joint Angles (deg)</h2>
+  <div id="joint-sliders"></div>
+  <div id="virtual-angles-container"></div>
+  <button id="resetBtn">Reset to Home</button>
+  <button id="demoBtn" style="display:none;">Demo Pose</button>
+  <button id="ikBtn">IK Mode: OFF</button>
+  <button id="labelBtn">Labels: OFF</button>
+  <button id="chainBtn">Chain: OFF</button>
+  <button id="originsBtn">Origins: OFF</button>
+  <button id="orthoBtn">Ortho: OFF</button>
+  <button id="flyBtn">Fly Around: OFF</button>
+  <div id="flySpeedRow" style="display:none; align-items:center; gap:6px; margin-top:4px;">
+    <label style="font-size:11px; color:#889; white-space:nowrap;">Fly speed:</label>
+    <input type="range" id="flySpeed" min="0.5" max="8" value="2" step="0.5" style="flex:1;">
+    <span id="flySpeedVal" style="font-size:11px; color:#8cf; min-width:32px;">2.0&times;</span>
+  </div>
+  <div id="splatClipRow" style="display:none; align-items:center; gap:6px; margin-top:4px;">
+    <label style="font-size:11px; color:#889; white-space:nowrap;">Splat clip:</label>
+    <input type="range" id="splatClip" min="0" max="100" value="0" step="1" style="flex:1;">
+    <span id="splatClipVal" style="font-size:11px; color:#8cf; min-width:32px;">0%</span>
+  </div>
+  <button id="screenshotBtn">Screenshot</button>
+  <button id="collisionBtn">Collision: OFF</button>
+  <button id="floorCollisionBtn">Floor Collision: ON</button>
+  <button id="stlSelectBtn">Mesh Select: ON</button>
+  <div style="display:flex; align-items:center; gap:6px; margin-top:4px;">
+    <label style="font-size:11px; color:#889; white-space:nowrap;">Floor:</label>
+    <input type="range" id="floorSize" min="0.5" max="4" value="2" step="0.25" style="flex:1;">
+    <span id="floorSizeVal" style="font-size:11px; color:#8cf; min-width:32px;">2 m</span>
+  </div>
+  <button id="stlBtn">Import Mesh (STL / OBJ / PLY / GLB / Splat)</button>
+  <input type="file" id="stlFile" accept=".stl,.obj,.mtl,.ply,.glb,.gltf,.splat,.ksplat,.spz" multiple style="display:none">
+  <div style="display:flex; gap:4px; margin-top:4px;">
+    <button id="addCubeBtn" style="flex:1; margin:0;">Cube</button>
+    <button id="addSphereBtn" style="flex:1; margin:0;">Sphere</button>
+    <button id="addCylinderBtn" style="flex:1; margin:0;">Cylinder</button>
+  </div>
+  <div id="stl-list"></div>
+  <div id="stl-mode">
+    <span id="stl-sel-name" class="stl-mode-name"></span>
+    <div class="stl-mode-buttons">
+      <button id="stlModeT" class="active">Move</button>
+      <button id="stlModeR">Rotate</button>
+      <button id="stlModeS">Scale</button>
+      <button id="stlSpaceBtn">World</button>
+      <button id="stlDeselect">Deselect</button>
+    </div>
+    <div style="display:flex; gap:4px; margin-top:5px;">
+      <button id="stlResetPos" style="flex:1; width:auto; padding:4px 0; margin:0; font-size:11px;">Reset Position</button>
+      <button id="stlResetRot" style="flex:1; width:auto; padding:4px 0; margin:0; font-size:11px;">Reset Rotation</button>
+      <button id="stlResetScale" style="flex:1; width:auto; padding:4px 0; margin:0; font-size:11px;">Reset Scale</button>
+    </div>
+    <div id="stl-numeric" style="margin-top:6px; font-size:11px; color:#889;">
+      <div style="display:grid; grid-template-columns:18px 1fr 18px 1fr 18px 1fr; align-items:center; gap:2px 4px; margin-bottom:3px;">
+        <span style="color:#f88;">X</span><input class="val-input" id="stlPosX" type="number" step="1" style="width:100%;min-width:0;">
+        <span style="color:#8f8;">Y</span><input class="val-input" id="stlPosY" type="number" step="1" style="width:100%;min-width:0;">
+        <span style="color:#88f;">Z</span><input class="val-input" id="stlPosZ" type="number" step="1" style="width:100%;min-width:0;">
+      </div>
+      <div style="display:grid; grid-template-columns:18px 1fr 18px 1fr 18px 1fr; align-items:center; gap:2px 4px; margin-bottom:3px;">
+        <span style="color:#f88;">Rx</span><input class="val-input" id="stlRotX" type="number" step="1" style="width:100%;min-width:0;">
+        <span style="color:#8f8;">Ry</span><input class="val-input" id="stlRotY" type="number" step="1" style="width:100%;min-width:0;">
+        <span style="color:#88f;">Rz</span><input class="val-input" id="stlRotZ" type="number" step="1" style="width:100%;min-width:0;">
+      </div>
+      <div style="display:grid; grid-template-columns:18px 1fr 18px 1fr 18px 1fr; align-items:center; gap:2px 4px;">
+        <span style="color:#f88;">Sx</span><input class="val-input" id="stlScX" type="number" step="0.01" style="width:100%;min-width:0;">
+        <span style="color:#8f8;">Sy</span><input class="val-input" id="stlScY" type="number" step="0.01" style="width:100%;min-width:0;">
+        <span style="color:#88f;">Sz</span><input class="val-input" id="stlScZ" type="number" step="0.01" style="width:100%;min-width:0;">
+      </div>
+      <div style="display:flex; gap:4px; margin-top:3px; color:#556; font-size:10px;">
+        <span style="flex:1; text-align:center;">mm</span>
+        <span style="flex:1; text-align:center;">deg</span>
+        <span style="flex:1; text-align:center;">scale</span>
+      </div>
+    </div>
+    <div id="stl-lock-aspect" style="display:flex; align-items:center; gap:5px; margin-top:5px;">
+      <input type="checkbox" id="lockAspectCb" style="width:auto; margin:0;">
+      <label for="lockAspectCb" style="font-size:11px; color:#889; cursor:pointer; white-space:nowrap;">Lock aspect ratio</label>
+    </div>
+    <div id="stl-parent">
+      <label>Parent:</label>
+      <select id="stlParentSelect">
+        <option value="">World</option>
+      </select>
+    </div>
+  </div>
+  <div id="collision-info" style="display:none;">Collisions: <span id="collision-text">none</span></div>
+  <div style="display:flex; gap:4px; margin-top:8px; padding-top:8px; border-top:1px solid #334;">
+    <button id="saveSceneBtn" style="flex:1; margin:0;">Save Scene</button>
+    <button id="loadSceneBtn" style="flex:1; margin:0;">Load Scene</button>
+    <button id="clearSceneBtn" style="flex:1; margin:0;">Clear Scene</button>
+    <input type="file" id="loadSceneFile" accept=".json" style="display:none">
+  </div>
+  <div id="ik-panel" style="display:none; margin-top: 8px; padding-top: 8px; border-top: 1px solid #334;">
+    <h2 style="color:#5b5;">IK Target (mm)</h2>
+    <div class="slider-row">
+      <label>X <span id="ikvx">190</span></label>
+      <input type="number" id="ikx" value="190" step="1" style="display:none">
+    </div>
+    <div class="slider-row">
+      <label>Y <span id="ikvy">0</span></label>
+      <input type="number" id="iky" value="0" step="1" style="display:none">
+    </div>
+    <div class="slider-row">
+      <label>Z <span id="ikvz">308</span></label>
+      <input type="number" id="ikz" value="308" step="1" style="display:none">
+    </div>
+    <h2 style="margin-top:8px; color:#5b5;">Orientation (deg)</h2>
+    <div class="slider-row">
+      <label>&alpha; (Rx) <span id="ikva">0</span></label>
+      <input type="range" id="ika" min="-180" max="180" value="0" step="1">
+    </div>
+    <div class="slider-row">
+      <label>&beta; (Ry) <span id="ikvb">0</span></label>
+      <input type="range" id="ikb" min="-180" max="180" value="0" step="1">
+    </div>
+    <div class="slider-row">
+      <label>&gamma; (Rz) <span id="ikvc">0</span></label>
+      <input type="range" id="ikc" min="-180" max="180" value="0" step="1">
+    </div>
+    <div id="ee-info">
+      EE: <span id="eePos">-</span><br>
+      Target: <span id="tgtPos">-</span><br>
+      Error: <span id="ikErr">-</span>
+    </div>
+  </div>
+</div>
+<script src="/node_modules/html2canvas/dist/html2canvas.min.js" onerror="console.warn('html2canvas not available')"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/node_modules/three/build/three.module.js",
+    "three/addons/": "/node_modules/three/examples/jsm/",
+    "three-mesh-bvh": "/node_modules/three-mesh-bvh/build/index.module.js",
+    "gaussian-splats-3d": "/node_modules/@mkkellogg/gaussian-splats-3d/build/gaussian-splats-3d.module.js"
+  }
+}
+</script>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
