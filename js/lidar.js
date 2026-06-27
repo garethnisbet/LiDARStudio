@@ -3,9 +3,10 @@
 // by the Python backend (lidar_jobs.py) and loads results straight into the
 // three.js + GaussianSplats3D viewer via the existing PLY loader.
 
-import { loadPLYFile } from './stl.js';
+import { loadPLYFile, deselectSTL } from './stl.js';
 import * as State from './state.js';
 import * as THREE from 'three';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
 
 const DEFAULT_PROJECT = '/home/gareth';
 
@@ -160,6 +161,51 @@ export function initLidarPanel() {
   const invCb = el('input', { type: 'checkbox' });
   const editStat = el('div', { class: 'muted' }, 'Select a loaded object to edit.');
 
+  // ── 3D crop-box gizmo (dedicated TransformControls, isolated from selection) ──
+  let cropGizmo = null, cropBox = null, cropTargetPath = null, cropTargetLi = null;
+  function ensureGizmo() {
+    if (cropGizmo) return cropGizmo;
+    const g = new TransformControls(State.activeCamera || State.camera, State.renderer.domElement);
+    g.setSize(0.7);
+    g.addEventListener('dragging-changed', (e) => { State.orbitControls.enabled = !e.value; });
+    g.addEventListener('change', () => State.requestRender());
+    State.scene.add(g);
+    cropGizmo = g;
+    return g;
+  }
+  function removeCropBox(render = true) {
+    if (cropGizmo && cropGizmo.object) cropGizmo.detach();
+    if (cropBox) {
+      State.scene.remove(cropBox);
+      cropBox.traverse(o => { o.geometry?.dispose?.(); o.material?.dispose?.(); });
+      cropBox = null;
+    }
+    if (render) State.requestRender();
+  }
+  function placeCropBox() {
+    const e = State.selectedSTL;
+    if (!e) { editStat.textContent = 'Select a loaded object first.'; return; }
+    if (!objPaths[e.name]) { editStat.textContent = 'Crop needs a file: load from Library / generate.'; return; }
+    const b = new THREE.Box3().setFromObject(e.mesh);
+    if (b.isEmpty()) { editStat.textContent = 'Could not read object bounds.'; return; }
+    cropTargetPath = objPaths[e.name];
+    cropTargetLi = State.selectedListItem;
+    deselectSTL();                       // free the shared gizmo / selection
+    removeCropBox(false);
+    const c = b.getCenter(new THREE.Vector3()), s = b.getSize(new THREE.Vector3());
+    const geo = new THREE.BoxGeometry(1, 1, 1);
+    cropBox = new THREE.Mesh(geo, new THREE.MeshBasicMaterial(
+      { color: 0x33ff99, transparent: true, opacity: 0.12, depthWrite: false }));
+    cropBox.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo),
+      new THREE.LineBasicMaterial({ color: 0x33ff99 })));
+    cropBox.position.copy(c);
+    cropBox.scale.set(Math.max(s.x, 0.05), Math.max(s.y, 0.05), Math.max(s.z, 0.05));
+    State.scene.add(cropBox);
+    ensureGizmo().attach(cropBox);
+    State.requestRender();
+    editStat.textContent = 'Drag the green box (Move/Scale), then Apply edit.';
+  }
+
   const pDec = el('div', { class: 'row' }, el('label', { class: 'muted', style: 'flex:1' }, 'N', facInput));
   const pSor = el('div', { class: 'row' },
     el('label', { class: 'muted', style: 'flex:1' }, 'neighbours', sorNb),
@@ -174,6 +220,11 @@ export function initLidarPanel() {
       cMax.forEach((inp, i) => inp.value = b.max.getComponent(i).toFixed(2));
     } }, 'Fill bounds from selection');
   const pCrop = el('div', {},
+    el('button', { class: 'act', style: 'margin-top:2px', onclick: placeCropBox }, 'Place 3D crop box'),
+    el('div', { class: 'row' },
+      el('button', { class: 'act', style: 'flex:1', onclick: () => cropGizmo?.setMode('translate') }, 'Move box'),
+      el('button', { class: 'act', style: 'flex:1', onclick: () => cropGizmo?.setMode('scale') }, 'Scale box')),
+    el('div', { class: 'muted', style: 'margin-top:4px' }, 'or set bounds manually:'),
     el('div', { class: 'row' }, el('span', { class: 'muted', style: 'width:28px' }, 'min'), ...cMin),
     el('div', { class: 'row' }, el('span', { class: 'muted', style: 'width:28px' }, 'max'), ...cMax),
     el('label', { class: 'muted' }, invCb, ' keep outside (delete inside)'),
@@ -190,48 +241,76 @@ export function initLidarPanel() {
   editOp.addEventListener('change', showOp);
   const applyEditBtn = el('button', { class: 'act' }, 'Apply edit');
 
+  async function runEdit(endpoint, body, li, doneMsg) {
+    applyEditBtn.disabled = true;
+    try {
+      const r = await api(endpoint, body);
+      editStat.textContent = doneMsg(r);
+      await loadPlyFromServer(r.output, r.output.split('/').pop());
+      if (li) li.querySelector('button[title="Remove"]')?.click();  // drop the pre-edit object
+    } catch (e) { editStat.textContent = 'Error: ' + e.message; }
+    applyEditBtn.disabled = false;
+  }
+
   applyEditBtn.onclick = async () => {
+    const op = editOp.value;
+
+    // Crop via the 3D box uses the remembered target (placing the box deselects).
+    if (op === 'crop' && cropBox) {
+      cropBox.updateWorldMatrix(true, false);
+      const b = new THREE.Box3().setFromObject(cropBox);
+      const params = { min: [b.min.x, b.min.y, b.min.z], max: [b.max.x, b.max.y, b.max.z], invert: invCb.checked };
+      editStat.textContent = 'Cropping to box…';
+      const li = cropTargetLi;
+      await runEdit('/api/edit/apply', { path: cropTargetPath, op: 'crop', params },
+        li, r => `Kept ${r.kept.toLocaleString()} / ${r.total.toLocaleString()} — reloading`);
+      removeCropBox();
+      return;
+    }
+
     const entry = State.selectedSTL;
     if (!entry) { editStat.textContent = 'Select an object in the list first.'; return; }
     const srcPath = objPaths[entry.name];
     if (!srcPath) { editStat.textContent = 'Edit needs a file: load it from the Library or generate it.'; return; }
-    const op = editOp.value;
+
+    const li = State.selectedListItem;
 
     if (op === 'recolour') {
       const scan = scanInput.value.trim();
       if (!scan) { editStat.textContent = 'Set the Scan folder (Generate section) first.'; return; }
-      applyEditBtn.disabled = true; editStat.textContent = 'Recolouring (multi-view)…';
-      const li = State.selectedListItem;
-      try {
-        const r = await api('/api/edit/recolour', { path: srcPath, scan_path: scan });
-        editStat.textContent = `Coloured ${r.coloured.toLocaleString()} / ${r.total.toLocaleString()} — reloading`;
-        await loadPlyFromServer(r.output, r.output.split('/').pop());
-        if (li) li.querySelector('button[title="Remove"]')?.click();
-      } catch (e) { editStat.textContent = 'Error: ' + e.message; }
-      applyEditBtn.disabled = false;
-      return;
+      editStat.textContent = 'Recolouring (multi-view)…';
+      return runEdit('/api/edit/recolour', { path: srcPath, scan_path: scan }, li,
+        r => `Coloured ${r.coloured.toLocaleString()} / ${r.total.toLocaleString()} — reloading`);
     }
 
     let params = {};
     if (op === 'decimate') params = { factor: parseInt(facInput.value) || 2 };
     else if (op === 'denoise_sor') params = { nb_neighbors: parseInt(sorNb.value) || 20, std_ratio: parseFloat(sorStd.value) || 2 };
-    else if (op === 'crop') params = {
-      min: cMin.map(i => parseFloat(i.value)), max: cMax.map(i => parseFloat(i.value)),
-      invert: invCb.checked,
-    };
-    if (op === 'crop' && params.min.concat(params.max).some(v => !isFinite(v))) {
-      editStat.textContent = 'Fill in the crop box bounds first.'; return;
+    else if (op === 'crop') {
+      params = { min: cMin.map(i => parseFloat(i.value)), max: cMax.map(i => parseFloat(i.value)), invert: invCb.checked };
+      if (params.min.concat(params.max).some(v => !isFinite(v))) {
+        editStat.textContent = 'Place a 3D crop box or fill in the bounds first.'; return;
+      }
     }
-    applyEditBtn.disabled = true; editStat.textContent = `Applying ${op}…`;
+    editStat.textContent = `Applying ${op}…`;
+    return runEdit('/api/edit/apply', { path: srcPath, op, params }, li,
+      r => `Kept ${r.kept.toLocaleString()} / ${r.total.toLocaleString()} — reloading`);
+  };
+
+  // Non-destructive revert: reload the original file the edits derived from.
+  const revertBtn = el('button', { class: 'act', style: 'background:#553', onclick: async () => {
+    const entry = State.selectedSTL;
+    if (!entry || !objPaths[entry.name]) { editStat.textContent = 'Select an edited object first.'; return; }
+    const cur = objPaths[entry.name];
+    const orig = cur.replace(/(_edited|_recoloured)+\.ply$/i, '.ply');
+    if (orig === cur) { editStat.textContent = 'This is already an original.'; return; }
+    editStat.textContent = 'Reverting to original…';
     const li = State.selectedListItem;
     try {
-      const r = await api('/api/edit/apply', { path: srcPath, op, params });
-      editStat.textContent = `Kept ${r.kept.toLocaleString()} / ${r.total.toLocaleString()} — reloading`;
-      await loadPlyFromServer(r.output, r.output.split('/').pop());
-      if (li) li.querySelector('button[title="Remove"]')?.click();  // drop the pre-edit object
-    } catch (e) { editStat.textContent = 'Error: ' + e.message; }
-    applyEditBtn.disabled = false;
-  };
+      await loadPlyFromServer(orig, orig.split('/').pop());
+      if (li) li.querySelector('button[title="Remove"]')?.click();
+    } catch (e) { editStat.textContent = 'Original not found: ' + e.message; }
+  } }, 'Revert to original');
 
   const panel = el('div', { id: 'lidar-panel' },
     el('h4', {}, 'Library'),
@@ -246,7 +325,7 @@ export function initLidarPanel() {
       el('label', { class: 'muted', style: 'flex:1' }, 'noise σ', sorInput)),
     genBtn, barWrap, logBox,
     el('h4', {}, 'Edit selected'),
-    editStat, editOp, pDec, pSor, pCrop, pRecol, applyEditBtn);
+    editStat, editOp, pDec, pSor, pCrop, pRecol, applyEditBtn, revertBtn);
   showOp();
 
   // Mount inside the existing right-side control panel as a collapsible section
