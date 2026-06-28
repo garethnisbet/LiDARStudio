@@ -1,8 +1,63 @@
-# Robot & Device Visualisation
+# LidarStudio
 
-Interactive 3D visualisation and control for robots and scientific instruments. Config-driven — works with any device defined by a JSON config and GLB model. Includes forward and inverse kinematics, mesh import, collision detection, and a remote control API.
+A browser-based studio for **generating and editing LiDAR point clouds and 3D Gaussian splats**, built on a Three.js + GaussianSplats3D viewer with a Python backend. Generate clouds/splats from raw scan bags, then clean, crop, recolour, erase, and re-place them interactively — all non-destructively, with results saved back into your project.
 
-## Supported Devices
+LidarStudio is a fork of a config-driven robot/device viewer; that engine (mesh import, transform gizmos, multi-object scene, remote API) is retained and documented below the LiDAR sections, since the editor builds on it.
+
+> **Note:** the LiDAR features are driven by a Python backend (`lidar_jobs.py`, `process_pointcloud.py`, `process_splat.py`, `edit_ops.py`, `cloud_ops.py`, `splat_io.py`) wired into `server.py`. The browser JS is served fresh on every reload, but the Python modules are imported once and cached — **restart `server.py` after any `.py` change** for it to take effect.
+
+## LiDAR Workflow
+
+The **LiDAR Workflow** panel (top of the right-hand control panel) drives the whole pipeline. Run with `python3 server.py` and open `http://localhost:8080`.
+
+### Generate
+
+Turn a raw scan folder (LiDAR + IMU + image `.bag` files) into a cloud or splat:
+
+- **Point cloud** — KISS-ICP registration + multi-view photo colouring, voxel-downsampled.
+- **Splat** — three modes:
+  - **surfel** — fast, derives surface-aligned gaussians directly from the coloured cloud.
+  - **trained** — GPU-trained 3D Gaussian Splatting (needs CUDA + the scan trajectory).
+  - **bootstrap** — CPU fallback, one gaussian per point. Adjustable **blob size (m)** controls the gaussian radius (smaller = finer, less blobby).
+
+Progress streams live into the panel; the result loads straight into the scene and appears in the Library.
+
+### Library
+
+Lists the clouds/splats already in the project (`pointclouds/` and `splats/`). **Load** brings one into the scene; long names truncate with the full name on hover.
+
+### Editing (non-destructive)
+
+All edits operate on the selected object, write a sibling `*_edited.ply` (the original is untouched), and reload in place. **Revert to original** reloads the source.
+
+- **Decimate** — keep 1-in-N points.
+- **Denoise** — statistical outlier removal (SOR; neighbours + std ratio).
+- **Crop** — an oriented 3D box (translate/rotate/scale via gizmo or **T/R/S** keys); keep inside or outside.
+- **Recolour** — re-project the scan photos onto an edited cloud using its saved trajectory.
+- **Save transformed (bake pose)** — bake the object's in-scene transform into the file.
+- Decimate and Denoise can be **limited to the visibility box region**.
+
+### Visibility box
+
+A non-destructive oriented box that hides geometry inside *or* outside it (live GPU clip) so internal structure can be inspected while editing. It can also **delete the shown side** in one click. Both the visibility and crop boxes are transformable with **T/R/S** and switch focus on click.
+
+### Eraser (Cube / Sphere / Cylinder)
+
+Add a primitive and use it as an eraser volume:
+
+- **Point clouds** — turn the **live eraser** on, then drag a primitive through the cloud: points vanish in real time as the volume sweeps over them. Per-stroke **undo**. Saved when you **Save As**.
+- **Splats** — a one-shot **Erase now** deletes points inside the current primitives.
+
+### Save As & Workflow
+
+- **Save As** — export the selected object under a new name. Optionally **bake the transform into the coordinates** for a self-contained, portable file; otherwise a lossless copy plus a pose sidecar that reloads correctly here.
+- **Save / Load Workflow** — remember the panel's settings (paths, parameters, options) in the browser and restore them on demand.
+
+### How placement is preserved
+
+Edits keep the file in its original local frame and store the object's pose in a `<file>.pose.json` sidecar, reapplied on load — so an edited/erased object reloads in the same place and orientation (and it works for splats, which carry an internal viewer transform). "Save transformed" / the Save As *bake* option instead write world coordinates for use in other tools.
+
+## Supported Devices (device-viewer engine)
 
 | Device | Config | Type | Description |
 |--------|--------|------|-------------|
@@ -38,7 +93,7 @@ New devices can be added from Blender scenes using `import_robot.py` (serial rob
 - **Mesh import** — load external STL, OBJ, PLY, and GLB/GLTF files into the scene with auto-scaling, labels, and per-object colour
 - **Primitive objects** — add cube, sphere, and cylinder primitives directly from the toolbar
 - **Object duplication** — duplicate any imported or primitive object with a single click
-- **Persistent objects** — imported and primitive objects are automatically saved to IndexedDB and restored on page reload
+- **Scene save/load** — save the scene to a file and reload it via the Save Scene / Load Scene buttons (LidarStudio does not auto-restore the scene on page load; clouds/splats are loaded explicitly from the Library)
 - **Object manipulation** — click objects to select, then move, rotate, or scale with transform gizmos (keyboard: T/R/S, Escape to deselect); World/Local space toggle for gizmo axis alignment
 - **Parent-child linking** — attach objects to device links so they follow the kinematic chain
 - **Self-collision detection** — BVH-accelerated triangle-level intersection testing between device links, using kinematic adjacency to skip physically connected parts
@@ -51,11 +106,18 @@ New devices can be added from Blender scenes using `import_robot.py` (serial rob
 
 ## Quick Start
 
-**Standalone (no remote control):**
+**LidarStudio (LiDAR generation + editing):**
+```bash
+pip3 install aiohttp websockets numpy open3d scipy   # plus torch + gsplat for GPU-trained splats
+python3 server.py
+```
+Open `http://localhost:8080` and use the **LiDAR Workflow** panel. The `/api/*` endpoints (generation, editing, save) require `server.py` — the plain static server below won't drive them. Remember to restart `server.py` after editing any backend `.py` file.
+
+**Device viewer only — standalone (no backend):**
 ```bash
 python3 -m http.server 8000
 ```
-Open `http://localhost:8000/threejs_scene.html` in a browser. Use the dropdown to switch devices, or specify a config: `?config=i16_config.json`.
+Open `http://localhost:8000/threejs_scene.html` in a browser. Use the dropdown to switch devices, or specify a config: `?config=i16_config.json`. (LiDAR generation/editing is unavailable without `server.py`.)
 
 **With remote control API:**
 ```bash
@@ -775,10 +837,17 @@ js/
   hexapod.js             Hexapod loader, Damped Track IK, FK solver, platform sync
   kinematics.js          FK, IK solver, kappa geometry math
   panel.js               Control panel UI, device list, parent dropdowns
-  stl.js                 Mesh import/export, primitives, duplication, IndexedDB persistence
+  stl.js                 Mesh import/export, primitives, point-cloud/splat add, eraser/clip shaders
+  lidar.js               LiDAR Workflow panel — generate, library, edit, boxes, eraser, save/workflow
   collision.js           BVH-accelerated collision detection (Web Worker + main-thread fallback)
   collision-worker.js    Background thread for collision math
   websocket.js           WebSocket client for remote control API
+lidar_jobs.py            LiDAR /api/* endpoints — generation jobs, edit/apply, save_as, outputs
+process_pointcloud.py    Scan bags → registered, coloured point cloud (KISS-ICP + multi-view colour)
+process_splat.py         Splat generation — surfel / GPU-trained / CPU bootstrap (with --splat-size)
+edit_ops.py              Unified edit ops (decimate/denoise/crop/erase/drop/transform) for clouds + splats
+cloud_ops.py             open3d point-cloud helpers (SOR, oriented-box keep, primitive erase masks)
+splat_io.py              Format-preserving splat PLY load/save + transform (bake) of gaussians
 import_robot.py          Blender import script — extracts serial robot armature to config JSON + GLB
 import_hexapod.py        Blender import script — extracts hexapod (Damped Track legs) to config JSON + GLB
 server.py                WebSocket + HTTP server for remote control API

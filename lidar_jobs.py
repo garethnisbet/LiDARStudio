@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import sys
 import uuid
 from pathlib import Path
@@ -486,7 +487,7 @@ async def _job_splat(project_path, scan_path, options, queue):
             "--iterations", str(options.get("iterations", 7000)),
         ]
         if mode == "bootstrap":
-            cmd += ["--bootstrap"]
+            cmd += ["--bootstrap", "--splat-size", str(options.get("splat_size", 0.05))]
         if pc_files:
             cmd += ["--pointcloud", str(pc_files[-1])]
             await queue.put({"event": "log", "message": f"Using existing point cloud: {pc_files[-1].name}"})
@@ -612,6 +613,7 @@ async def edit_apply_handler(request):
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None, edit_ops.apply_edit, str(src), out, op, params)
+        _write_pose_sidecar(out, data.get("pose"))
         return web.json_response(result)
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
@@ -634,7 +636,64 @@ async def edit_recolour_handler(request):
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None, edit_ops.recolour, str(src), out, scan)
+        _write_pose_sidecar(out, data.get("pose"))
         return web.json_response(result)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+def _write_pose_sidecar(out_path, pose):
+    """Persist the object's in-scene pose next to an edited file (``<out>.pose.json``)
+    so reloading it from the Library restores its placement. The edit keeps the
+    file in its original local frame, so without this it would reload at identity
+    (wrong orientation). ``pose`` is {position, rotation, scale, visible,
+    parentLink}; a falsy/identity pose removes any stale sidecar so the two stay
+    consistent (e.g. after a 'transform' bake)."""
+    sidecar = Path(str(out_path) + ".pose.json")
+    try:
+        if pose:
+            sidecar.write_text(json.dumps(pose))
+        elif sidecar.exists():
+            sidecar.unlink()
+    except Exception as exc:
+        log.warning("pose sidecar write failed for %s: %s", out_path, exc)
+
+
+async def edit_save_as_handler(request):
+    """POST /api/edit/save_as — save a cloud/splat to a new file under a chosen name.
+
+    Two modes:
+      • copy (default): lossless byte copy, preserving all fields/format, with the
+        object's pose stored in a sidecar so it reloads in the same place here.
+      • bake: when ``matrix`` (the object's world matrix, column-major 16) is
+        given, the transform is baked into the coordinates, producing a
+        self-contained file that's correctly oriented in any viewer (no sidecar).
+
+    Body: {path, output, [pose], [matrix]}. `output` must be a .ply path.
+    """
+    data = await request.json()
+    src = Path((data.get("path") or "").strip())
+    out = (data.get("output") or "").strip()
+    if not src.name or not out:
+        return web.json_response({"error": "path and output required"}, status=400)
+    if not src.exists():
+        return web.json_response({"error": "source not found"}, status=404)
+    out_path = Path(out)
+    if out_path.suffix.lower() != ".ply":
+        return web.json_response({"error": "output must be a .ply file"}, status=400)
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        matrix = data.get("matrix")
+        if matrix is not None:
+            import edit_ops
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, edit_ops.apply_edit, str(src), str(out_path), "transform", {"matrix": matrix})
+            _write_pose_sidecar(str(out_path), None)   # baked → no sidecar
+        else:
+            shutil.copy2(src, out_path)
+            _write_pose_sidecar(str(out_path), data.get("pose"))
+        return web.json_response({"output": str(out_path), "baked": matrix is not None})
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
 
@@ -646,6 +705,7 @@ async def edit_recolour_handler(request):
 def register_routes(app: web.Application) -> None:
     app.router.add_post("/api/edit/apply", edit_apply_handler)
     app.router.add_post("/api/edit/recolour", edit_recolour_handler)
+    app.router.add_post("/api/edit/save_as", edit_save_as_handler)
     app.router.add_post("/api/browse", browse_handler)
     app.router.add_post("/api/browse/dir", browse_dir_handler)
     app.router.add_post("/api/project/create", project_create_handler)

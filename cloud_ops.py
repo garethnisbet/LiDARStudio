@@ -119,6 +119,52 @@ def aabb_keep(pcd, min_xyz, max_xyz, invert: bool = False) -> np.ndarray:
     return np.nonzero(keep)[0]
 
 
+def obb_mask(pcd, to_local_matrix) -> np.ndarray:
+    """Boolean mask (length N) of points inside an *oriented* unit-cube box
+    ([-0.5, 0.5]^3).
+
+    `to_local_matrix` is a length-16, column-major array that maps a point's
+    *local* (file) coordinates straight into box-local space — i.e. the client
+    sends inv(boxWorld) @ cloudWorld, folding in the cloud's in-scene transform.
+    A point is inside when |xyz| <= 0.5 after the transform."""
+    pts = np.asarray(pcd.points, float)
+    M = np.asarray(to_local_matrix, float).reshape(4, 4).T   # column-major -> row-major
+    h = np.concatenate([pts, np.ones((len(pts), 1))], axis=1)   # N x 4 homogeneous
+    local = h @ M.T                                             # (M @ h.T).T
+    return np.all(np.abs(local[:, :3]) <= 0.5, axis=1)
+
+
+def obb_keep(pcd, to_local_matrix, invert: bool = False) -> np.ndarray:
+    """Keep points inside an oriented unit-cube box (see :func:`obb_mask`)."""
+    inside = obb_mask(pcd, to_local_matrix)
+    keep = ~inside if invert else inside
+    return np.nonzero(keep)[0]
+
+
+def primitive_erase_keep(pcd, erasers) -> np.ndarray:
+    """Keep points that fall OUTSIDE every eraser primitive (cube/sphere/cylinder).
+
+    Each eraser is {type, matrix}: `matrix` (column-major 16) maps a point's
+    *local* coords into the primitive's canonical frame, where the volume is the
+    unit shape — cube |xyz| <= 0.5, sphere r <= 0.5, cylinder r(xz) <= 0.5 and
+    |y| <= 0.5. A point inside ANY eraser is removed (union)."""
+    pts = np.asarray(pcd.points, float)
+    h = np.concatenate([pts, np.ones((len(pts), 1))], axis=1)   # N x 4
+    inside = np.zeros(len(pts), dtype=bool)
+    for e in erasers or []:
+        M = np.asarray(e["matrix"], float).reshape(4, 4).T      # column-major -> row-major
+        loc = (h @ M.T)[:, :3]
+        t = (e.get("type") or "cube").lower()
+        if t == "sphere":
+            m = (loc ** 2).sum(axis=1) <= 0.25
+        elif t == "cylinder":
+            m = (loc[:, 0] ** 2 + loc[:, 2] ** 2 <= 0.25) & (np.abs(loc[:, 1]) <= 0.5)
+        else:  # cube / box
+            m = np.all(np.abs(loc) <= 0.5, axis=1)
+        inside |= m
+    return np.nonzero(~inside)[0]
+
+
 def auto_clean_mask(
     pcd: o3d.geometry.PointCloud,
     sor_neighbors: int = 20,

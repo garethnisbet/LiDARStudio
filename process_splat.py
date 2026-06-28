@@ -386,14 +386,17 @@ def train_splat(frames, pts, rgb, out_path: Path, iters: int,
 
 # ── CPU fallback: bootstrap one Gaussian per point ───────────────────
 
-def bootstrap_splat_from_ply(input_ply: Path, output_ply: Path):
-    """Unoptimised splat: each coloured point → one isotropic Gaussian (no GPU)."""
+def bootstrap_splat_from_ply(input_ply: Path, output_ply: Path, size: float = 0.05):
+    """Unoptimised splat: each coloured point → one isotropic Gaussian (no GPU).
+
+    ``size`` is the Gaussian radius (std-dev) in metres for every splat. Smaller
+    values give finer splats instead of large blobs (the field stores log-scale)."""
     import numpy as np
-    progress(10, f"Bootstrap (no training) from {input_ply.name}…")
+    progress(10, f"Bootstrap (no training, size={size} m) from {input_ply.name}…")
     pts, rgb = load_coloured_ply(input_ply)
     n = len(pts)
     dc = rgb_to_sh(rgb).astype(np.float32)
-    scale = np.full((n, 3), -3.0, np.float32)
+    scale = np.full((n, 3), float(np.log(max(size, 1e-4))), np.float32)
     rot = np.zeros((n, 4), np.float32); rot[:, 0] = 1.0
     opac = np.full((n, 1), 2.197, np.float32)
     header = ("ply\nformat binary_little_endian 1.0\n"
@@ -516,6 +519,8 @@ def main():
     p.add_argument("--max-init-points", type=int, default=1_000_000)
     p.add_argument("--no-crop-to-init", dest="crop_to_init", action="store_false", default=True)
     p.add_argument("--crop-margin", type=float, default=0.05)
+    p.add_argument("--splat-size", type=float, default=0.05,
+                   help="bootstrap Gaussian radius (m) — smaller = finer splats, less blobby")
     p.add_argument("--bootstrap", action="store_true",
                    help="skip GPU training; one isotropic Gaussian per point (CPU)")
     p.add_argument("--surfel", action="store_true",
@@ -563,7 +568,7 @@ def main():
         if not traj_path.exists():
             print(f"  No trajectory sidecar ({traj_path.name}) — bootstrap only. "
                   "Regenerate the point cloud to enable trained splats.", flush=True)
-        bootstrap_splat_from_ply(pc, out)
+        bootstrap_splat_from_ply(pc, out, size=args.splat_size)
         return
 
     progress(5, "Loading coloured cloud and camera poses…")

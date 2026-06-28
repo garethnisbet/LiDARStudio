@@ -1009,7 +1009,10 @@ async function _tryLoadSavedScene() {
   return null;
 }
 
-const savedData = await _tryLoadSavedScene();
+// LidarStudio loads clouds/splats explicitly (Library / Load Scene / Load
+// Workflow), so the page does not auto-restore a saved scene on load. (Disabled
+// the inherited robot-viewer auto-restore, which retried up to 3 times.)
+const savedData = null;
 
 if (savedData) {
   for (let attempt = 1; attempt <= MAX_RESTORE_ATTEMPTS && !restoredFromStorage; attempt++) {

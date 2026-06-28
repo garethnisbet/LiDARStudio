@@ -69,6 +69,79 @@ def save_splat(path: str | Path, data, indices=None) -> int:
     return len(out)
 
 
+def _quat_from_matrix(R):
+    """Unit quaternion (w, x, y, z) from a 3x3 rotation matrix."""
+    m = R
+    tr = m[0, 0] + m[1, 1] + m[2, 2]
+    if tr > 0:
+        s = np.sqrt(tr + 1.0) * 2
+        w = 0.25 * s
+        x = (m[2, 1] - m[1, 2]) / s
+        y = (m[0, 2] - m[2, 0]) / s
+        z = (m[1, 0] - m[0, 1]) / s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    q = np.array([w, x, y, z], float)
+    return q / np.linalg.norm(q)
+
+
+def transform_splat(data, M):
+    """Bake a 4x4 world transform ``M`` (row-major) into a splat record:
+    move centres, rotate each gaussian's orientation quaternion, and grow its
+    log-scales by the (uniform) scale factor. Rotation + uniform scale +
+    translation are exact; non-uniform scale is approximated by its geometric
+    mean (anisotropic scale doesn't commute with per-gaussian rotation), and
+    higher-order SH (``f_rest_*``) is left unrotated — the DC colour term is
+    rotation-invariant, so appearance is preserved for diffuse splats."""
+    M = np.asarray(M, float)
+    R = M[:3, :3]
+    t = M[:3, 3]
+    scale = np.linalg.norm(R, axis=0)              # per-axis scale (column norms)
+    Rn = R / np.where(scale == 0, 1, scale)        # pure rotation (assumes no shear)
+
+    out = data.copy()
+    names = data.dtype.names
+
+    p = np.stack([data["x"], data["y"], data["z"]], 1).astype(float)
+    p2 = p @ R.T + t
+    out["x"], out["y"], out["z"] = p2[:, 0], p2[:, 1], p2[:, 2]
+
+    if all(f in names for f in ("rot_0", "rot_1", "rot_2", "rot_3")):
+        aw, ax, ay, az = _quat_from_matrix(Rn)     # world rotation, (w,x,y,z)
+        q = np.stack([data["rot_0"], data["rot_1"], data["rot_2"], data["rot_3"]], 1).astype(float)
+        nrm = np.linalg.norm(q, axis=1, keepdims=True)
+        q = q / np.where(nrm == 0, 1, nrm)
+        bw, bx, by, bz = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        out["rot_0"] = aw * bw - ax * bx - ay * by - az * bz
+        out["rot_1"] = aw * bx + ax * bw + ay * bz - az * by
+        out["rot_2"] = aw * by - ax * bz + ay * bw + az * bx
+        out["rot_3"] = aw * bz + ax * by - ay * bx + az * bw
+
+    if all(f in names for f in ("scale_0", "scale_1", "scale_2")):
+        s_uni = float(np.cbrt(max(scale[0] * scale[1] * scale[2], 1e-30)))
+        ln_s = np.log(s_uni)
+        for f in ("scale_0", "scale_1", "scale_2"):
+            out[f] = data[f].astype(float) + ln_s
+
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
