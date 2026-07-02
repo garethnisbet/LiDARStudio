@@ -7,9 +7,15 @@ for remote robot control.
 
 Usage:
     pip install aiohttp
-    python server.py [--port 8000] [--config meca500_config.json]
+    python server.py [--port 8080] [--config meca500_config.json]
 
-WebSocket endpoint: ws://localhost:8000/ws
+WebSocket endpoint: ws://localhost:8080/ws
+
+Network exposure:
+    Binds 127.0.0.1 by default. Pass --host 0.0.0.0 to serve the viewer to
+    other machines (e.g. a VR headset). The LiDAR /api/* endpoints read and
+    write the local filesystem, so they stay loopback-only even then unless
+    --allow-remote-fs is also given.
 
 API Protocol (JSON over WebSocket):
 ────────────────────────────────────
@@ -50,6 +56,7 @@ Session routing:
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import logging
 import ssl
@@ -184,6 +191,40 @@ async def sessions_handler(request):
     return web.json_response(data)
 
 
+def _is_loopback_peer(remote) -> bool:
+    """True if the request came from this machine (or a non-IP transport)."""
+    if not remote:
+        return True
+    try:
+        addr = ipaddress.ip_address(remote)
+    except ValueError:
+        return False
+    if addr.is_loopback:
+        return True
+    mapped = getattr(addr, "ipv4_mapped", None)  # e.g. ::ffff:127.0.0.1
+    return bool(mapped and mapped.is_loopback)
+
+
+@web.middleware
+async def local_fs_api_guard_mw(request, handler):
+    """Keep the LiDAR /api/* endpoints loopback-only unless --allow-remote-fs.
+
+    Those endpoints browse directories and read/write files anywhere the
+    server's user can, so they must not be reachable from the network just
+    because the viewer is (e.g. --host 0.0.0.0 for a VR headset)."""
+    if (
+        request.path.startswith("/api/")
+        and not request.app.get("allow_remote_fs")
+        and not _is_loopback_peer(request.remote)
+    ):
+        return web.json_response(
+            {"error": "filesystem API is loopback-only; "
+                      "start the server with --allow-remote-fs to enable remote clients"},
+            status=403,
+        )
+    return await handler(request)
+
+
 @web.middleware
 async def cross_origin_isolation_mw(request, handler):
     """Add COOP/COEP headers so the page is cross-origin isolated.
@@ -202,8 +243,30 @@ async def cross_origin_isolation_mw(request, handler):
     return resp
 
 
-def create_app(config_path=None):
-    app = web.Application(middlewares=[cross_origin_isolation_mw])
+# Root-level files the viewer may fetch (configs, models, bundled client, …).
+# Everything else at the repo root — Python source, .git, dotfiles — is not served.
+_ROOT_ASSET_EXTENSIONS = {".css", ".html", ".ico", ".json", ".glb", ".gltf",
+                          ".stl", ".ply", ".png", ".jpg", ".jpeg", ".zip"}
+
+
+async def root_asset_handler(request):
+    """Serve an allowlisted asset file sitting directly in the project root."""
+    name = request.match_info["name"]
+    if not name or name.startswith(".") or "/" in name or "\\" in name:
+        raise web.HTTPNotFound()
+    p = ROOT / name
+    if (
+        p.suffix.lower() not in _ROOT_ASSET_EXTENSIONS
+        or not p.is_file()
+        or p.resolve().parent != ROOT.resolve()
+    ):
+        raise web.HTTPNotFound()
+    return web.FileResponse(p)
+
+
+def create_app(config_path=None, allow_remote_fs=False):
+    app = web.Application(middlewares=[local_fs_api_guard_mw, cross_origin_isolation_mw])
+    app["allow_remote_fs"] = allow_remote_fs
 
     # LidarStudio boots into an empty editor scene by default ("none" = no robot).
     config_name = Path(config_path).name if config_path else "none"
@@ -226,7 +289,12 @@ def create_app(config_path=None):
     except Exception as e:  # pragma: no cover - keep the viewer usable if jobs fail to load
         logging.getLogger("server").warning(f"LiDAR workflow routes unavailable: {e}")
 
-    app.router.add_static("/", ROOT, show_index=False)
+    # Static assets, allowlisted: the JS modules, npm packages, and specific
+    # root-level file types. Deliberately NOT a blanket add_static("/", ROOT),
+    # which would expose the server source, .git, and everything else here.
+    app.router.add_static("/js/", ROOT / "js")
+    app.router.add_static("/node_modules/", ROOT / "node_modules")
+    app.router.add_get("/{name}", root_asset_handler)
     return app
 
 
@@ -270,7 +338,12 @@ async def _run_https(app, host, port, ssl_ctx):
 def main():
     parser = argparse.ArgumentParser(description="Robot Visualisation WebSocket Server")
     parser.add_argument("--port", type=int, default=8080, help="HTTP port (default: 8080)")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Bind address (default: 127.0.0.1; use 0.0.0.0 to serve the LAN)")
+    parser.add_argument("--allow-remote-fs", action="store_true", default=False,
+                        help="Let non-loopback clients use the LiDAR /api/* endpoints "
+                             "(they read/write the local filesystem; needed for e.g. a VR "
+                             "headset running the full workflow)")
     parser.add_argument("--config", default="none",
                         help="Optional robot config JSON; default 'none' = empty editor scene")
     parser.add_argument("--ssl", action="store_true", default=False,
@@ -283,7 +356,20 @@ def main():
     if args.ssl or args.cert:
         ssl_ctx = _make_ssl_context(args.cert, args.key)
 
-    app = create_app(config_path=args.config)
+    try:
+        host_is_local = ipaddress.ip_address(args.host).is_loopback
+    except ValueError:
+        host_is_local = args.host in ("localhost",)
+    if not host_is_local:
+        log.warning(f"Binding {args.host}: the viewer and WebSocket API are network-visible.")
+        if args.allow_remote_fs:
+            log.warning("--allow-remote-fs: remote clients can browse and read/write "
+                        "this machine's filesystem via the LiDAR API.")
+        else:
+            log.info("LiDAR filesystem APIs stay loopback-only "
+                     "(pass --allow-remote-fs to enable remote clients).")
+
+    app = create_app(config_path=args.config, allow_remote_fs=args.allow_remote_fs)
     config_name = Path(args.config).name
 
     if ssl_ctx:

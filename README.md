@@ -10,6 +10,8 @@ LidarStudio is a fork of a config-driven robot/device viewer; that engine (mesh 
 
 The **LiDAR Workflow** panel (top of the right-hand control panel) drives the whole pipeline. Run with `python3 server.py` and open `http://localhost:8080`.
 
+> **Network exposure:** the server binds `127.0.0.1` by default. Pass `--host 0.0.0.0` to serve the viewer to other devices (e.g. a VR headset) — the LiDAR `/api/*` endpoints, which browse and read/write the local filesystem, stay loopback-only even then unless you also pass `--allow-remote-fs`. Static serving is allowlisted (`js/`, `node_modules/`, and specific root-level asset types); the Python source, `.git`, and dotfiles are never served.
+
 ### Generate
 
 Turn a raw scan folder (LiDAR + IMU + image `.bag` files) into a cloud or splat:
