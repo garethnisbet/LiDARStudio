@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/ndf61257/robot-visualisation
+  repository: ghcr.io/ndf61257/lidarstudio
   tag: latest
   pullPolicy: Always
 
@@ -12,7 +12,7 @@ service:
 ingress:
   enabled: true
   className: nginx
-  host: robots.diamond.ac.uk
+  host: lidarstudio.diamond.ac.uk
   annotations: {}
   tls: true
 

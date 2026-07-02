@@ -1,6 +1,6 @@
 # Client-Side Migration Plan
 
-Migrate LidarStudio's heavy lifting from the Python backend to the browser, stage by stage. The end state: the server shrinks to a static file host (+ the WebSocket robot-control relay), and all point-cloud/splat processing runs client-side in Web Workers / WASM / WebGPU.
+Migrate LidarStudio's heavy lifting from the Python backend to the browser, stage by stage. The end state: the server shrinks to a static file host, and all point-cloud/splat processing runs client-side in Web Workers / WASM / WebGPU.
 
 **Usage:** `/client-side-migration [stage]` — run one stage at a time, in order. With no argument, determine the next incomplete stage (check the criteria at the end of each stage) and propose it before starting.
 

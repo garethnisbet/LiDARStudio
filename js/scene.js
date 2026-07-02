@@ -46,24 +46,6 @@ orbitCtrl.addEventListener('change', () => State.requestRender());
 // Orthographic camera (created once, activated on toggle)
 const orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.001, 50);
 
-// Transform controls — need references to STL state for drag handler;
-// that reference is injected by main.js after both modules load.
-const transformCtrl = new TransformControls(camera, renderer.domElement);
-transformCtrl.setSize(0.5);
-transformCtrl.setMode('translate');
-transformCtrl.addEventListener('dragging-changed', (e) => {
-  orbitCtrl.enabled = !e.value;
-});
-transformCtrl.addEventListener('objectChange', () => {
-  if (transformCtrl.getMode() !== 'rotate') return;
-  const dev = State.activeDevice;
-  if (!dev || !dev.ikMode) return;
-  dev.ikTargetQuat.copy(dev.ikTarget.quaternion);
-  dev.ikTargetEuler.setFromQuaternion(dev.ikTargetQuat, 'YZX');
-});
-transformCtrl.addEventListener('change', () => State.requestRender());
-scene.add(transformCtrl);
-
 const stlTransformCtrl = new TransformControls(camera, renderer.domElement);
 stlTransformCtrl.setSize(0.4);
 stlTransformCtrl.setMode('translate');
@@ -92,20 +74,10 @@ stlTransformCtrl.addEventListener('dragging-changed', (e) => {
 stlTransformCtrl.addEventListener('change', () => State.requestRender());
 scene.add(stlTransformCtrl);
 
-// Device origin TransformControls
-const deviceTransformCtrl = new TransformControls(camera, renderer.domElement);
-deviceTransformCtrl.setSize(0.6);
-deviceTransformCtrl.setMode('translate');
-deviceTransformCtrl.addEventListener('dragging-changed', (e) => {
-  orbitCtrl.enabled = !e.value;
-});
-deviceTransformCtrl.addEventListener('change', () => State.requestRender());
-scene.add(deviceTransformCtrl);
-
 // Publish all objects into shared state
 State.initCoreObjects(scene, camera, renderer, labelRenderer);
 State.initCameras(orthoCamera, camera);
-State.initControls(orbitCtrl, transformCtrl, stlTransformCtrl, deviceTransformCtrl);
+State.initControls(orbitCtrl, stlTransformCtrl);
 
 // ============================================================
 // Orthographic frustum helper (synchronous, uses State bindings)
@@ -157,9 +129,7 @@ export function setOrtho(on) {
     State.setActiveCamera(State.camera);
   }
   State.orbitControls.object = State.activeCamera;
-  State.transformControls.camera = State.activeCamera;
   State.stlTransformControls.camera = State.activeCamera;
-  State.deviceTransformControls.camera = State.activeCamera;
   State.orbitControls.update();
 }
 

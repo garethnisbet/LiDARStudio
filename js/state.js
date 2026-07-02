@@ -21,42 +21,24 @@ export let orthoOn      = false;
 export let splatClipFraction = 0;
 
 // Controls
-export let orbitControls           = null;
-export let transformControls       = null;
-export let stlTransformControls    = null;
-export let deviceTransformControls = null;
-
-// Multi-device registry
-export const devices = [];
-export let activeDevice    = null;
-export let deviceIdCounter = 0;
+export let orbitControls        = null;
+export let stlTransformControls = null;
 
 // UI flags
-export let labelsOn         = false;
-export let originsOn        = false;
-export let moveDeviceActive = false;
+export let labelsOn = false;
 
 // Floor
 export let floorSize = 2;
 
-// Collision
-export let collisionEnabled      = false;
-export let floorCollisionEnabled = true;
-export let lastCollisions        = [];
-
-// STL import
+// Imported objects (meshes, point clouds, splats)
 export const importedSTLs = [];
 export let stlColorIdx    = 0;
 
-// STL selection
+// Object selection
 export let selectedSTL      = null;
 export let selectedListItem = null;
 export let lockAspect       = false;
 export let stlSelectable    = true;
-
-// WebSocket
-export let ws               = null;
-export let wsReconnectTimer = null;
 
 // ============================================================
 // Setters — used when a let-export must be reassigned from
@@ -71,39 +53,24 @@ export function initCameras(ortho, active) {
   orthoCamera = ortho; activeCamera = active;
 }
 
-export function initControls(orbit, transform, stlTransform, deviceTransform) {
-  orbitControls          = orbit;
-  transformControls      = transform;
-  stlTransformControls   = stlTransform;
-  deviceTransformControls = deviceTransform;
+export function initControls(orbit, stlTransform) {
+  orbitControls        = orbit;
+  stlTransformControls = stlTransform;
 }
 
 export function setActiveCamera(cam)  { activeCamera = cam; }
 export function setOrthoOn(v)         { orthoOn = v; }
 export function setSplatClipFraction(v) { splatClipFraction = v; }
 
-export function setActiveDevice(dev)  { activeDevice = dev; }
-export function incrementDeviceId()   { return 'dev_' + (deviceIdCounter++); }
-export function resetDeviceIdCounter() { deviceIdCounter = 0; }
-
 export function setLabelsOn(v)          { labelsOn = v; }
-export function setOriginsOn(v)         { originsOn = v; }
-export function setMoveDeviceActive(v)  { moveDeviceActive = v; }
 
 export function setFloorSize(v)         { floorSize = v; }
-
-export function setCollisionEnabled(v)       { collisionEnabled = v; }
-export function setFloorCollisionEnabled(v)  { floorCollisionEnabled = v; }
-export function setLastCollisions(arr)       { lastCollisions = arr; }
 
 export function setStlColorIdx(v)       { stlColorIdx = v; }
 export function setSelectedSTL(e)       { selectedSTL = e; }
 export function setSelectedListItem(i)  { selectedListItem = i; }
 export function setLockAspect(v)        { lockAspect = v; }
 export function setStlSelectable(v)     { stlSelectable = v; }
-
-export function setWs(socket)           { ws = socket; }
-export function setWsReconnectTimer(t)  { wsReconnectTimer = t; }
 
 // VR
 export let vrActive       = false;

@@ -1,6 +1,6 @@
 apiVersion: v2
-name: robot-visualisation
-description: Robot & device 3D visualisation — serial arms, hexapods, diffractometers — Three.js + WebSocket
+name: lidarstudio
+description: LidarStudio — LiDAR point-cloud & Gaussian-splat generation and editing — Three.js + Python backend
 type: application
 version: 0.2.0
 appVersion: "0.2.0"

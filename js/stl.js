@@ -1,7 +1,7 @@
 // ============================================================
-// js/stl.js — STL/OBJ/PLY/GLB import, file-based scene save/load,
-//             primitive creation, STL list UI,
-//             selection, transform mode, parent assignment
+// js/stl.js — STL/OBJ/PLY/GLB/splat import, file-based scene save/load,
+//             primitive creation, object list UI,
+//             selection, transform mode
 // ============================================================
 import * as THREE from 'three';
 import { STLLoader }  from 'three/addons/loaders/STLLoader.js';
@@ -50,30 +50,6 @@ function _base64ToArrayBuffer(b64) {
   return bytes.buffer;
 }
 
-// Convert runtime parentLink (devId:linkName) to stable index-based format (devIndex:linkName)
-function _parentLinkToStable(parentLink) {
-  if (!parentLink || !parentLink.includes(':')) return parentLink;
-  const [devId, linkName] = parentLink.split(':', 2);
-  const devIdx = State.devices.findIndex(d => d.id === devId);
-  if (devIdx < 0) return null;
-  return devIdx + ':' + linkName;
-}
-
-function _buildDevicesPayload() {
-  return State.devices.map((dev) => {
-    const entry = {
-      configFile: dev.configFile,
-      name: dev.name,
-      jointAngles: [...dev.jointAngles],
-      position: [dev.rootGroup.position.x, dev.rootGroup.position.y, dev.rootGroup.position.z],
-      rotation: [dev.rootGroup.rotation.x, dev.rootGroup.rotation.y, dev.rootGroup.rotation.z],
-      parentLink: _parentLinkToStable(dev.parentLink),
-    };
-    if (dev.type === 'hexapod') entry.platformPose = [...dev.platformPose];
-    return entry;
-  });
-}
-
 function _buildCameraPayload() {
   const cam = State.camera;
   const ctrl = State.orbitControls;
@@ -97,7 +73,6 @@ function _buildSTLPayload(entry, bufferFn, includeSplatBuffers) {
     rotation: [m.rotation.x, m.rotation.y, m.rotation.z],
     scale: [m.scale.x, m.scale.y, m.scale.z],
     visible: m.visible,
-    parentLink: _parentLinkToStable(entry.parentLink),
   };
   // bufferFn === null builds a metadata-only record (buffers saved separately).
   if (bufferFn && (!entry.isSplat || includeSplatBuffers)) rec.buffer = bufferFn(entry._buffer);
@@ -108,13 +83,13 @@ function _buildSTLPayload(entry, bufferFn, includeSplatBuffers) {
 
 export function buildScenePayload() {
   const stls = State.importedSTLs.map(entry => _buildSTLPayload(entry, _arrayBufferToBase64, false));
-  return { version: 1, devices: _buildDevicesPayload(), stls, camera: _buildCameraPayload(), floorSize: State.floorSize };
+  return { version: 1, stls, camera: _buildCameraPayload(), floorSize: State.floorSize };
 }
 
 // DB variant — stores raw ArrayBuffers (no base64), used by IndexedDB auto-save.
 export function buildScenePayloadForDB() {
   const stls = State.importedSTLs.map(entry => _buildSTLPayload(entry, buf => buf, true));
-  return { version: 1, devices: _buildDevicesPayload(), stls, camera: _buildCameraPayload(), floorSize: State.floorSize };
+  return { version: 1, stls, camera: _buildCameraPayload(), floorSize: State.floorSize };
 }
 
 // Metadata-only DB payload — omits the heavy mesh/point-cloud/splat buffers,
@@ -122,7 +97,7 @@ export function buildScenePayloadForDB() {
 // Cheap enough to clone into IndexedDB on every auto-save tick.
 export function buildSceneMetadataForDB() {
   const stls = State.importedSTLs.map(entry => _buildSTLPayload(entry, null, false));
-  return { version: 1, devices: _buildDevicesPayload(), stls, camera: _buildCameraPayload(), floorSize: State.floorSize };
+  return { version: 1, stls, camera: _buildCameraPayload(), floorSize: State.floorSize };
 }
 
 // The heavy buffers only, keyed by stl id. Re-written only when the buffer set
@@ -146,9 +121,8 @@ export function sceneBufferSignature() {
 
 export async function exportSceneState() {
   const payload = buildScenePayload();
-  console.log('[Save Scene]', payload.devices.length, 'devices,', payload.stls.length, 'objects');
-  for (const d of payload.devices) console.log('  device:', d.name, 'joints:', d.jointAngles.map(a => (a * 180 / Math.PI).toFixed(1)));
-  for (const s of payload.stls) console.log('  object:', s.name, 'pos:', s.position, 'rot:', s.rotation, 'parent:', s.parentLink);
+  console.log('[Save Scene]', payload.stls.length, 'objects');
+  for (const s of payload.stls) console.log('  object:', s.name, 'pos:', s.position, 'rot:', s.rotation);
 
   const json = JSON.stringify(payload, null, 2);
   const blob = new Blob([json], { type: 'application/json' });
@@ -184,26 +158,6 @@ export async function importSceneState(file) {
   const data = JSON.parse(text);
   if (!data.version || !data.stls) throw new Error('Invalid scene file');
   return data;
-}
-
-// Convert stable index-based parentLink (devIndex:linkName) back to runtime (devId:linkName)
-// Also handles legacy format (devId:linkName) from older save files
-function _parentLinkFromStable(parentLink) {
-  if (!parentLink || !parentLink.includes(':')) return parentLink;
-  const [idxStr, linkName] = parentLink.split(':', 2);
-  // Try index-based format first (e.g. "0:L1")
-  const devIdx = parseInt(idxStr, 10);
-  if (!isNaN(devIdx) && devIdx >= 0 && devIdx < State.devices.length) {
-    return State.devices[devIdx].id + ':' + linkName;
-  }
-  // Legacy format (e.g. "dev_0:L1") — search by link name across all devices
-  for (const dev of State.devices) {
-    if (dev.linkToJoint[linkName] !== undefined ||
-        (dev.parentGroups && dev.parentGroups[linkName])) {
-      return dev.id + ':' + linkName;
-    }
-  }
-  return null;
 }
 
 async function _promptForSplatFiles(expectedNames) {
@@ -350,18 +304,10 @@ export async function restoreSTLsFromState(records) {
       if (rec.splatTint !== undefined) entry._splatTint = rec.splatTint;
     }
 
-    // Apply parent link
-    const resolvedParent = _parentLinkFromStable(rec.parentLink);
-    if (resolvedParent) {
-      setSTLParent(entry, resolvedParent, true);
-    }
-
     console.log('[Restore]', rec.name,
       'pos:', [m.position.x.toFixed(4), m.position.y.toFixed(4), m.position.z.toFixed(4)],
       'rot:', [m.rotation.x.toFixed(4), m.rotation.y.toFixed(4), m.rotation.z.toFixed(4)],
-      'scale:', [m.scale.x.toFixed(4), m.scale.y.toFixed(4), m.scale.z.toFixed(4)],
-      'parent:', entry.parentLink,
-      'meshParent:', m.parent?.name || 'Scene');
+      'scale:', [m.scale.x.toFixed(4), m.scale.y.toFixed(4), m.scale.z.toFixed(4)]);
   }
 }
 
@@ -490,9 +436,6 @@ export function _addPointsToScene(geometry, buffer, name, color, stlId, transfor
   State.setStlColorIdx(Math.max(State.stlColorIdx, stlColors.indexOf(color) + 1));
   addSTLListItem(entry);
 
-  if (transforms && transforms.parentLink) {
-    setSTLParent(entry, transforms.parentLink, true);
-  }
   State.requestRender();
   return entry;
 }
@@ -539,9 +482,6 @@ export function _addMeshToScene(geometry, buffer, fileType, name, color, stlId, 
   State.setStlColorIdx(Math.max(State.stlColorIdx, stlColors.indexOf(color) + 1));
   addSTLListItem(entry);
 
-  if (transforms && transforms.parentLink) {
-    setSTLParent(entry, transforms.parentLink, true);
-  }
   State.requestRender();
   return entry;
 }
@@ -735,7 +675,7 @@ function _patchSplatBoxClip(material) {
 // splat centre (`viewCenter`). We inject a discard so any splat closer
 // to the camera than `foregroundClipDist` (world metres) is dropped,
 // letting the interior of a scan be seen in orthographic mode. Only the
-// splat material is patched, so meshes/robots are never clipped.
+// splat material is patched, so ordinary meshes are never clipped.
 function _patchSplatClipMaterial(material) {
   if (!material || material.userData._fgClipPatched) return;
   if (!material.vertexShader || !material.vertexShader.includes('uniform float orthoZoom;')) return;
@@ -1001,9 +941,6 @@ export function _addSplatToScene(buffer, ext, name, color, stlId, transforms, fi
     console.error('[Splat] Failed to load', name, err);
   });
 
-  if (transforms && transforms.parentLink) {
-    setSTLParent(entry, transforms.parentLink, true);
-  }
   State.requestRender();
   return entry;
 }
@@ -1295,65 +1232,6 @@ export function addSTLListItem(entry) {
 const stlModePanel = document.getElementById('stl-mode');
 const stlSelName   = document.getElementById('stl-sel-name');
 
-// STL parent-link assignment (multi-device aware)
-const _reparentMat = new THREE.Matrix4();
-
-export function resolveParentLink(parentValue) {
-  // parentValue is either 'devId:linkName' (new format) or just 'linkName' (legacy)
-  if (!parentValue) return { dev: null, linkName: null };
-  if (parentValue.includes(':')) {
-    const [devId, linkName] = parentValue.split(':', 2);
-    const dev = State.devices.find(d => d.id === devId);
-    return { dev: dev || null, linkName };
-  }
-  // Legacy: search all devices for this link name
-  for (const dev of State.devices) {
-    if (dev.linkToJoint[parentValue] !== undefined) {
-      return { dev, linkName: parentValue };
-    }
-  }
-  return { dev: null, linkName: parentValue };
-}
-
-export function setSTLParent(entry, parentValue, preserveLocal = false) {
-  const mesh = entry.mesh;
-  const { dev, linkName } = resolveParentLink(parentValue);
-
-  if (!preserveLocal) {
-    mesh.updateWorldMatrix(true, false);
-    _reparentMat.copy(mesh.matrixWorld);
-  }
-
-  mesh.removeFromParent();
-
-  let targetGroup = null;
-  if (dev && linkName) {
-    if (dev.linkToJoint[linkName] !== undefined) {
-      targetGroup = dev.jointRotGroups[dev.linkToJoint[linkName]];
-    } else if (dev.parentGroups && dev.parentGroups[linkName]) {
-      targetGroup = dev.parentGroups[linkName];
-    }
-  }
-
-  if (targetGroup) {
-    if (!preserveLocal) {
-      targetGroup.updateWorldMatrix(true, false);
-      const localMat = targetGroup.matrixWorld.clone().invert().multiply(_reparentMat);
-      localMat.decompose(mesh.position, mesh.quaternion, mesh.scale);
-      mesh.rotation.setFromQuaternion(mesh.quaternion);
-    }
-    targetGroup.add(mesh);
-    entry.parentLink = dev.id + ':' + linkName;
-  } else {
-    if (!preserveLocal) {
-      _reparentMat.decompose(mesh.position, mesh.quaternion, mesh.scale);
-      mesh.rotation.setFromQuaternion(mesh.quaternion);
-    }
-    State.scene.add(mesh);
-    entry.parentLink = null;
-  }
-}
-
 export function selectSTL(entry, listItem) {
   deselectSTL();
   State.setSelectedSTL(entry);
@@ -1362,7 +1240,6 @@ export function selectSTL(entry, listItem) {
   State.stlTransformControls.attach(entry.mesh);
   stlModePanel.style.display = 'block';
   stlSelName.textContent = entry.name;
-  document.getElementById('stlParentSelect').value = entry.parentLink || '';
   syncSTLNumericInputs(entry);
 
   if (listItem) listItem.classList.add('selected');

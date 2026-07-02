@@ -5,14 +5,14 @@
 // IndexedDB stores ArrayBuffers natively via structured clone.
 // ============================================================
 
-const DB_NAME    = 'robotvis_db';
+const DB_NAME    = 'lidarstudio_db';
 const DB_VERSION = 1;
 const STORE      = 'scene';
 const KEY        = 'autosave';
 // Heavy mesh/point-cloud/splat ArrayBuffers are stored under their own key so
-// the lightweight metadata record (camera, transforms, joint angles) can be
-// re-written on every auto-save without re-cloning megabytes of geometry that
-// never changed. See autoSaveScene in main.js.
+// the lightweight metadata record (camera, transforms) can be re-written on
+// every auto-save without re-cloning megabytes of geometry that never
+// changed. See autoSaveScene in main.js.
 export const BUFFERS_KEY = 'autosave_buffers';
 const VR_ANCHOR_KEY = 'vr_anchor';
 

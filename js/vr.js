@@ -2,13 +2,12 @@
 // js/vr.js — WebXR VR interaction (Meta Quest controller conventions)
 //
 // Controller mapping (Meta Quest guidelines):
-//   Trigger (select)    = ray-select: UI interaction, device selection
-//   Grip (squeeze)      = grab objects (STL meshes, IK target)
+//   Trigger (select)    = ray-select: UI interaction, object selection
+//   Grip (squeeze)      = grab objects (meshes, clouds, splats)
 //   Left thumbstick     = locomotion: up=teleport arc, L/R=snap turn
 //   Right thumbstick    = scroll panel (Y), snap turn (X) when not on panel
 //   Thumbstick press    = toggle passthrough (AR camera feed)
 //   B / Y button        = toggle / reposition VR panel
-//   A / X button        = reset to home position
 // ============================================================
 import * as THREE from 'three';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
@@ -16,10 +15,7 @@ import { HTMLMesh } from 'three/addons/interactive/HTMLMesh.js';
 import { InteractiveGroup } from 'three/addons/interactive/InteractiveGroup.js';
 import * as State from './state.js';
 import { setOrtho } from './scene.js';
-import { findDeviceForObject, setActiveDevice } from './panel.js';
-import { updateFK } from './kinematics.js';
 import { selectSTL } from './stl.js';
-import { syncHexapodFromTransform, syncHexapodSliders, updateHexapodPose } from './hexapod.js';
 import { dbSaveVRAnchor, dbLoadVRAnchor } from './storage.js';
 
 const _raycaster = new THREE.Raycaster();
@@ -297,7 +293,7 @@ function togglePassthrough() {
 const _vrOverflowSaved = [];
 
 function _stripOverflow() {
-  const ids = ['panel', 'device-list', 'stl-list'];
+  const ids = ['panel', 'stl-list'];
   for (const id of ids) {
     const el = document.getElementById(id);
     if (!el) continue;
@@ -386,17 +382,6 @@ function castRay(controller) {
   _tempMatrix.identity().extractRotation(controller.matrixWorld);
   _raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
   _raycaster.ray.direction.set(0, 0, -1).applyMatrix4(_tempMatrix);
-}
-
-function getAllDeviceMeshes() {
-  const meshes = [];
-  for (const dev of State.devices) {
-    for (const link of dev.robotLinkMeshes) {
-      for (const mesh of link.meshes) meshes.push(mesh);
-    }
-    for (const mesh of dev.staticMeshes) meshes.push(mesh);
-  }
-  return meshes;
 }
 
 function isPointingAtPanel(controller) {
@@ -495,21 +480,6 @@ function onTriggerStart(controller) {
     }
   }
 
-  // Device selection
-  const deviceMeshes = getAllDeviceMeshes();
-  const deviceHits = _raycaster.intersectObjects(deviceMeshes, false);
-  if (deviceHits.length > 0 && deviceHits[0].distance < 10) {
-    const hitDev = findDeviceForObject(deviceHits[0].object);
-    if (hitDev) {
-      controller.userData.hitType = 'device';
-      if (hitDev !== State.activeDevice) {
-        setActiveDevice(hitDev);
-        refreshVRPanel();
-      }
-      return;
-    }
-  }
-
   controller.userData.hitType = 'none';
 }
 
@@ -528,86 +498,6 @@ function onGripStart(controller) {
   // Collect all grabbable candidates
   const candidates = State.importedSTLs.filter(s => s.mesh.visible).map(s => s.mesh);
 
-  // IK target: check the target sphere itself, the TransformControls gizmo
-  // handles, and a larger invisible proximity sphere for easier VR targeting
-  let ikHit = false;
-  if (State.activeDevice?.ikMode && State.activeDevice.ikTarget) {
-    const ikTarget = State.activeDevice.ikTarget;
-
-    // Proximity check: is the ray within 0.08m (80mm) of the IK target center?
-    const ikWorldPos = new THREE.Vector3();
-    ikTarget.getWorldPosition(ikWorldPos);
-    const closest = new THREE.Vector3();
-    _raycaster.ray.closestPointToPoint(ikWorldPos, closest);
-    const dist = closest.distanceTo(ikWorldPos);
-    const rayDist = _raycaster.ray.origin.distanceTo(closest);
-
-    if (dist < 0.08 && rayDist < 5) {
-      ikHit = true;
-    }
-
-    // Also check the TransformControls gizmo children
-    if (!ikHit && State.transformControls.object === ikTarget) {
-      const gizmoHits = _raycaster.intersectObjects(State.transformControls.children, true);
-      if (gizmoHits.length > 0 && gizmoHits[0].distance < 5) {
-        ikHit = true;
-      }
-    }
-  }
-
-  // Hexapod platform grab: same interaction pattern as IK target
-  if (!ikHit && State.activeDevice?.ikMode && State.activeDevice.type === 'hexapod') {
-    const platGroup = State.activeDevice.platformGroup;
-    const platWorldPos = new THREE.Vector3();
-    platGroup.getWorldPosition(platWorldPos);
-    const closest = new THREE.Vector3();
-    _raycaster.ray.closestPointToPoint(platWorldPos, closest);
-    const dist = closest.distanceTo(platWorldPos);
-    const rayDist = _raycaster.ray.origin.distanceTo(closest);
-
-    if (dist < 0.15 && rayDist < 5) {
-      controller.getWorldPosition(_worldPos);
-      const objWorld = new THREE.Vector3();
-      platGroup.getWorldPosition(objWorld);
-
-      const ctrlQuat = new THREE.Quaternion();
-      controller.getWorldQuaternion(ctrlQuat);
-
-      activeGrab = {
-        controller,
-        object: platGroup,
-        offset: objWorld.clone().sub(_worldPos),
-        isIKTarget: false,
-        isHexapodPlatform: true,
-        startCtrlQuat: ctrlQuat,
-        startObjQuat: platGroup.quaternion.clone(),
-      };
-      return;
-    }
-  }
-
-  if (ikHit) {
-    const ikTarget = State.activeDevice.ikTarget;
-    controller.getWorldPosition(_worldPos);
-    const objWorld = new THREE.Vector3();
-    ikTarget.getWorldPosition(objWorld);
-
-    // Store initial quaternions for rotation tracking
-    const ctrlQuat = new THREE.Quaternion();
-    controller.getWorldQuaternion(ctrlQuat);
-
-    activeGrab = {
-      controller,
-      object: ikTarget,
-      offset: objWorld.clone().sub(_worldPos),
-      isIKTarget: true,
-      startCtrlQuat: ctrlQuat,
-      startObjQuat: ikTarget.quaternion.clone(),
-    };
-    return;
-  }
-
-  // STL meshes
   const hits = _raycaster.intersectObjects(candidates, true);
   if (hits.length > 0 && hits[0].distance < 5) {
     const hitObj = hits[0].object;
@@ -631,36 +521,9 @@ function onGripStart(controller) {
       controller,
       object: target,
       offset: objWorld.clone().sub(_worldPos),
-      isIKTarget: false,
       startCtrlQuat: ctrlQuat,
       startObjQuat: target.quaternion.clone(),
     };
-    return;
-  }
-
-  // Device base — grab rootGroup to translate/rotate the whole device
-  const deviceMeshes = getAllDeviceMeshes();
-  const devHits = _raycaster.intersectObjects(deviceMeshes, false);
-  if (devHits.length > 0 && devHits[0].distance < 5) {
-    const hitDev = findDeviceForObject(devHits[0].object);
-    if (hitDev) {
-      const target = hitDev.rootGroup;
-      controller.getWorldPosition(_worldPos);
-      const objWorld = new THREE.Vector3();
-      target.getWorldPosition(objWorld);
-
-      const ctrlQuat = new THREE.Quaternion();
-      controller.getWorldQuaternion(ctrlQuat);
-
-      activeGrab = {
-        controller,
-        object: target,
-        offset: objWorld.clone().sub(_worldPos),
-        isIKTarget: false,
-        startCtrlQuat: ctrlQuat,
-        startObjQuat: target.quaternion.clone(),
-      };
-    }
   }
 }
 
@@ -723,21 +586,6 @@ function pollGamepads(dt) {
     // B / Y button (index 5) — toggle and reposition VR panel
     if (gp.buttons[5] && buttonEdge(idx, 5, gp.buttons[5].pressed)) {
       toggleVRPanel();
-    }
-
-    // A / X button (index 4) — reset to home
-    if (gp.buttons[4] && buttonEdge(idx, 4, gp.buttons[4].pressed)) {
-      if (State.activeDevice) {
-        if (State.activeDevice.type === 'hexapod') {
-          State.activeDevice.platformPose.fill(0);
-          updateHexapodPose(State.activeDevice);
-          syncHexapodSliders(State.activeDevice);
-        } else {
-          State.activeDevice.jointAngles.fill(0);
-          updateFK(State.activeDevice);
-        }
-        refreshVRPanel();
-      }
     }
 
     // Thumbstick press (index 3) — toggle passthrough
@@ -952,16 +800,6 @@ export function updateVR(frame) {
       const deltaQuat = currentCtrlQuat.multiply(activeGrab.startCtrlQuat.clone().invert());
       const newQuat = deltaQuat.multiply(activeGrab.startObjQuat);
       activeGrab.object.quaternion.copy(newQuat);
-
-      if (activeGrab.isIKTarget && State.activeDevice) {
-        State.activeDevice.ikTargetQuat.copy(newQuat);
-        State.activeDevice.ikTargetEuler.setFromQuaternion(newQuat, 'YZX');
-      }
-    }
-
-    if (activeGrab.isHexapodPlatform && State.activeDevice?.type === 'hexapod') {
-      syncHexapodFromTransform(State.activeDevice);
-      syncHexapodSliders(State.activeDevice);
     }
   }
 

@@ -38,11 +38,6 @@
   }
   button:hover { background: #445; }
   button.active { background: #448; border-color: #66f; color: #fff; }
-  #ee-info {
-    margin-top: 8px; padding-top: 8px; border-top: 1px solid #334;
-    font-size: 11px; color: #889;
-  }
-  #ee-info span { color: #8cf; }
   .slider-row label span { cursor: text; }
   .editable-val {
     cursor: pointer; padding: 0 4px; border-radius: 2px;
@@ -104,123 +99,8 @@
     flex: 1; width: auto; padding: 5px 0; margin: 0;
     font-size: 11px; text-align: center;
   }
-  #stl-parent { margin-top: 5px; display: flex; align-items: center; gap: 5px; }
-  #stl-parent label { font-size: 11px; color: #889; white-space: nowrap; }
-  #stlParentSelect {
-    flex: 1; background: #223; color: #aac; border: 1px solid #446;
-    border-radius: 3px; font-size: 11px; padding: 2px 4px; outline: none;
-  }
-  #collision-info {
-    margin-top: 6px; padding-top: 6px; border-top: 1px solid #334;
-    font-size: 11px; color: #889;
-  }
-  #collision-info.hit { color: #f66; }
-  #collision-info .collision-pair {
-    color: #fa8; font-size: 10px; display: block;
-    padding-left: 8px; margin-top: 2px;
-  }
-  #ws-status {
-    position: absolute; top: 10px; left: 10px;
-    font-size: 11px; font-family: monospace; color: #889;
-    background: rgba(22,22,28,0.85); padding: 6px 10px;
-    border-radius: 6px; backdrop-filter: blur(8px);
-    border: 1px solid rgba(100,100,200,0.2);
-    cursor: pointer; user-select: none;
-  }
-  #ws-status:hover { border-color: rgba(100,100,200,0.5); color: #aab; }
-  #ws-status .dot {
-    display: inline-block; width: 8px; height: 8px;
-    border-radius: 50%; margin-right: 6px; vertical-align: middle;
-  }
-  #ws-status .dot.off { background: #555; }
-  #ws-status .dot.on { background: #4f4; box-shadow: 0 0 4px #4f4; }
-  #ws-status .dot.err { background: #f44; box-shadow: 0 0 4px #f44; }
-  #ws-info-panel {
-    position: absolute; top: 38px; left: 10px; width: 340px;
-    background: rgba(10,10,30,0.95); color: #ccd;
-    border: 1px solid rgba(100,100,200,0.35); border-radius: 8px;
-    backdrop-filter: blur(10px); padding: 12px 14px;
-    font-family: monospace; font-size: 11px;
-    z-index: 100;
-  }
-  .wsi-row {
-    display: flex; align-items: center; gap: 6px;
-    margin-bottom: 8px;
-  }
-  .wsi-row:last-child { margin-bottom: 0; }
-  .wsi-label {
-    width: 86px; flex-shrink: 0; color: #778; font-size: 10px; text-align: right;
-  }
-  .wsi-val {
-    flex: 1; color: #8cf; background: rgba(0,0,40,0.6);
-    border: 1px solid rgba(80,80,160,0.4); border-radius: 3px;
-    padding: 2px 6px; font-size: 11px; overflow: hidden;
-    text-overflow: ellipsis; white-space: nowrap;
-  }
-  .wsi-copy {
-    width: auto; padding: 2px 6px; margin: 0; font-size: 12px;
-    background: rgba(50,50,90,0.8); border-color: rgba(80,80,160,0.4);
-    color: #889; flex-shrink: 0;
-  }
-  .wsi-copy:hover { background: #446; color: #fff; }
-  .wsi-copy.copied { color: #4f4; border-color: #4f4; }
-  .wsi-divider { border-top: 1px solid rgba(100,100,200,0.2); margin: 8px 0; }
-  #wsi-download {
-    display: block; text-align: center; padding: 5px;
-    background: rgba(50,50,90,0.8); border: 1px solid rgba(80,80,160,0.4);
-    border-radius: 4px; color: #8cf; font-size: 11px; text-decoration: none;
-  }
-  #wsi-download:hover { background: #446; color: #fff; border-color: #66f; }
   #nav-gizmo {
-    position: absolute; top: 45px; left: 10px;
+    position: absolute; top: 10px; left: 10px;
     width: 110px; height: 110px; cursor: default;
     border-radius: 50%;
-  }
-  /* Device manager styles */
-  #device-manager { margin-bottom: 10px; }
-  #primary-model-row {
-    display: flex; align-items: center; gap: 5px; margin-bottom: 6px;
-  }
-  #primaryModelSelect {
-    flex: 1; background: #223; color: #aac; border: 1px solid #446;
-    border-radius: 4px; font-size: 11px; padding: 3px 6px; outline: none;
-  }
-  #device-list {
-    max-height: 120px; overflow-y: auto; margin-bottom: 4px;
-  }
-  .device-item {
-    display: flex; align-items: center; justify-content: space-between;
-    font-size: 11px; color: #aac; padding: 4px 6px;
-    border: 1px solid transparent; border-radius: 4px;
-    cursor: pointer; margin-bottom: 2px;
-  }
-  .device-item:hover { background: rgba(100,140,255,0.1); }
-  .device-item.active {
-    background: rgba(100,140,255,0.2);
-    border-color: rgba(100,140,255,0.4);
-    color: #fff;
-  }
-  .device-item .dev-name {
-    flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .device-item .dev-rm {
-    background: none; border: none; color: #667; cursor: pointer;
-    font-size: 11px; padding: 0 3px; width: auto; margin: 0;
-  }
-  .device-item .dev-rm:hover { color: #f66; }
-  #add-device-row {
-    display: flex; gap: 4px;
-  }
-  #addDeviceSelect {
-    flex: 1; background: #223; color: #aac; border: 1px solid #446;
-    border-radius: 4px; font-size: 11px; padding: 3px 6px; outline: none;
-  }
-  #addDeviceBtn {
-    width: 32px; padding: 3px 0; margin: 0; font-size: 14px; font-weight: bold;
-  }
-  #device-parent { display: flex; align-items: center; gap: 5px; }
-  #device-parent label { font-size: 11px; color: #889; white-space: nowrap; }
-  #deviceParentSelect {
-    flex: 1; background: #223; color: #aac; border: 1px solid #446;
-    border-radius: 3px; font-size: 11px; padding: 2px 4px; outline: none;
   }

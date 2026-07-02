@@ -1,7 +1,7 @@
 {
   "name": "lidarstudio",
   "version": "1.0.0",
-  "description": "Browser-based studio for generating and editing LiDAR point clouds and 3D Gaussian splats — Three.js + GaussianSplats3D viewer with a Python backend. Built on a config-driven robot/device viewer (kinematics, mesh import, collision detection, remote control API).",
+  "description": "Browser-based studio for generating and editing LiDAR point clouds and 3D Gaussian splats — Three.js + GaussianSplats3D viewer with a Python backend.",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },

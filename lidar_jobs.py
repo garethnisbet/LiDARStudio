@@ -160,10 +160,6 @@ def _list_outputs(project_path: Path) -> dict:
 
 # ── HTTP handlers ──────────────────────────────────────────────────────────────
 
-async def index_handler(request):
-    return web.FileResponse(ROOT / "lidar_editor.html")
-
-
 async def browse_handler(request):
     """POST /api/browse — open native folder picker; return chosen path."""
     data: dict = {}

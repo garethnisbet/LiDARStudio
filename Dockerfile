@@ -9,9 +9,13 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev
 
+# aiohttp serves the app; numpy/plyfile power the editing endpoints.
+# The heavy generation deps (open3d, kiss-icp, torch/gsplat for trained
+# splats) are intentionally left out of the image — generation runs on a
+# workstation with the scan data.
 RUN pip install uv && \
     uv venv /app/.venv && \
-    uv pip install --python /app/.venv/bin/python aiohttp
+    uv pip install --python /app/.venv/bin/python aiohttp numpy plyfile
 
 # Stage 2: runtime — minimal image with venv + static assets
 FROM python:3.12-slim AS runtime
@@ -21,22 +25,18 @@ WORKDIR /app
 COPY --from=build /app/.venv /app/.venv
 COPY --from=build /app/node_modules ./node_modules/
 
-COPY server.py robot_ipython.py RemoteAPI.zip threejs_scene.html viewer.css *.glb ./
+COPY server.py lidar_jobs.py edit_ops.py cloud_ops.py splat_io.py \
+     process_pointcloud.py process_splat.py \
+     threejs_scene.html viewer.css package.json ./
 COPY js/ ./js/
-COPY *.json ./
 
 RUN echo "=== Files in /app ===" && ls -lh /app && \
     echo "=== Verifying Python ===" && \
     /app/.venv/bin/python --version && \
     echo "=== Verifying aiohttp import ===" && \
     /app/.venv/bin/python -c "import aiohttp; print('aiohttp', aiohttp.__version__)" && \
-    echo "=== Verifying server.py syntax ===" && \
-    /app/.venv/bin/python -m py_compile server.py && echo "server.py OK" && \
-    echo "=== Verifying config files ===" && \
-    for f in *.json; do \
-        /app/.venv/bin/python -c "import json,sys; json.load(open('$f')); print('$f OK')" || \
-        { echo "INVALID JSON: $f"; exit 1; }; \
-    done && \
+    echo "=== Verifying server syntax ===" && \
+    /app/.venv/bin/python -m py_compile server.py lidar_jobs.py && echo "server OK" && \
     echo "=== Runtime stage verification complete ==="
 
 ENV PATH="/app/.venv/bin:$PATH"
