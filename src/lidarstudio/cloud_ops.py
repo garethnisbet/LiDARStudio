@@ -26,7 +26,9 @@ def save(pcd: o3d.geometry.PointCloud, path: str) -> None:
 def statistical_outlier(
     pcd: o3d.geometry.PointCloud, nb_neighbors: int = 20, std_ratio: float = 2.0
 ) -> o3d.geometry.PointCloud:
-    out, _ = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
+    out, _ = pcd.remove_statistical_outlier(
+        nb_neighbors=nb_neighbors, std_ratio=std_ratio
+    )
     return out
 
 
@@ -37,7 +39,9 @@ def radius_outlier(
     return out
 
 
-def voxel_downsample(pcd: o3d.geometry.PointCloud, voxel: float = 0.01) -> o3d.geometry.PointCloud:
+def voxel_downsample(
+    pcd: o3d.geometry.PointCloud, voxel: float = 0.01
+) -> o3d.geometry.PointCloud:
     return pcd.voxel_down_sample(voxel_size=voxel)
 
 
@@ -102,8 +106,12 @@ def auto_clean(
 # --------------------------------------------------------------------------- #
 # Index / keep-mask variants -- so the GUI can show exactly what gets removed
 # --------------------------------------------------------------------------- #
-def statistical_outlier_keep(pcd, nb_neighbors: int = 20, std_ratio: float = 2.0) -> np.ndarray:
-    _, ind = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
+def statistical_outlier_keep(
+    pcd, nb_neighbors: int = 20, std_ratio: float = 2.0
+) -> np.ndarray:
+    _, ind = pcd.remove_statistical_outlier(
+        nb_neighbors=nb_neighbors, std_ratio=std_ratio
+    )
     return np.asarray(ind, dtype=np.int64)
 
 
@@ -114,7 +122,10 @@ def radius_outlier_keep(pcd, nb_points: int = 16, radius: float = 0.05) -> np.nd
 
 def aabb_keep(pcd, min_xyz, max_xyz, invert: bool = False) -> np.ndarray:
     pts = np.asarray(pcd.points)
-    inside = np.all((pts >= np.asarray(min_xyz, float)) & (pts <= np.asarray(max_xyz, float)), axis=1)
+    inside = np.all(
+        (pts >= np.asarray(min_xyz, float)) & (pts <= np.asarray(max_xyz, float)),
+        axis=1,
+    )
     keep = ~inside if invert else inside
     return np.nonzero(keep)[0]
 
@@ -128,9 +139,9 @@ def obb_mask(pcd, to_local_matrix) -> np.ndarray:
     sends inv(boxWorld) @ cloudWorld, folding in the cloud's in-scene transform.
     A point is inside when |xyz| <= 0.5 after the transform."""
     pts = np.asarray(pcd.points, float)
-    M = np.asarray(to_local_matrix, float).reshape(4, 4).T   # column-major -> row-major
-    h = np.concatenate([pts, np.ones((len(pts), 1))], axis=1)   # N x 4 homogeneous
-    local = h @ M.T                                             # (M @ h.T).T
+    M = np.asarray(to_local_matrix, float).reshape(4, 4).T  # column-major -> row-major
+    h = np.concatenate([pts, np.ones((len(pts), 1))], axis=1)  # N x 4 homogeneous
+    local = h @ M.T  # (M @ h.T).T
     return np.all(np.abs(local[:, :3]) <= 0.5, axis=1)
 
 
@@ -149,14 +160,14 @@ def primitive_erase_keep(pcd, erasers) -> np.ndarray:
     unit shape — cube |xyz| <= 0.5, sphere r <= 0.5, cylinder r(xz) <= 0.5 and
     |y| <= 0.5. A point inside ANY eraser is removed (union)."""
     pts = np.asarray(pcd.points, float)
-    h = np.concatenate([pts, np.ones((len(pts), 1))], axis=1)   # N x 4
+    h = np.concatenate([pts, np.ones((len(pts), 1))], axis=1)  # N x 4
     inside = np.zeros(len(pts), dtype=bool)
     for e in erasers or []:
-        M = np.asarray(e["matrix"], float).reshape(4, 4).T      # column-major -> row-major
+        M = np.asarray(e["matrix"], float).reshape(4, 4).T  # column-major -> row-major
         loc = (h @ M.T)[:, :3]
         t = (e.get("type") or "cube").lower()
         if t == "sphere":
-            m = (loc ** 2).sum(axis=1) <= 0.25
+            m = (loc**2).sum(axis=1) <= 0.25
         elif t == "cylinder":
             m = (loc[:, 0] ** 2 + loc[:, 2] ** 2 <= 0.25) & (np.abs(loc[:, 1]) <= 0.5)
         else:  # cube / box
@@ -216,7 +227,8 @@ def info(pcd: o3d.geometry.PointCloud) -> str:
     mx = pts.max(0)
     return (
         f"{len(pts):,} pts  "
-        f"bbox=[{mn[0]:.2f},{mn[1]:.2f},{mn[2]:.2f}]..[{mx[0]:.2f},{mx[1]:.2f},{mx[2]:.2f}]  "
+        f"bbox=[{mn[0]:.2f},{mn[1]:.2f},{mn[2]:.2f}].."
+        f"[{mx[0]:.2f},{mx[1]:.2f},{mx[2]:.2f}]  "
         f"colors={'yes' if pcd.has_colors() else 'no'}"
     )
 
@@ -224,7 +236,7 @@ def info(pcd: o3d.geometry.PointCloud) -> str:
 def main() -> None:
     """Headless auto-clean: SOR + percentile crop + radius outlier removal.
 
-        python -m raven.cloud_ops work/cloud_raw.ply work/cloud_edited.ply
+    python -m raven.cloud_ops work/cloud_raw.ply work/cloud_edited.ply
     """
     import argparse
 
@@ -241,8 +253,15 @@ def main() -> None:
 
     pcd = load(args.input)
     print("input: ", info(pcd))
-    out = auto_clean(pcd, args.sor_neighbors, args.sor_std, args.crop_low,
-                     args.crop_high, args.radius_nb, args.radius)
+    out = auto_clean(
+        pcd,
+        args.sor_neighbors,
+        args.sor_std,
+        args.crop_low,
+        args.crop_high,
+        args.radius_nb,
+        args.radius,
+    )
     print("output:", info(out))
     save(out, args.output)
     print(f"saved -> {args.output}")

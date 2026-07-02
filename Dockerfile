@@ -1,4 +1,4 @@
-# Stage 1: build — install Python and Node dependencies
+# Stage 1: build — install Node dependencies and the Python package
 FROM python:3.12-slim AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm && \
@@ -9,13 +9,17 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev
 
-# aiohttp serves the app; numpy/plyfile power the editing endpoints.
-# The heavy generation deps (open3d, kiss-icp, torch/gsplat for trained
+# Install the lidarstudio package (aiohttp/numpy/plyfile) into a venv.
+# No .git in the build context, so give setuptools_scm a version.
+# The heavy generation extras (open3d, kiss-icp, torch/gsplat for trained
 # splats) are intentionally left out of the image — generation runs on a
 # workstation with the scan data.
+ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LIDARSTUDIO=0.0.0
+COPY pyproject.toml README.md LICENSE ./
+COPY src/ ./src/
 RUN pip install uv && \
     uv venv /app/.venv && \
-    uv pip install --python /app/.venv/bin/python aiohttp numpy plyfile
+    uv pip install --python /app/.venv/bin/python .
 
 # Stage 2: runtime — minimal image with venv + static assets
 FROM python:3.12-slim AS runtime
@@ -25,19 +29,13 @@ WORKDIR /app
 COPY --from=build /app/.venv /app/.venv
 COPY --from=build /app/node_modules ./node_modules/
 
-COPY server.py lidar_jobs.py edit_ops.py cloud_ops.py splat_io.py \
-     process_pointcloud.py process_splat.py \
-     threejs_scene.html viewer.css package.json ./
+# Front-end assets, served from the working directory
+COPY threejs_scene.html viewer.css ./
 COPY js/ ./js/
 
-RUN echo "=== Files in /app ===" && ls -lh /app && \
-    echo "=== Verifying Python ===" && \
-    /app/.venv/bin/python --version && \
-    echo "=== Verifying aiohttp import ===" && \
-    /app/.venv/bin/python -c "import aiohttp; print('aiohttp', aiohttp.__version__)" && \
-    echo "=== Verifying server syntax ===" && \
-    /app/.venv/bin/python -m py_compile server.py lidar_jobs.py && echo "server OK" && \
-    echo "=== Runtime stage verification complete ==="
+RUN echo "=== Verifying install ===" && \
+    /app/.venv/bin/lidarstudio --version && \
+    /app/.venv/bin/python -c "import lidarstudio.lidar_jobs; print('lidar_jobs OK')"
 
 ENV PATH="/app/.venv/bin:$PATH"
 
@@ -48,5 +46,5 @@ USER appuser
 
 EXPOSE 8080
 
-ENTRYPOINT ["python", "server.py"]
+ENTRYPOINT ["lidarstudio"]
 CMD ["--host", "0.0.0.0", "--port", "8080"]

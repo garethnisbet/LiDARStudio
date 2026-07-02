@@ -7,7 +7,7 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "Apache-2.0",
   "dependencies": {
     "@mkkellogg/gaussian-splats-3d": "^0.4.7",
     "html2canvas": "^1.4.1",

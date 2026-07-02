@@ -1,0 +1,17 @@
+# Changes here will be overwritten by Copier
+_commit: 5.2.0
+_src_path: https://github.com/DiamondLightSource/python-copier-template.git
+author_email: garethnisbet@gmail.com
+author_name: Gareth Nisbet
+description: Browser-based studio for generating and editing LiDAR point clouds and
+    3D Gaussian splats
+distribution_name: lidarstudio
+docker: false
+docs_type: README
+git_platform: github.com
+github_org: garethnisbet
+package_name: lidarstudio
+pypi: false
+repo_name: LiDARStudio
+strict_typing: false
+type_checker: pyright

@@ -53,10 +53,15 @@ def display_colours(data) -> np.ndarray:
     ``red/green/blue``, else neutral grey."""
     names = data.dtype.names
     if "f_dc_0" in names:
-        dc = np.stack([data["f_dc_0"], data["f_dc_1"], data["f_dc_2"]], 1).astype(np.float64)
+        dc = np.stack([data["f_dc_0"], data["f_dc_1"], data["f_dc_2"]], 1).astype(
+            np.float64
+        )
         return np.clip(0.5 + SH_C0 * dc, 0.0, 1.0)
     if "red" in names:
-        return np.stack([data["red"], data["green"], data["blue"]], 1).astype(np.float64) / 255.0
+        return (
+            np.stack([data["red"], data["green"], data["blue"]], 1).astype(np.float64)
+            / 255.0
+        )
     return np.full((len(data), 3), 0.6)
 
 
@@ -112,8 +117,8 @@ def transform_splat(data, M):
     M = np.asarray(M, float)
     R = M[:3, :3]
     t = M[:3, 3]
-    scale = np.linalg.norm(R, axis=0)              # per-axis scale (column norms)
-    Rn = R / np.where(scale == 0, 1, scale)        # pure rotation (assumes no shear)
+    scale = np.linalg.norm(R, axis=0)  # per-axis scale (column norms)
+    Rn = R / np.where(scale == 0, 1, scale)  # pure rotation (assumes no shear)
 
     out = data.copy()
     names = data.dtype.names
@@ -123,8 +128,10 @@ def transform_splat(data, M):
     out["x"], out["y"], out["z"] = p2[:, 0], p2[:, 1], p2[:, 2]
 
     if all(f in names for f in ("rot_0", "rot_1", "rot_2", "rot_3")):
-        aw, ax, ay, az = _quat_from_matrix(Rn)     # world rotation, (w,x,y,z)
-        q = np.stack([data["rot_0"], data["rot_1"], data["rot_2"], data["rot_3"]], 1).astype(float)
+        aw, ax, ay, az = _quat_from_matrix(Rn)  # world rotation, (w,x,y,z)
+        q = np.stack(
+            [data["rot_0"], data["rot_1"], data["rot_2"], data["rot_3"]], 1
+        ).astype(float)
         nrm = np.linalg.norm(q, axis=1, keepdims=True)
         q = q / np.where(nrm == 0, 1, nrm)
         bw, bx, by, bz = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
@@ -143,13 +150,21 @@ def transform_splat(data, M):
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("input")
     ap.add_argument("output")
-    ap.add_argument("--crop", type=float, nargs=6, metavar=("XMIN", "YMIN", "ZMIN", "XMAX", "YMAX", "ZMAX"),
-                    help="keep only gaussians whose centres fall inside this AABB")
-    ap.add_argument("--invert", action="store_true", help="with --crop, remove inside instead")
+    ap.add_argument(
+        "--crop",
+        type=float,
+        nargs=6,
+        metavar=("XMIN", "YMIN", "ZMIN", "XMAX", "YMAX", "ZMAX"),
+        help="keep only gaussians whose centres fall inside this AABB",
+    )
+    ap.add_argument(
+        "--invert", action="store_true", help="with --crop, remove inside instead"
+    )
     args = ap.parse_args()
 
     if not is_splat_ply(args.input):
@@ -157,14 +172,17 @@ def main() -> None:
     data, fields = load_splat(args.input)
     idx = None
     if args.crop:
-        lo = np.array(args.crop[:3]); hi = np.array(args.crop[3:])
+        lo = np.array(args.crop[:3])
+        hi = np.array(args.crop[3:])
         p = xyz(data)
         inside = np.all((p >= lo) & (p <= hi), axis=1)
         keep = ~inside if args.invert else inside
         idx = np.nonzero(keep)[0]
     n = save_splat(args.output, data, idx)
-    print(f"{args.input}: {len(data):,} gaussians ({len(fields)} fields) "
-          f"-> {args.output}: {n:,} kept")
+    print(
+        f"{args.input}: {len(data):,} gaussians ({len(fields)} fields) "
+        f"-> {args.output}: {n:,} kept"
+    )
 
 
 if __name__ == "__main__":

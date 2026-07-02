@@ -1,15 +1,23 @@
+[![CI](https://github.com/garethnisbet/LiDARStudio/actions/workflows/ci.yml/badge.svg)](https://github.com/garethnisbet/LiDARStudio/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+
 # LidarStudio
 
 A browser-based studio for **generating and editing LiDAR point clouds and 3D Gaussian splats**, built on a Three.js + GaussianSplats3D viewer with a Python backend. Generate clouds/splats from raw scan bags, then clean, crop, recolour, erase, and re-place them interactively — all non-destructively, with results saved back into your project.
 
-> **Note:** the LiDAR features are driven by a Python backend (`lidar_jobs.py`, `process_pointcloud.py`, `process_splat.py`, `edit_ops.py`, `cloud_ops.py`, `splat_io.py`) wired into `server.py`. The browser JS is served fresh on every reload, but the Python modules are imported once and cached — **restart `server.py` after any `.py` change** for it to take effect.
+> **Note:** the LiDAR features are driven by the Python backend (`src/lidarstudio/`). The browser JS is served fresh on every reload, but the Python modules are imported once per process — **restart the server after any backend `.py` change** for it to take effect.
 
 ## Quick Start
 
+The Python side follows the [DLS python-copier-template](https://github.com/DiamondLightSource/python-copier-template) layout and is managed with [uv](https://docs.astral.sh/uv/):
+
 ```bash
-pip3 install aiohttp numpy plyfile open3d scipy   # plus torch + gsplat for GPU-trained splats
-python3 server.py
+npm install                              # front-end deps (three.js, GaussianSplats3D)
+uv sync                                  # create .venv and install lidarstudio + dev tools
+uv run lidarstudio                       # start the server
 ```
+
+Generation needs the pipeline extra (`uv sync --extra pipeline` — open3d, kiss-icp, rosbags, OpenCV, scipy; the trained-splat mode additionally needs CUDA + torch + gsplat). Editing/serving alone needs no extras.
 
 Open `http://localhost:8080` and use the **LiDAR Workflow** panel.
 
@@ -86,7 +94,7 @@ The scene around the LiDAR tools is a general-purpose 3D editor:
 
 **Server (Python)** — everything that touches files or needs numpy/CUDA:
 
-| Module | Role |
+| Module (`src/lidarstudio/`) | Role |
 |--------|------|
 | `server.py` | aiohttp server: static assets (allowlisted), LiDAR API mounting, loopback guard |
 | `lidar_jobs.py` | `/api/*` handlers: projects, scan validation, job orchestration + SSE progress, file proxy |
@@ -99,13 +107,17 @@ The browser calls the backend over REST + Server-Sent Events; there is no other 
 ## Project Structure
 
 ```
-server.py                aiohttp server (static + LiDAR API)
-lidar_jobs.py            LiDAR workflow API handlers
-process_pointcloud.py    bag → coloured, registered point cloud
-process_splat.py         cloud → gaussian splat (surfel / trained / bootstrap)
-edit_ops.py              edit operations (decimate, SOR, crop, recolour, bake)
-cloud_ops.py             point-cloud helpers (open3d)
-splat_io.py              splat PLY read/write
+pyproject.toml           packaging, deps, ruff/pyright/pytest/tox config (DLS template)
+src/lidarstudio/
+  __main__.py            `python -m lidarstudio` / `lidarstudio` entry point
+  server.py              aiohttp server (static + LiDAR API)
+  lidar_jobs.py          LiDAR workflow API handlers
+  process_pointcloud.py  bag → coloured, registered point cloud
+  process_splat.py       cloud → gaussian splat (surfel / trained / bootstrap)
+  edit_ops.py            edit operations (decimate, SOR, crop, recolour, bake)
+  cloud_ops.py           point-cloud helpers (open3d)
+  splat_io.py            splat PLY read/write
+tests/                   pytest suite
 threejs_scene.html       the app page
 viewer.css               styles
 js/
@@ -117,7 +129,17 @@ js/
   storage.js             IndexedDB persistence
   vr.js                  WebXR support
 Dockerfile, helm/        container + k8s deployment
+.github/, .devcontainer/ CI workflows + dev container (from the DLS template)
 ```
+
+## Development
+
+```bash
+uv sync            # dev environment (.venv)
+uv run tox -p      # run everything CI runs: pre-commit (ruff), pyright, pytest
+```
+
+The repo was generated against the [DLS python-copier-template](https://github.com/DiamondLightSource/python-copier-template); pull future template updates with `uvx copier update`.
 
 ## Deployment
 

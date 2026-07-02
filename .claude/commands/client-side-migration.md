@@ -8,7 +8,7 @@ Migrate LidarStudio's heavy lifting from the Python backend to the browser, stag
 
 - The page is already **cross-origin isolated** (`server.py` sends COOP/COEP headers), so `SharedArrayBuffer`, multithreaded WASM, and WebGPU compute are available now.
 - The browser already does real-time point editing (live eraser, visibility-box GPU clip in `js/lidar.js`) — the migration extends that pattern to persistence and generation.
-- Server pieces being replaced: `lidar_jobs.py` (API + file proxy), `edit_ops.py`/`cloud_ops.py`/`splat_io.py` (edit ops + PLY I/O), `process_pointcloud.py` (bag → cloud), `process_splat.py` (cloud → splat).
+- Server pieces being replaced (all under `src/lidarstudio/`): `lidar_jobs.py` (API + file proxy), `edit_ops.py`/`cloud_ops.py`/`splat_io.py` (edit ops + PLY I/O), `process_pointcloud.py` (bag → cloud), `process_splat.py` (cloud → splat).
 - Keep the Python pipeline working in parallel throughout — it remains the headless/batch path and the fallback for non-Chromium browsers and VR headsets (weak clients want server-side processing; consider a "process locally / on server" toggle rather than deleting the server path).
 
 ## Stage 1 — Edit ops + Save in the browser (do this first; proves the pattern)

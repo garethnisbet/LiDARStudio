@@ -15,10 +15,9 @@ import logging
 import os
 import shutil
 import sys
+import threading
 import uuid
 from pathlib import Path
-from typing import Optional
-import threading
 
 from aiohttp import web
 
@@ -33,7 +32,8 @@ jobs: dict = {}
 
 # ── Native folder picker ───────────────────────────────────────────────────────
 
-def _tk_browse_folder(title: str = "Select Folder", initial: str = "") -> Optional[str]:
+
+def _tk_browse_folder(title: str = "Select Folder", initial: str = "") -> str | None:
     """Open a native folder picker dialog. Returns the chosen path or None."""
     if sys.platform == "linux" and not os.environ.get("DISPLAY"):
         return None  # headless — no display
@@ -67,6 +67,7 @@ def _tk_browse_folder(title: str = "Select Folder", initial: str = "") -> Option
 
 
 # ── Scan folder inspection ─────────────────────────────────────────────────────
+
 
 def _scan_contents(scan_path: Path) -> dict:
     """Return a description of the files found inside a scan folder."""
@@ -160,6 +161,7 @@ def _list_outputs(project_path: Path) -> dict:
 
 # ── HTTP handlers ──────────────────────────────────────────────────────────────
 
+
 async def browse_handler(request):
     """POST /api/browse — open native folder picker; return chosen path."""
     data: dict = {}
@@ -181,6 +183,7 @@ async def browse_handler(request):
     # Check whether tkinter is available but user cancelled vs. not available
     try:
         import tkinter  # noqa: F401
+
         return web.json_response({"path": None, "cancelled": True})
     except ImportError:
         return web.json_response(
@@ -206,11 +209,13 @@ async def browse_dir_handler(request):
     except PermissionError:
         return web.json_response({"error": "Permission denied"}, status=403)
 
-    return web.json_response({
-        "path": str(p),
-        "parent": str(p.parent) if p.parent != p else None,
-        "items": items,
-    })
+    return web.json_response(
+        {
+            "path": str(p),
+            "parent": str(p.parent) if p.parent != p else None,
+            "items": items,
+        }
+    )
 
 
 async def project_create_handler(request):
@@ -228,7 +233,9 @@ async def project_create_handler(request):
     project_path = Path(folder) / safe_name
 
     if project_path.exists():
-        return web.json_response({"error": f"Already exists: {project_path}"}, status=409)
+        return web.json_response(
+            {"error": f"Already exists: {project_path}"}, status=409
+        )
 
     try:
         project_path.mkdir(parents=True)
@@ -261,12 +268,14 @@ async def project_open_handler(request):
         except Exception:
             pass
 
-    return web.json_response({
-        "path": str(p),
-        "name": p.name,
-        "meta": meta,
-        "outputs": _list_outputs(p),
-    })
+    return web.json_response(
+        {
+            "path": str(p),
+            "name": p.name,
+            "meta": meta,
+            "outputs": _list_outputs(p),
+        }
+    )
 
 
 async def scan_validate_handler(request):
@@ -290,15 +299,18 @@ async def scan_validate_handler(request):
         except Exception as exc:
             params = {"_parse_error": str(exc)}
 
-    return web.json_response({
-        "path": str(p),
-        "name": p.name,
-        "contents": contents,
-        "parameters": params,
-    })
+    return web.json_response(
+        {
+            "path": str(p),
+            "name": p.name,
+            "contents": contents,
+            "parameters": params,
+        }
+    )
 
 
 # ── Processing jobs ────────────────────────────────────────────────────────────
+
 
 async def process_start_handler(request):
     """POST /api/process/start — launch a background processing job."""
@@ -309,17 +321,19 @@ async def process_start_handler(request):
     options = data.get("options", {})
 
     if job_type not in ("pointcloud", "splat"):
-        return web.json_response({"error": "type must be 'pointcloud' or 'splat'"}, status=400)
+        return web.json_response(
+            {"error": "type must be 'pointcloud' or 'splat'"}, status=400
+        )
     if not project_path or not scan_path:
-        return web.json_response({"error": "project_path and scan_path required"}, status=400)
+        return web.json_response(
+            {"error": "project_path and scan_path required"}, status=400
+        )
 
     job_id = uuid.uuid4().hex[:8]
     queue: asyncio.Queue = asyncio.Queue()
     jobs[job_id] = {"queue": queue, "done": False}
 
-    asyncio.create_task(
-        _run_job(job_id, job_type, project_path, scan_path, options)
-    )
+    asyncio.create_task(_run_job(job_id, job_type, project_path, scan_path, options))
 
     return web.json_response({"job_id": job_id})
 
@@ -360,10 +374,14 @@ def _pointcloud_cmd(scan, contents, output_file, voxel):
     cmd = [
         sys.executable,
         str(ROOT / "process_pointcloud.py"),
-        "--lidar-bag", str(scan / contents["lidar_bag"]),
-        "--image-bag", str(scan / contents["image_bag"]),
-        "--output", str(output_file),
-        "--voxel-size", str(voxel),
+        "--lidar-bag",
+        str(scan / contents["lidar_bag"]),
+        "--image-bag",
+        str(scan / contents["image_bag"]),
+        "--output",
+        str(output_file),
+        "--voxel-size",
+        str(voxel),
     ]
     if contents.get("project_parameters"):
         cmd += ["--params", str(scan / "project_parameters.json")]
@@ -377,10 +395,18 @@ async def _job_pointcloud(project_path, scan_path, options, queue):
     scan = Path(scan_path)
     contents = _scan_contents(scan)
 
-    await queue.put({"event": "progress", "percent": 0, "message": "Starting point cloud generation…"})
+    await queue.put(
+        {
+            "event": "progress",
+            "percent": 0,
+            "message": "Starting point cloud generation…",
+        }
+    )
 
     if not contents.get("valid"):
-        await queue.put({"event": "error", "message": "Scan folder is missing required bag files"})
+        await queue.put(
+            {"event": "error", "message": "Scan folder is missing required bag files"}
+        )
         return
 
     out_dir = proj / "pointclouds"
@@ -393,7 +419,13 @@ async def _job_pointcloud(project_path, scan_path, options, queue):
 
     cmd = _pointcloud_cmd(scan, contents, output_file, options.get("voxel_size", 0.05))
 
-    await queue.put({"event": "progress", "percent": 5, "message": "Launching process_pointcloud.py…"})
+    await queue.put(
+        {
+            "event": "progress",
+            "percent": 5,
+            "message": "Launching process_pointcloud.py…",
+        }
+    )
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -402,7 +434,12 @@ async def _job_pointcloud(project_path, scan_path, options, queue):
             stderr=asyncio.subprocess.STDOUT,
         )
     except FileNotFoundError:
-        await queue.put({"event": "error", "message": "process_pointcloud.py not found — see the stub script."})
+        await queue.put(
+            {
+                "event": "error",
+                "message": "process_pointcloud.py not found — see the stub script.",
+            }
+        )
         return
 
     rc = await _stream_proc(proc, queue)
@@ -410,15 +447,22 @@ async def _job_pointcloud(project_path, scan_path, options, queue):
     if rc == 0 and output_file.exists():
         size_mb = round(output_file.stat().st_size / 1_048_576, 1)
         await queue.put({"event": "progress", "percent": 100, "message": "Complete!"})
-        await queue.put({
-            "event": "result",
-            "type": "pointcloud",
-            "path": str(output_file),
-            "filename": output_file.name,
-            "size_mb": size_mb,
-        })
+        await queue.put(
+            {
+                "event": "result",
+                "type": "pointcloud",
+                "path": str(output_file),
+                "filename": output_file.name,
+                "size_mb": size_mb,
+            }
+        )
     else:
-        await queue.put({"event": "error", "message": f"process_pointcloud.py exited with code {rc}"})
+        await queue.put(
+            {
+                "event": "error",
+                "message": f"process_pointcloud.py exited with code {rc}",
+            }
+        )
 
 
 async def _job_splat(project_path, scan_path, options, queue):
@@ -426,7 +470,13 @@ async def _job_splat(project_path, scan_path, options, queue):
     scan = Path(scan_path)
     contents = _scan_contents(scan)
 
-    await queue.put({"event": "progress", "percent": 0, "message": "Starting Gaussian Splat generation…"})
+    await queue.put(
+        {
+            "event": "progress",
+            "percent": 0,
+            "message": "Starting Gaussian Splat generation…",
+        }
+    )
 
     out_dir = proj / "splats"
     out_dir.mkdir(exist_ok=True)
@@ -443,52 +493,93 @@ async def _job_splat(project_path, scan_path, options, queue):
         # cloud is dense), so the splat job keeps its own fine-voxel cloud,
         # separate from the coarser one used for the on-screen cloud view.
         if not contents.get("valid"):
-            await queue.put({"event": "error", "message": "Scan folder is missing required bag files"})
+            await queue.put(
+                {
+                    "event": "error",
+                    "message": "Scan folder is missing required bag files",
+                }
+            )
             return
         voxel = float(options.get("splat_voxel", 0.01))
         dense = pc_dir / f"pointcloud_{ts}_dense.ply"
         if not dense.exists():
             pc_dir.mkdir(exist_ok=True)
-            await queue.put({"event": "progress", "percent": 5,
-                             "message": f"Building dense cloud for splat (voxel {voxel} m)…"})
+            await queue.put(
+                {
+                    "event": "progress",
+                    "percent": 5,
+                    "message": f"Building dense cloud for splat (voxel {voxel} m)…",
+                }
+            )
             pc_cmd = _pointcloud_cmd(scan, contents, dense, voxel)
             try:
                 pc_proc = await asyncio.create_subprocess_exec(
-                    *pc_cmd, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT)
+                    *pc_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
             except FileNotFoundError:
-                await queue.put({"event": "error", "message": "process_pointcloud.py not found."})
+                await queue.put(
+                    {"event": "error", "message": "process_pointcloud.py not found."}
+                )
                 return
             prc = await _stream_proc(pc_proc, queue)
             if prc != 0 or not dense.exists():
-                await queue.put({"event": "error", "message": f"Dense cloud step failed (code {prc})"})
+                await queue.put(
+                    {
+                        "event": "error",
+                        "message": f"Dense cloud step failed (code {prc})",
+                    }
+                )
                 return
         else:
-            await queue.put({"event": "log", "message": f"Using dense cloud: {dense.name}"})
+            await queue.put(
+                {"event": "log", "message": f"Using dense cloud: {dense.name}"}
+            )
 
         cmd = [
-            sys.executable, str(ROOT / "process_splat.py"),
-            "--scan", str(scan), "--output", str(output_file),
-            "--pointcloud", str(dense), "--surfel",
-            "--surfel-flatten", str(options.get("surfel_flatten", 0.2)),
-            "--surfel-sor", str(options.get("surfel_sor", 2.0)),
+            sys.executable,
+            str(ROOT / "process_splat.py"),
+            "--scan",
+            str(scan),
+            "--output",
+            str(output_file),
+            "--pointcloud",
+            str(dense),
+            "--surfel",
+            "--surfel-flatten",
+            str(options.get("surfel_flatten", 0.2)),
+            "--surfel-sor",
+            str(options.get("surfel_sor", 2.0)),
         ]
     else:
         # Legacy GPU-trained / bootstrap path (uses the latest coloured cloud).
         pc_files = sorted(pc_dir.glob("pointcloud_*.ply")) if pc_dir.exists() else []
         pc_files = [p for p in pc_files if not p.stem.endswith("_dense")] or pc_files
         cmd = [
-            sys.executable, str(ROOT / "process_splat.py"),
-            "--scan", str(scan), "--output", str(output_file),
-            "--iterations", str(options.get("iterations", 7000)),
+            sys.executable,
+            str(ROOT / "process_splat.py"),
+            "--scan",
+            str(scan),
+            "--output",
+            str(output_file),
+            "--iterations",
+            str(options.get("iterations", 7000)),
         ]
         if mode == "bootstrap":
             cmd += ["--bootstrap", "--splat-size", str(options.get("splat_size", 0.05))]
         if pc_files:
             cmd += ["--pointcloud", str(pc_files[-1])]
-            await queue.put({"event": "log", "message": f"Using existing point cloud: {pc_files[-1].name}"})
+            await queue.put(
+                {
+                    "event": "log",
+                    "message": f"Using existing point cloud: {pc_files[-1].name}",
+                }
+            )
 
-    await queue.put({"event": "progress", "percent": 5, "message": "Launching process_splat.py…"})
+    await queue.put(
+        {"event": "progress", "percent": 5, "message": "Launching process_splat.py…"}
+    )
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -497,7 +588,12 @@ async def _job_splat(project_path, scan_path, options, queue):
             stderr=asyncio.subprocess.STDOUT,
         )
     except FileNotFoundError:
-        await queue.put({"event": "error", "message": "process_splat.py not found — see the stub script."})
+        await queue.put(
+            {
+                "event": "error",
+                "message": "process_splat.py not found — see the stub script.",
+            }
+        )
         return
 
     rc = await _stream_proc(proc, queue)
@@ -505,15 +601,19 @@ async def _job_splat(project_path, scan_path, options, queue):
     if rc == 0 and output_file.exists():
         size_mb = round(output_file.stat().st_size / 1_048_576, 1)
         await queue.put({"event": "progress", "percent": 100, "message": "Complete!"})
-        await queue.put({
-            "event": "result",
-            "type": "splat",
-            "path": str(output_file),
-            "filename": output_file.name,
-            "size_mb": size_mb,
-        })
+        await queue.put(
+            {
+                "event": "result",
+                "type": "splat",
+                "path": str(output_file),
+                "filename": output_file.name,
+                "size_mb": size_mb,
+            }
+        )
     else:
-        await queue.put({"event": "error", "message": f"process_splat.py exited with code {rc}"})
+        await queue.put(
+            {"event": "error", "message": f"process_splat.py exited with code {rc}"}
+        )
 
 
 async def process_events_handler(request):
@@ -535,7 +635,7 @@ async def process_events_handler(request):
         while True:
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=60)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 await resp.write(b": keep-alive\n\n")
                 continue
 
@@ -566,8 +666,13 @@ async def scan_file_handler(request):
         return web.Response(status=404, text="File not found")
 
     # Determine content type
-    ct_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-              ".json": "application/json", ".ply": "application/octet-stream"}
+    ct_map = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".json": "application/json",
+        ".ply": "application/octet-stream",
+    }
     ct = ct_map.get(p.suffix.lower(), "application/octet-stream")
     return web.FileResponse(p, headers={"Content-Type": ct})
 
@@ -605,10 +710,12 @@ async def edit_apply_handler(request):
     out = data.get("output") or str(src.with_name(f"{stem}_edited.ply"))
 
     try:
-        import edit_ops
+        from lidarstudio import edit_ops
+
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None, edit_ops.apply_edit, str(src), out, op, params)
+            None, edit_ops.apply_edit, str(src), out, op, params
+        )
         _write_pose_sidecar(out, data.get("pose"))
         return web.json_response(result)
     except Exception as exc:
@@ -628,10 +735,12 @@ async def edit_recolour_handler(request):
     stem = src.stem[:-12] if src.stem.endswith("_recoloured") else src.stem
     out = data.get("output") or str(src.with_name(f"{stem}_recoloured.ply"))
     try:
-        import edit_ops
+        from lidarstudio import edit_ops
+
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None, edit_ops.recolour, str(src), out, scan)
+            None, edit_ops.recolour, str(src), out, scan
+        )
         _write_pose_sidecar(out, data.get("pose"))
         return web.json_response(result)
     except Exception as exc:
@@ -681,11 +790,18 @@ async def edit_save_as_handler(request):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         matrix = data.get("matrix")
         if matrix is not None:
-            import edit_ops
+            from lidarstudio import edit_ops
+
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
-                None, edit_ops.apply_edit, str(src), str(out_path), "transform", {"matrix": matrix})
-            _write_pose_sidecar(str(out_path), None)   # baked → no sidecar
+                None,
+                edit_ops.apply_edit,
+                str(src),
+                str(out_path),
+                "transform",
+                {"matrix": matrix},
+            )
+            _write_pose_sidecar(str(out_path), None)  # baked → no sidecar
         else:
             shutil.copy2(src, out_path)
             _write_pose_sidecar(str(out_path), data.get("pose"))
@@ -697,6 +813,7 @@ async def edit_save_as_handler(request):
 # ── Route registration ──────────────────────────────────────────────────────
 # LidarStudio hosts the viewer at "/" and owns the static handler, so we attach
 # only the LiDAR workflow's /api/* endpoints onto the shared aiohttp app.
+
 
 def register_routes(app: web.Application) -> None:
     app.router.add_post("/api/edit/apply", edit_apply_handler)
