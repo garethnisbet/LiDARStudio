@@ -118,7 +118,21 @@ def read_lidar_points(bag_path: Path):
                 np.frombuffer(raw[:, off:off+4].tobytes(), dtype=np.float32)
                 for off in offsets
             ], axis=1)
-            yield timestamp, xyz
+            # Per-point acquisition time (relative offset within the sweep, s) if
+            # the sensor provides it — required for motion deskew. The Vanjee 722z
+            # carries a float64 'timestamp' field running 0→~0.1 s across the scan;
+            # fall back to the usual alternative names, and None if absent.
+            pt_ts = None
+            tname = next((n for n in ("timestamp", "time", "t") if n in fields), None)
+            if tname is not None:
+                tf = fields[tname]
+                tdt = {7: (np.float32, 4), 8: (np.float64, 8)}.get(tf.datatype)
+                if tdt is not None:
+                    dt, sz = tdt
+                    pt_ts = np.frombuffer(
+                        raw[:, tf.offset:tf.offset+sz].tobytes(), dtype=dt
+                    ).astype(np.float64)
+            yield timestamp, xyz, pt_ts
 
 
 def rotate_to_portrait(img, rot: str):
@@ -139,6 +153,32 @@ def rotate_to_portrait(img, rot: str):
     return img
 
 
+def _find_image_topic(bag, camera_name: str):
+    """Return the camera image topic in an open rosbag (camera-name match, else
+    first image-like topic)."""
+    for topic, info in bag.topics.items():
+        if camera_name in topic and ("Image" in info.msgtype or "image" in topic):
+            return topic
+    for topic, info in bag.topics.items():
+        if "Image" in info.msgtype:
+            return topic
+    return None
+
+
+def count_image_frames(bag_path: Path, camera_name: str = "front") -> int:
+    """Cheaply count frames on the camera topic (bag index only, no decode) so a
+    progress bar over the colouring loop can show a real percentage/total."""
+    from rosbags.rosbag1 import Reader
+    try:
+        with Reader(str(bag_path)) as bag:
+            topic = _find_image_topic(bag, camera_name)
+            if topic is None:
+                return 0
+            return int(bag.topics[topic].msgcount)
+    except Exception:
+        return 0
+
+
 def read_images(bag_path: Path, camera_name: str = "front", rot: str = "ccw"):
     """
     Yield (timestamp_ns, bgr_image) from the camera bag.
@@ -153,18 +193,7 @@ def read_images(bag_path: Path, camera_name: str = "front", rot: str = "ccw"):
 
     typestore = get_typestore(Stores.ROS1_NOETIC)
     with Reader(str(bag_path)) as bag:
-        # Find a topic matching the camera name
-        img_topic = None
-        for topic, info in bag.topics.items():
-            if camera_name in topic and ("Image" in info.msgtype or "image" in topic):
-                img_topic = topic
-                break
-        if img_topic is None:
-            # Fall back to first image-like topic
-            for topic, info in bag.topics.items():
-                if "Image" in info.msgtype:
-                    img_topic = topic
-                    break
+        img_topic = _find_image_topic(bag, camera_name)
         if img_topic is None:
             raise RuntimeError("No image topic found in IMAGE bag")
         print(f"  Image topic: {img_topic}", flush=True)
@@ -350,6 +379,53 @@ def frame_rotations(lidar_ts, imu_ts, quats):
     return Rs
 
 
+# ── IMU rotational deskew ────────────────────────────────────────────
+#
+# Each LiDAR sweep spans ~100 ms (the per-point 'timestamp' field runs 0→~0.1 s
+# across the scan).  While the handheld unit rotates during that window, points
+# captured late in the sweep sit in a different sensor orientation than early
+# ones, smearing the scan into curved ghosts.  KISS-ICP can undo this with a
+# constant-velocity guess, but we have the real motion: a 200 Hz gyro.  We
+# integrate it (integrate_orientation) and rotate every point back to the
+# sweep-start orientation using the *measured* rotation — more faithful than a
+# guess, and it hands KISS-ICP undistorted frames to register.
+
+def _nearest_quat_idx(times_ns, imu_ts):
+    """Index of the IMU sample nearest each (absolute, ns int64) time."""
+    import numpy as np
+    j = np.searchsorted(imu_ts, times_ns)
+    j = np.clip(j, 1, len(imu_ts) - 1)
+    prev_closer = (times_ns - imu_ts[j - 1]) < (imu_ts[j] - times_ns)
+    return np.where(prev_closer, j - 1, j)
+
+
+def imu_deskew_frame(xyz, pt_ts, header_ts, imu_ts, quats):
+    """
+    Rotate every point of one sweep back to the sweep-start sensor orientation
+    using the integrated gyro track (rotation-only motion compensation).
+
+    xyz        : (N,3) points in the instantaneous sensor frame.
+    pt_ts      : (N,) per-point time offset within the sweep (s), 0 at sweep start.
+    header_ts  : sweep-start absolute time (ns) — the anchor for pt_ts.
+    imu_ts,quats : sensor→world orientation track from integrate_orientation
+                   (imu_ts int64 ns, quats (M,4) [x,y,z,w]).
+    """
+    import numpy as np
+    tp = header_ts + (pt_ts * 1e9).astype(np.int64)
+    idx = _nearest_quat_idx(tp, imu_ts)
+    ref_ts = header_ts + np.int64(pt_ts.min() * 1e9)
+    ref_idx = int(_nearest_quat_idx(np.array([ref_ts], dtype=np.int64), imu_ts)[0])
+    R_ref_T = _quat_to_R(quats[ref_idx]).T
+    out = np.empty_like(xyz)
+    # Orientation is ~constant between adjacent 200 Hz samples, so every point
+    # that snaps to the same IMU index shares one deskew rotation — group by it.
+    for u in np.unique(idx):
+        m = idx == u
+        R = R_ref_T @ _quat_to_R(quats[u])      # sensor(t) → sensor(sweep start)
+        out[m] = xyz[m] @ R.T
+    return out
+
+
 # ── Full registration (KISS-ICP LiDAR odometry) ──────────────────────
 #
 # Gyro integration (above) recovers rotation only and assumes the scanner
@@ -359,12 +435,16 @@ def frame_rotations(lidar_ts, imu_ts, quats):
 # 4×4 sensor→world pose (rotation AND translation), which is what makes the
 # accumulated cloud resemble the device's own SLAM-fused output.
 
-def register_with_kiss(all_xyz, max_range=50.0, voxel_size=None,
+def register_with_kiss(all_xyz, all_ts=None, max_range=50.0, voxel_size=None,
                        deskew=False, progress_cb=None):
     """
     Run KISS-ICP over the LiDAR scans and return a list of 4×4 sensor→world
     pose matrices, one per scan.  Raises ImportError if kiss-icp is absent so
     the caller can fall back to gyro-only stacking.
+
+    When ``deskew`` is set, per-point timestamps (``all_ts[i]``, same length and
+    order as ``all_xyz[i]``) are normalised to [0, 1] per sweep — the convention
+    KISS-ICP's motion compensation expects — and passed to ``register_frame``.
     """
     from kiss_icp.kiss_icp import KissICP
     from kiss_icp.config import KISSConfig
@@ -383,9 +463,15 @@ def register_with_kiss(all_xyz, max_range=50.0, voxel_size=None,
     poses = []
     n = len(all_xyz)
     for i, xyz in enumerate(all_xyz):
-        frame = np.ascontiguousarray(
-            xyz[np.isfinite(xyz).all(axis=1)], dtype=np.float64)
-        kiss.register_frame(frame, empty)
+        finite = np.isfinite(xyz).all(axis=1)
+        frame = np.ascontiguousarray(xyz[finite], dtype=np.float64)
+        ts = empty
+        if deskew and all_ts is not None and all_ts[i] is not None:
+            t = np.asarray(all_ts[i], dtype=np.float64)[finite]
+            span = float(t.max() - t.min())
+            ts = np.ascontiguousarray(
+                (t - t.min()) / span if span > 0 else np.zeros_like(t))
+        kiss.register_frame(frame, ts)
         poses.append(np.asarray(kiss.last_pose, dtype=np.float64).copy())
         if progress_cb and (i % 20 == 0 or i == n - 1):
             progress_cb(i + 1, n)
@@ -473,7 +559,7 @@ def project_and_colour(xyz, image, K, D, T):
 
 def colour_points_multiview(xyz_world, poses, lidar_ts, image_bag, calib,
                             camera="front", image_rot="ccw", max_range=20.0,
-                            occl_tol=0.03, depth_ds=4):
+                            occl_tol=0.03, depth_ds=4, progress_cb=None):
     """Colour world points from *every* camera frame, not just the time-nearest.
 
     The camera is rigidly mounted to the LiDAR and only sees the front
@@ -502,9 +588,15 @@ def colour_points_multiview(xyz_world, poses, lidar_ts, image_bag, calib,
     pa = np.asarray(poses, np.float64)                # (F,4,4) sensor→world
     o = np.argsort(ts); ts, pa = ts[o], pa[o]
 
+    # Total frames (from the bag index, no decode) so the callback can report a
+    # real percentage through the long colouring loop.
+    n_total = count_image_frames(image_bag, camera) if progress_cb else 0
+
     n_img = 0
     for ts_img, img in read_images(image_bag, camera, rot=image_rot):
         n_img += 1
+        if progress_cb and (n_img == 1 or n_img % 20 == 0):
+            progress_cb(n_img, n_total)
         j = int(np.searchsorted(ts, ts_img)); j = min(max(j, 0), len(pa) - 1)
         if j > 0 and abs(ts[j - 1] - ts_img) < abs(ts[j] - ts_img):
             j -= 1
@@ -607,6 +699,12 @@ def main():
                         help="KISS-ICP map voxel size (m); default auto")
     parser.add_argument("--no-slam",     action="store_true",
                         help="skip KISS-ICP; gyro-only stacking (tripod scans)")
+    parser.add_argument("--deskew",      choices=["imu", "kiss", "off"],
+                        default="imu",
+                        help="per-sweep motion compensation: 'imu' = gyro "
+                             "rotational deskew (200 Hz IMU) then KISS-ICP "
+                             "register; 'kiss' = KISS-ICP constant-velocity "
+                             "deskew; 'off' = none (legacy)")
     parser.add_argument("--single-frame-colour", action="store_true",
                         help="colour each scan from only its time-nearest image "
                              "(old behaviour; default is multi-view)")
@@ -637,10 +735,12 @@ def main():
     # Read all LiDAR frames
     progress(10, "Reading LIDAR bag…")
     all_xyz = []
+    all_pt_ts = []
     frame_count = 0
     lidar_timestamps = []
-    for ts, xyz in read_lidar_points(lidar_bag):
+    for ts, xyz, pt_ts in read_lidar_points(lidar_bag):
         all_xyz.append(xyz)
+        all_pt_ts.append(pt_ts)
         lidar_timestamps.append(ts)
         frame_count += 1
         if frame_count % 10 == 0:
@@ -659,17 +759,48 @@ def main():
     imu_ts, imu_w, imu_a = read_imu(lidar_bag)
     L = _level_transform(imu_a)        # gravity → down (heading undetermined)
 
+    # Motion-compensate (deskew) each sweep before registration.  'imu' uses the
+    # measured 200 Hz gyro to un-rotate points to the sweep-start orientation and
+    # then lets KISS-ICP register undistorted frames; 'kiss' uses KISS-ICP's own
+    # constant-velocity deskew (needs per-point times); 'off' keeps raw scans.
+    have_pt_ts = any(t is not None for t in all_pt_ts)
+    kiss_deskew = (args.deskew == "kiss")
+    if args.deskew == "imu":
+        if imu_ts is not None and len(imu_ts) > 1 and have_pt_ts:
+            progress(39, "IMU rotational deskew (200 Hz gyro)…")
+            _, dq = integrate_orientation(imu_ts, imu_w, imu_a)
+            n_de = 0
+            for i in range(frame_count):
+                if all_pt_ts[i] is not None:
+                    all_xyz[i] = imu_deskew_frame(
+                        all_xyz[i], all_pt_ts[i], lidar_timestamps[i], imu_ts, dq)
+                    n_de += 1
+            print(f"  IMU-deskewed {n_de} sweeps using {len(imu_ts):,} gyro "
+                  f"samples", flush=True)
+        else:
+            kiss_deskew = True     # no IMU/point-times → fall back to KISS deskew
+            print("  IMU deskew unavailable (no IMU or no per-point times) — "
+                  "using KISS-ICP constant-velocity deskew", flush=True)
+    if kiss_deskew and not have_pt_ts:
+        kiss_deskew = False
+        print("  KISS-ICP deskew requested but scans carry no per-point "
+              "timestamps — proceeding without deskew", flush=True)
+
     poses = None
     if not args.no_slam:
         try:
             progress(40, "Registering scans with KISS-ICP…")
             raw_poses = register_with_kiss(
-                all_xyz, max_range=args.max_range, voxel_size=args.kiss_voxel,
+                all_xyz, all_ts=(all_pt_ts if kiss_deskew else None),
+                max_range=args.max_range, voxel_size=args.kiss_voxel,
+                deskew=kiss_deskew,
                 progress_cb=lambda i, n: progress(
                     40 + int(15 * i / n), f"KISS-ICP registering {i}/{n}…"))
             poses = [L @ P for P in raw_poses]   # level the whole trajectory
+            mode = ("IMU-deskewed" if args.deskew == "imu" and not kiss_deskew
+                    else "KISS-deskewed" if kiss_deskew else "raw")
             print(f"  Registered {frame_count} scans with KISS-ICP "
-                  f"(full 6-DoF odometry), gravity-levelled", flush=True)
+                  f"(full 6-DoF odometry, {mode}), gravity-levelled", flush=True)
         except ImportError:
             print("  kiss-icp not installed — falling back to gyro-only "
                   "stacking (run: pip install kiss-icp)", flush=True)
@@ -700,10 +831,16 @@ def main():
         # Preferred: project every world point into *all* camera frames so points
         # the camera only saw later in the walk-through still get coloured.
         progress(45, "Multi-view colour projection…")
+
+        def _colour_progress(i, n):
+            pct = 45 + int(44 * i / n) if n else 45
+            total = f"/{n}" if n else ""
+            progress(min(pct, 89), f"Colouring from photo {i}{total}…")
+
         rgb, _ = colour_points_multiview(
             combined_xyz, poses, lidar_timestamps, image_bag, calib,
             camera=args.camera, image_rot=args.image_rot,
-            max_range=args.colour_range)
+            max_range=args.colour_range, progress_cb=_colour_progress)
     elif calib is not None:
         progress(45, "Reading image bag and projecting…")
 

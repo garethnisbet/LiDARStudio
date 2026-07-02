@@ -33,6 +33,11 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# Reduce CUDA fragmentation before torch initialises its caching allocator — the
+# tile-intersection step on millions of gaussians allocates large transient
+# buffers and OOM'd mid-run without this.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 # Reuse the bag/calibration/pose helpers from the point-cloud stage.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import process_pointcloud as ppc  # noqa: E402
@@ -83,15 +88,61 @@ def load_coloured_ply(path: Path):
 
 # ── Camera dataset (KISS-ICP trajectory ∘ lidar→camera extrinsic) ─────
 
+def _interp_pose(traj_ts, poses, ts):
+    """
+    Continuous-time SE(3) pose at time ``ts`` by interpolating the two bracketing
+    trajectory samples: SLERP on rotation, LERP on translation.  The LiDAR runs at
+    ~10 Hz, so a camera frame lands up to ±50 ms from the nearest sample; over that
+    gap a handheld rig rotates/translates enough to smear the projection.  Nearest-
+    neighbour snapping bakes that error into the training pose — interpolation
+    removes it.  Timestamps outside the trajectory clamp to the nearest endpoint
+    (no extrapolation).  Returns (pose 4×4, alpha in [0,1], bracket_gap_ns).
+    """
+    import numpy as np
+    from scipy.spatial.transform import Rotation, Slerp
+    n = len(traj_ts)
+    j = int(np.searchsorted(traj_ts, ts))
+    if j <= 0:
+        return poses[0], 0.0, 0
+    if j >= n:
+        return poses[-1], 1.0, 0
+    t0, t1 = int(traj_ts[j - 1]), int(traj_ts[j])
+    P0, P1 = poses[j - 1], poses[j]
+    gap = t1 - t0
+    if gap <= 0:
+        return P1, 1.0, 0
+    a = (int(ts) - t0) / gap
+    R = Slerp([0.0, 1.0], Rotation.from_matrix(
+        np.stack([P0[:3, :3], P1[:3, :3]])))([a])[0].as_matrix()
+    out = np.eye(4)
+    out[:3, :3] = R
+    out[:3, 3] = (1.0 - a) * P0[:3, 3] + a * P1[:3, 3]
+    return out, a, gap
+
+
 def build_camera_frames(scan: Path, traj_path: Path, camera: str,
-                        image_rot: str, downscale: int):
+                        image_rot: str, downscale: int,
+                        undistort: bool = True, undistort_fov: float = 120.0,
+                        cam_time_offset: float = 0.0):
     """
     Return a list of {image HxWx3 float[0,1], K 3x3, viewmat 4x4 (world→cam)}.
 
-    For each camera frame we take the LiDAR pose nearest its timestamp, P, and
-    form the world→camera matrix  T_extrinsic @ inv(P)  — points go world →
-    lidar (inv P) → camera (T).  Images are rotated to portrait to match K,
-    undistorted to a pinhole model, and downscaled for tractable training.
+    For each camera frame we query the LiDAR pose at its (offset-corrected) exact
+    timestamp by SE(3) interpolation, P, and form the world→camera matrix
+    T_extrinsic @ inv(P)  — points go world → lidar (inv P) → camera (T).  Images
+    are rotated to portrait to match K.  ``cam_time_offset`` (seconds) shifts the
+    image clock onto the LiDAR clock before the query (camera_ts + offset), to
+    absorb a constant sensor time skew; sweep it if frames look consistently
+    mis-registered.
+
+    ``undistort`` (default) remaps each ~180° fisheye photo to a virtual PINHOLE
+    of ``undistort_fov`` degrees horizontal, using OpenCV's own Kannala-Brandt
+    undistort — the SAME lens model that coloured the cloud. This is essential:
+    gsplat's ``camera_model="fisheye"`` does NOT reproduce OpenCV KB (it squashes
+    the scene into a central dome), so training in fisheye renders garbage and the
+    photometric loss can never converge. Training on undistorted pinhole frames
+    (``camera_model="pinhole"``) gives a provably-correct projection; the cost is
+    losing the extreme (heavily-distorted) periphery beyond ``undistort_fov``.
     """
     import numpy as np
     import cv2
@@ -113,12 +164,11 @@ def build_camera_frames(scan: Path, traj_path: Path, camera: str,
     if img_bag is None:
         raise FileNotFoundError(f"no IMAGE_*.bag in {scan}")
 
-    # The lens is a ~180° fisheye, so we DON'T undistort to a pinhole (a pinhole
-    # can't represent it).  Instead gsplat rasterizes with camera_model="fisheye"
-    # and these k1..k4 radial coeffs directly, matching the colouring projection.
-    # Distortion coeffs are angle-based and unaffected by downscaling; only K
-    # scales with the image.
     radial = D.reshape(4).astype(np.float64)
+    Dk = radial.reshape(4, 1)
+    maps = None                                # (map1, map2, K_pinhole), built once
+    offset_ns = int(round(cam_time_offset * 1e9))
+    diag = {"n": 0, "clamped": 0, "snap_err_ns": [], "gap_ns": []}
     frames = []
     for ts, img in ppc.read_images(img_bag, camera, rot=image_rot):
         h, w = img.shape[:2]
@@ -128,18 +178,50 @@ def build_camera_frames(scan: Path, traj_path: Path, camera: str,
                              interpolation=cv2.INTER_AREA)
             K = K / downscale
             K[2, 2] = 1.0
+        H, W = img.shape[:2]
+
+        if undistort:
+            if maps is None:
+                # Virtual pinhole: f = (W/2)/tan(fov/2); centred principal point.
+                f = (W / 2.0) / np.tan(np.radians(undistort_fov) / 2.0)
+                Kp = np.array([[f, 0, W / 2.0], [0, f, H / 2.0], [0, 0, 1.0]])
+                m1, m2 = cv2.fisheye.initUndistortRectifyMap(
+                    K, Dk, np.eye(3), Kp, (W, H), cv2.CV_16SC2)
+                maps = (m1, m2, Kp)
+                print(f"  undistort: fisheye → pinhole {undistort_fov:.0f}° "
+                      f"(f={f:.1f}px, {W}×{H})", flush=True)
+            img = cv2.remap(img, maps[0], maps[1], interpolation=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT)
+            K = maps[2]
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
-        j = int(np.searchsorted(traj_ts, ts))
-        j = min(max(j, 0), len(poses) - 1)
-        if 0 < j < len(poses) and abs(traj_ts[j - 1] - ts) < abs(traj_ts[j] - ts):
-            j -= 1
-        viewmat = T @ np.linalg.inv(poses[j])    # world → camera
+        tq = int(ts) + offset_ns
+        P, a, gap = _interp_pose(traj_ts, poses, tq)
+        viewmat = T @ np.linalg.inv(P)           # world → camera
+        # Diagnostics: how far the old nearest-neighbour snap would have been, and
+        # the bracket size we interpolated across.
+        diag["n"] += 1
+        if gap == 0:
+            diag["clamped"] += 1
+        else:
+            diag["gap_ns"].append(gap)
+            diag["snap_err_ns"].append(min(a, 1.0 - a) * gap)
 
-        frames.append({"image": rgb, "K": K.astype(np.float64),
-                       "viewmat": viewmat, "radial": radial})
+        frame = {"image": rgb, "K": K.astype(np.float64), "viewmat": viewmat}
+        if not undistort:                        # fisheye path keeps radial coeffs
+            frame["radial"] = radial
+        frames.append(frame)
     if not frames:
         raise RuntimeError("no camera frames loaded from image bag")
+    if diag["snap_err_ns"]:
+        se = np.array(diag["snap_err_ns"]) / 1e6      # ms
+        gp = np.array(diag["gap_ns"]) / 1e6           # ms
+        print(f"  pose query: continuous-time SE(3) interp, offset "
+              f"{cam_time_offset*1e3:+.1f} ms; {diag['clamped']} frame(s) clamped "
+              f"to trajectory ends", flush=True)
+        print(f"    interp removed a median {np.median(se):.1f} ms "
+              f"(max {se.max():.1f} ms) nearest-neighbour snap; "
+              f"bracket median {np.median(gp):.1f} ms", flush=True)
     return frames
 
 
@@ -162,14 +244,71 @@ def knn_scale(points, k: int = 4):
     return np.clip(s, 1e-4, max(hi, 1e-3))
 
 
-def build_gaussians(points, rgb, sh_degree, device, init_opacity: float = 0.1):
+def pca_surfel_frame(points, k: int = 12, radius_factor: float = 0.6,
+                     flatten: float = 0.25):
+    """Per-point anisotropic disc frame from local kNN PCA (shape from geometry).
+
+    Returns (log_scales Nx3, quats_wxyz Nx4): two in-plane axes sized to the local
+    point spacing and a thin normal axis (``flatten``×), oriented by the surface
+    tangent plane. This is the same surface-fitting that ``surfel_splat_from_ply``
+    does — factored out so trained splats can *seed* anisotropy from the (accurate)
+    LiDAR geometry instead of trying to learn it from inconsistent fisheye photos.
+    """
+    import numpy as np
+    from scipy.spatial import cKDTree
+    from scipy.spatial.transform import Rotation
+    tree = cKDTree(points)
+    d, idx = tree.query(points, k=k + 1, workers=-1)
+    nn = np.clip(d[:, 1], 1e-5, None)
+    nbr = points[idx[:, 1:]]
+    cen = nbr - nbr.mean(1, keepdims=True)
+    cov = np.einsum("nki,nkj->nij", cen, cen) / k
+    _, evecs = np.linalg.eigh(cov)                       # ascending eigenvalues
+    R = np.stack([evecs[:, :, 2], evecs[:, :, 1], evecs[:, :, 0]], axis=2)  # [t1,t2,n]
+    R[np.linalg.det(R) < 0, :, 2] *= -1.0                # keep proper rotation
+    q = Rotation.from_matrix(R).as_quat()               # [x,y,z,w]
+    quats = np.column_stack([q[:, 3], q[:, :3]]).astype(np.float32)  # [w,x,y,z]
+    r_in = nn * radius_factor
+    r_in = np.minimum(r_in, float(np.median(r_in)) * 3.0)
+    s_in = np.log(np.clip(r_in, 1e-5, None))
+    s_nr = np.log(np.clip(r_in * flatten, 1e-6, None))
+    log_scales = np.stack([s_in, s_in, s_nr], axis=1).astype(np.float32)
+    return log_scales, quats
+
+
+def _se3_exp(t):
+    """
+    4×4 SE(3) transform from a 6-vector tangent [ωx,ωy,ωz, vx,vy,vz] (torch,
+    differentiable).  Built with torch.stack (no in-place writes) so autograd can
+    backprop through it into a learnable pose delta; matrix_exp handles the
+    small-angle limit exactly, so no ω→0 special-casing is needed.
+    """
+    import torch
+    wx, wy, wz, vx, vy, vz = t
+    z = torch.zeros((), dtype=t.dtype, device=t.device)
+    rows = torch.stack([
+        torch.stack([z, -wz,  wy, vx]),
+        torch.stack([wz,  z, -wx, vy]),
+        torch.stack([-wy, wx,  z, vz]),
+        torch.stack([z,   z,   z,  z]),
+    ])
+    return torch.linalg.matrix_exp(rows)
+
+
+def build_gaussians(points, rgb, sh_degree, device, init_opacity: float = 0.1,
+                    anisotropic: bool = False):
     import numpy as np
     import torch
     n = len(points)
     means = torch.tensor(points, dtype=torch.float32, device=device)
-    scales = torch.tensor(np.log(knn_scale(points)), dtype=torch.float32, device=device)
-    scales = scales[:, None].repeat(1, 3)
-    quats = torch.zeros(n, 4, device=device); quats[:, 0] = 1.0
+    if anisotropic:                          # seed surface-aligned discs from geometry
+        log_scales, quats_np = pca_surfel_frame(points)
+        scales = torch.tensor(log_scales, dtype=torch.float32, device=device)
+        quats = torch.tensor(quats_np, dtype=torch.float32, device=device)
+    else:
+        scales = torch.tensor(np.log(knn_scale(points)), dtype=torch.float32, device=device)
+        scales = scales[:, None].repeat(1, 3)
+        quats = torch.zeros(n, 4, device=device); quats[:, 0] = 1.0
     opacities = torch.logit(torch.full((n,), init_opacity, device=device))
     num_sh = (sh_degree + 1) ** 2
     colors = torch.zeros(n, num_sh, 3, device=device)
@@ -255,10 +394,17 @@ def export_ply(params, path: Path, crop_aabb=None):
 
 def train_splat(frames, pts, rgb, out_path: Path, iters: int,
                 sh_degree: int, ssim_lambda: float, max_init: int,
-                crop_to_init: bool, crop_margin: float):
+                crop_to_init: bool, crop_margin: float,
+                densify: bool = True, cap_max: int = 3_000_000,
+                init_opacity: float = 0.5, appearance: bool = True,
+                opacity_reg: float = 0.004, scale_reg: float = 0.01,
+                appearance_reg: float = 0.05, pose_opt: bool = True,
+                pose_opt_lr: float = 1e-2, pose_warmup: int = 300,
+                pose_reg: float = 1e-3):
     import numpy as np
     import torch
     from gsplat import rasterization
+    from gsplat.strategy import MCMCStrategy
 
     device = "cuda"
     # Drop uncoloured (black) points: the camera doesn't see every LiDAR return,
@@ -290,87 +436,194 @@ def train_splat(frames, pts, rgb, out_path: Path, iters: int,
     for f in frames:                                      # world→cam ∘ (norm→world)
         f["viewmat"] = f["viewmat"] @ S
 
-    # Refine-only training (no densification).  The coloured cloud is already a
-    # dense, geometrically-correct seed (one Gaussian per measured surface point),
-    # so — like JMStudio's own splat — we don't synthesise new geometry; we just
-    # optimise colour/opacity/scale/rotation so the splat is photo-consistent.
-    # This is also the only *stable* path on this data: gsplat's fisheye renderer
-    # needs the unscented-transform (with_ut), whose 2-D means gradient the default
-    # densifier can't use, and MCMC relocation kept diverging (an unbounded
-    # exp(scale) regulariser overflowed to NaN, then crashed torch.multinomial).
-    # We start opaque enough to cover surfaces and clamp scales to keep exp finite.
-    # Freeze opacity: on this multi-view-inconsistent data (auto-exposure, specular
-    # — see the ~17.5 dB photometric ceiling) the photometric gradient otherwise
-    # drives opacity → 0, dissolving solid surfaces into translucent haze (worse
-    # than the clean init).  Held opaque, training can only sharpen colour/shape:
-    # scales+quats flatten the isotropic seeds into surface-aligned discs.
-    params = build_gaussians(pts_n, rgb, sh_degree, device, init_opacity=0.8)
-    optimizers = make_optimizers(params, lr_scale=1.0, freeze=("opacities",))
+    # Full adaptive-density 3DGS (this is what closes the gap to 3DMakerpro).
+    #
+    # Densification uses MCMC (gsplat's MCMCStrategy), NOT the default densifier:
+    # the fisheye renderer needs the unscented transform (with_ut), which doesn't
+    # produce the 2-D screen-space means gradient the default densifier clones on.
+    # MCMC is gradient-free — it teleports low-opacity Gaussians to high-opacity
+    # regions and samples new ones from the opacity distribution — so it works on
+    # the fisheye path and grows the cloud where photos demand detail (~1M → ~3M).
+    # The earlier NaN that killed MCMC came from an *unbounded* exp(scale) in its
+    # scale regulariser; we clamp scales every step so exp() stays finite.
+    #
+    # Opacity is LEARNED (not frozen): the previous freeze hid surfaces behind hard
+    # opaque blobs, the opposite of 3DMakerpro's faint alpha-blended surfels
+    # (median opacity ~0.18). To stop the ~17.5 dB photometric inconsistency
+    # (per-frame auto-exposure / white-balance / specular) from driving opacity to
+    # zero instead, each frame gets a learned affine colour transform (gain+bias)
+    # that absorbs exposure drift, leaving the photometric gradient free to shape
+    # geometry. The MCMC opacity/scale regularisers then pull toward many small,
+    # faint, anisotropic Gaussians — the surfel look we're after.
+    params = build_gaussians(pts_n, rgb, sh_degree, device,
+                             init_opacity=init_opacity, anisotropic=True)
+    optimizers = make_optimizers(params, lr_scale=1.0)
 
-    sc = iters / 30_000
-    scale_clamp = float(np.log(0.3))         # ≤0.3 in unit space (~1.1 m world)
-    sh_increase_every = max(1, round(1000 * sc))
+    strategy = None
+    strategy_state = None
+    if densify:
+        # noise_lr well below the 5e5 default: the seeds are already on-surface
+        # from LiDAR, so we want gentle teleport/growth, not heavy position noise
+        # that scrambles the geometry (which flat-lined the fit in testing).
+        strategy = MCMCStrategy(
+            cap_max=cap_max, noise_lr=1e4,
+            refine_start_iter=max(100, iters // 50),
+            refine_stop_iter=int(iters * 0.8), refine_every=100,
+            min_opacity=0.005, verbose=False)
+        strategy.check_sanity(params, optimizers)
+        strategy_state = strategy.initialize_state()
+
+    # Per-frame appearance compensation: pred_adj = pred * gain + bias, with gain→1
+    # / bias→0 init and a light pull-back regulariser so it only soaks up exposure,
+    # not scene radiance. Dropped on export (canonical, neutral-exposure radiance).
+    app_gain = app_bias = app_opt = None
+    if appearance:
+        nf = len(frames)
+        app_gain = torch.nn.Parameter(torch.ones(nf, 3, device=device))
+        app_bias = torch.nn.Parameter(torch.zeros(nf, 3, device=device))
+        app_opt = torch.optim.Adam([app_gain, app_bias], lr=1e-3, eps=1e-15)
+
+    # Camera-pose optimization: a learnable per-frame SE(3) delta composed into
+    # the view matrix (viewmat' = exp(δ)·viewmat).  The LiDAR-odometry poses are
+    # globally consistent but locally off (drift + camera↔LiDAR time-sync), so the
+    # photometric loss sees frames that disagree on where a surface projects and
+    # blurs Gaussians to average them — the 'solid but blurry' look.  Letting δ
+    # absorb that per-frame error frees the geometry to sharpen.  gsplat 1.5
+    # backprops through viewmats to δ.  δ affects training views only; the
+    # exported world-frame Gaussians need no change.  Warmup lets the Gaussians
+    # settle before the poses start moving; a light L2 keeps δ from running away.
+    pose_delta = pose_opt_optimizer = None
+    if pose_opt:
+        pose_delta = torch.nn.Parameter(torch.zeros(len(frames), 6, device=device))
+        pose_opt_optimizer = torch.optim.Adam([pose_delta], lr=pose_opt_lr, eps=1e-15)
+
+    means_lr = optimizers["means"].param_groups[0]["lr"]
+    scale_clamp = float(np.log(0.1))         # ≤0.1 unit (~0.3-0.5 m world): keeps
+                                             # gaussians surface-sized — fewer tiles
+                                             # each (less VRAM) and less radial blur.
+    # Floor the smallest axis too: without it the photometric loss collapses one
+    # axis → 0, making degenerate "needle" gaussians (aniso blew up to ~300:1 and
+    # crashed gsplat's tile intersection). This caps anisotropy at 0.3/3e-3 = 100:1.
+    scale_floor = float(np.log(3e-3))
+    sh_increase_every = max(1, round(1000 * iters / 30_000))
+
+    # Undistorted frames render as pinhole; legacy fisheye frames carry "radial".
+    pinhole = "radial" not in frames[0]
+    print(f"  camera model: {'pinhole (undistorted)' if pinhole else 'fisheye (UT)'}", flush=True)
+
+    def render(p, f, sh_deg, W, H, viewmat):
+        cam = (dict(camera_model="pinhole") if pinhole else
+               dict(camera_model="fisheye", radial_coeffs=f["radial_t"], with_ut=True))
+        return rasterization(
+            means=p["means"], quats=p["quats"], scales=torch.exp(p["scales"]),
+            opacities=torch.sigmoid(p["opacities"]),
+            colors=torch.cat([p["sh0"], p["shN"]], dim=1),
+            viewmats=viewmat[None], Ks=f["K_t"][None],
+            width=W, height=H, sh_degree=sh_deg,
+            packed=True, **cam)   # packed = sparse intersections → far less VRAM
+
+    def frame_viewmat(fi, f, step):
+        """View matrix for frame fi, with the learnable pose delta applied once
+        warmup has passed (identity/original before that)."""
+        if pose_opt and step >= pose_warmup:
+            return _se3_exp(pose_delta[fi]) @ f["viewmat_t"]
+        return f["viewmat_t"]
 
     for f in frames:
         f["image_t"] = torch.tensor(f["image"]).pin_memory()
         f["K_t"] = torch.tensor(f["K"], dtype=torch.float32, device=device)
         f["viewmat_t"] = torch.tensor(f["viewmat"], dtype=torch.float32, device=device)
-        # gsplat fisheye radial coeffs: shape [C, 4] (one camera per call).
-        f["radial_t"] = torch.tensor(f["radial"], dtype=torch.float32,
-                                     device=device)[None]
+        if not pinhole:                      # gsplat fisheye radial coeffs [C,4]
+            f["radial_t"] = torch.tensor(f["radial"], dtype=torch.float32,
+                                         device=device)[None]
 
     rng = np.random.default_rng(0)
     order = rng.permutation(len(frames)); cur = 0
     for step in range(iters):
         if cur >= len(order):
             order = rng.permutation(len(frames)); cur = 0
-        f = frames[int(order[cur])]; cur += 1
+        fi = int(order[cur]); f = frames[fi]; cur += 1
         H, W = f["image"].shape[:2]
         sh_deg = min(sh_degree, step // sh_increase_every)
-        colors = torch.cat([params["sh0"], params["shN"]], dim=1)
-        renders, alphas, info = rasterization(
-            means=params["means"], quats=params["quats"],
-            scales=torch.exp(params["scales"]),
-            opacities=torch.sigmoid(params["opacities"]),
-            colors=colors, viewmats=f["viewmat_t"][None], Ks=f["K_t"][None],
-            width=W, height=H, sh_degree=sh_deg, packed=False,
-            camera_model="fisheye", radial_coeffs=f["radial_t"], with_ut=True)
-        pred = renders[0].clamp(0, 1)
+        use_pose = pose_opt and step >= pose_warmup
+        viewmat = frame_viewmat(fi, f, step)
+        renders, alphas, info = render(params, f, sh_deg, W, H, viewmat)
+        if strategy is not None:
+            strategy.step_pre_backward(params, optimizers, strategy_state, step, info)
+        pred = renders[0]
+        if appearance:                       # soak up this frame's exposure/WB
+            pred = pred * app_gain[fi] + app_bias[fi]
+        pred = pred.clamp(0, 1)
         gt = f["image_t"].to(device, non_blocking=True)
         l1 = (pred - gt).abs().mean()
         loss = (1 - ssim_lambda) * l1 + ssim_lambda * (1 - windowed_ssim(pred, gt))
+        # MCMC regularisers: push toward many small, faint Gaussians. exp(scale) is
+        # bounded by the per-step clamp below, so it can't overflow to NaN.
+        loss = loss + opacity_reg * torch.sigmoid(params["opacities"]).abs().mean()
+        loss = loss + scale_reg * torch.exp(params["scales"].clamp(max=scale_clamp)).abs().mean()
+        if appearance:                       # keep the affine near identity
+            loss = loss + appearance_reg * ((app_gain[fi] - 1) ** 2 + app_bias[fi] ** 2).mean()
+        if use_pose:                         # light L2 so the pose delta can't run away
+            loss = loss + pose_reg * pose_delta[fi].pow(2).sum()
         if not torch.isfinite(loss):         # skip rare bad frames, don't poison params
             for opt in optimizers.values():
                 opt.zero_grad(set_to_none=True)
+            if app_opt is not None:
+                app_opt.zero_grad(set_to_none=True)
+            if pose_opt_optimizer is not None:
+                pose_opt_optimizer.zero_grad(set_to_none=True)
             print(f"  step {step}: non-finite loss, skipped", flush=True)
             continue
         loss.backward()
         for opt in optimizers.values():
             opt.step(); opt.zero_grad(set_to_none=True)
-        with torch.no_grad():                # keep exp(scales) finite/bounded
-            params["scales"].clamp_(max=scale_clamp)
+        if app_opt is not None:
+            app_opt.step(); app_opt.zero_grad(set_to_none=True)
+        if use_pose:
+            # decay the pose LR toward 0.1× over the run so late steps only
+            # micro-adjust; clip keeps a single bad frame from lurching a camera.
+            frac = (step - pose_warmup) / max(1, iters - pose_warmup)
+            for g in pose_opt_optimizer.param_groups:
+                g["lr"] = pose_opt_lr * (0.1 ** frac)
+            torch.nn.utils.clip_grad_norm_([pose_delta], 1.0)
+            pose_opt_optimizer.step(); pose_opt_optimizer.zero_grad(set_to_none=True)
+        with torch.no_grad():                # bound scales: no overflow, no needles
+            params["scales"].clamp_(min=scale_floor, max=scale_clamp)
+        if strategy is not None:             # teleport / grow Gaussians (gradient-free)
+            strategy.step_post_backward(params, optimizers, strategy_state,
+                                        step, info, lr=means_lr)
         if step % 100 == 0:
+            with torch.no_grad():
+                op_med = float(torch.sigmoid(params["opacities"]).median())
+                sw = torch.exp(params["scales"])
+                aniso = float((sw.amax(1) / sw.amin(1).clamp_min(1e-9)).median())
+            pose_dbg = ""
+            if pose_opt and pose_delta is not None:
+                with torch.no_grad():
+                    dn = pose_delta.detach()
+                    rot_deg = float(dn[:, :3].norm(dim=1).mean()) * 180.0 / np.pi
+                    trans = float(dn[:, 3:].norm(dim=1).mean())
+                pose_dbg = f"  poseδ~{rot_deg:.2f}°/{trans:.3f}u"
             print(f"  step {step:6d}  loss {loss.item():.4f}  "
-                  f"gaussians {params['means'].shape[0]:,}", flush=True)
+                  f"gaussians {params['means'].shape[0]:,}  "
+                  f"opacity~{op_med:.2f}  aniso~{aniso:.1f}{pose_dbg}", flush=True)
             print(f"PROGRESS {step + 1}/{iters}", flush=True)
             pct = 10 + int(85 * step / max(iters, 1))
             progress(min(pct, 95), f"Training splat {step}/{iters}…")
     print(f"PROGRESS {iters}/{iters}", flush=True)
 
-    # Train-view PSNR readout (cheap sanity / quality gauge).
+    # Train-view PSNR readout (cheap sanity / quality gauge). Uses the per-frame
+    # appearance transform so PSNR reflects fit, not exposure mismatch.
     with torch.no_grad():
-        colors = torch.cat([params["sh0"], params["shN"]], dim=1)
         tot = n = 0
         for fi in range(0, len(frames), max(1, len(frames) // 20)):
             f = frames[fi]; H, W = f["image"].shape[:2]
-            out, _, _ = rasterization(
-                means=params["means"], quats=params["quats"],
-                scales=torch.exp(params["scales"]),
-                opacities=torch.sigmoid(params["opacities"]), colors=colors,
-                viewmats=f["viewmat_t"][None], Ks=f["K_t"][None],
-                width=W, height=H, sh_degree=sh_degree, packed=False,
-                camera_model="fisheye", radial_coeffs=f["radial_t"], with_ut=True)
-            mse = (out[0].clamp(0, 1) - f["image_t"].to(device)).pow(2).mean()
+            vm = frame_viewmat(fi, f, iters)     # with the learned pose delta
+            out, _, _ = render(params, f, sh_degree, W, H, vm)
+            pred = out[0]
+            if appearance:
+                pred = pred * app_gain[fi] + app_bias[fi]
+            mse = (pred.clamp(0, 1) - f["image_t"].to(device)).pow(2).mean()
             tot += float(10 * torch.log10(1.0 / mse)); n += 1
         print(f"  train-view PSNR (mean over {n} frames): {tot / n:.2f} dB", flush=True)
 
@@ -381,7 +634,7 @@ def train_splat(frames, pts, rgb, out_path: Path, iters: int,
         params["scales"].add_(float(np.log(norm)))
 
     export_ply(params, out_path, crop_aabb)
-    print(f"Saved: {out_path}", flush=True)
+    print(f"Saved: {out_path} ({params['means'].shape[0]:,} gaussians)", flush=True)
 
 
 # ── CPU fallback: bootstrap one Gaussian per point ───────────────────
@@ -519,6 +772,33 @@ def main():
     p.add_argument("--max-init-points", type=int, default=1_000_000)
     p.add_argument("--no-crop-to-init", dest="crop_to_init", action="store_false", default=True)
     p.add_argument("--crop-margin", type=float, default=0.05)
+    p.add_argument("--no-densify", dest="densify", action="store_false", default=True,
+                   help="disable MCMC densification (refine-only — the old behaviour)")
+    p.add_argument("--cap-max", type=int, default=3_000_000,
+                   help="max gaussians MCMC may grow to (3DMakerpro ref ≈ 3.4M)")
+    p.add_argument("--init-opacity", type=float, default=0.5,
+                   help="initial (learned) gaussian opacity; reg pulls it lower")
+    p.add_argument("--no-appearance", dest="appearance", action="store_false", default=True,
+                   help="disable per-frame exposure/white-balance compensation")
+    p.add_argument("--no-pose-opt", dest="pose_opt", action="store_false", default=True,
+                   help="disable per-frame camera-pose optimisation (on by default)")
+    p.add_argument("--pose-opt-lr", type=float, default=1e-2,
+                   help="learning rate for the per-frame SE(3) pose delta")
+    p.add_argument("--pose-warmup", type=int, default=300,
+                   help="steps to let Gaussians settle before pose deltas update")
+    p.add_argument("--pose-reg", type=float, default=1e-3,
+                   help="L2 weight keeping pose deltas small")
+    p.add_argument("--no-undistort", dest="undistort", action="store_false", default=True,
+                   help="train in raw fisheye (broken: gsplat fisheye ≠ OpenCV KB) "
+                        "instead of undistorting photos to pinhole")
+    p.add_argument("--undistort-fov", type=float, default=120.0,
+                   help="horizontal FOV (deg) of the virtual pinhole when undistorting")
+    p.add_argument("--cam-time-offset", type=float, default=0.0,
+                   help="camera↔LiDAR clock offset in SECONDS added to each image "
+                        "timestamp before the continuous-time pose query; sweep to "
+                        "calibrate a constant sensor time skew")
+    p.add_argument("--no-prefer-dense", dest="prefer_dense", action="store_false", default=True,
+                   help="don't auto-seed from a sibling *_dense.ply if present")
     p.add_argument("--splat-size", type=float, default=0.05,
                    help="bootstrap Gaussian radius (m) — smaller = finer splats, less blobby")
     p.add_argument("--bootstrap", action="store_true",
@@ -571,16 +851,32 @@ def main():
         bootstrap_splat_from_ply(pc, out, size=args.splat_size)
         return
 
+    # Prefer a denser sibling cloud for the seed (e.g. *_dense.ply): 3DMakerpro's
+    # reference splat is ~3.4M gaussians, and a richer seed → far more detail.
+    seed_pc = pc
+    if args.prefer_dense and pc.suffix == ".ply" and "_dense" not in pc.stem:
+        dense = pc.with_name(pc.stem + "_dense.ply")
+        if dense.exists():
+            seed_pc = dense
+            print(f"  seeding from dense cloud: {dense.name}", flush=True)
+
     progress(5, "Loading coloured cloud and camera poses…")
-    pts, rgb = load_coloured_ply(pc)
+    pts, rgb = load_coloured_ply(seed_pc)
     frames = build_camera_frames(scan, traj_path, args.camera,
-                                 args.image_rot, args.downscale)
+                                 args.image_rot, args.downscale,
+                                 undistort=args.undistort,
+                                 undistort_fov=args.undistort_fov,
+                                 cam_time_offset=args.cam_time_offset)
     print(f"  {len(frames)} posed frames @ {frames[0]['image'].shape[1]}×"
           f"{frames[0]['image'].shape[0]} (downscale {args.downscale})", flush=True)
     progress(10, f"Training {args.iterations}-iter splat on GPU…")
     train_splat(frames, pts, rgb, out, args.iterations, args.sh_degree,
                 args.ssim_lambda, args.max_init_points,
-                args.crop_to_init, args.crop_margin)
+                args.crop_to_init, args.crop_margin,
+                densify=args.densify, cap_max=args.cap_max,
+                init_opacity=args.init_opacity, appearance=args.appearance,
+                pose_opt=args.pose_opt, pose_opt_lr=args.pose_opt_lr,
+                pose_warmup=args.pose_warmup, pose_reg=args.pose_reg)
     progress(100, "Complete!")
 
 

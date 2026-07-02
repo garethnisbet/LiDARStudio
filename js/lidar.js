@@ -149,8 +149,15 @@ export function initLidarPanel() {
   #lidar-panel .item button{flex:0 0 auto;width:auto;margin:0;background:#2c7;border:0;color:#04210f;border-radius:4px;padding:3px 9px;
     font-weight:700;cursor:pointer;font-size:11px}
   #lidar-panel .muted{color:#7d8aa0;font-size:11px}
-  #ls-bar-wrap{height:6px;background:#0f1620;border-radius:4px;overflow:hidden;margin-top:8px;display:none}
-  #ls-bar{height:100%;width:0;background:#2a6df0;transition:width .2s}
+  #ls-bar-label{display:none;justify-content:space-between;align-items:baseline;gap:8px;
+    margin-top:8px;font-size:11px;color:#aeb9cc}
+  #ls-bar-label .ls-bar-msg{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #ls-bar-label .ls-bar-pct{font-weight:700;color:#cdd8ec;font-variant-numeric:tabular-nums;flex:0 0 auto}
+  #ls-bar-wrap{height:10px;background:#0f1620;border-radius:5px;overflow:hidden;margin-top:4px;display:none}
+  #ls-bar{height:100%;width:0;background:linear-gradient(90deg,#2a6df0,#4f9bff);
+    border-radius:5px;transition:width .25s ease}
+  #ls-bar.indeterminate{width:35%!important;animation:ls-indet 1.1s ease-in-out infinite}
+  @keyframes ls-indet{0%{margin-left:-35%}100%{margin-left:100%}}
   #ls-log{font:10px/1.4 monospace;color:#9fb;background:#0c121b;border-radius:5px;padding:6px;
     margin-top:6px;max-height:120px;overflow:auto;white-space:pre-wrap;display:none}`;
   document.head.append(el('style', {}, css));
@@ -198,20 +205,47 @@ export function initLidarPanel() {
   typeSel.addEventListener('change', showGen);
   methodSel.addEventListener('change', showGen);
   showGen();
-  const barWrap = el('div', { id: 'ls-bar-wrap' }, el('div', { id: 'ls-bar' }));
+  const barMsg = el('span', { class: 'ls-bar-msg' }, 'Starting…');
+  const barPct = el('span', { class: 'ls-bar-pct' }, '');
+  const barLabel = el('div', { id: 'ls-bar-label' }, barMsg, barPct);
+  const barFill = el('div', { id: 'ls-bar' });
+  const barWrap = el('div', { id: 'ls-bar-wrap' }, barFill);
   const logBox = el('div', { id: 'ls-log' });
   const genBtn = el('button', { class: 'act' }, 'Generate');
 
+  let lastPct = null;
+  // Drive the progress bar. pct === undefined ⇒ keep current % (log-only update);
+  // before the first real % arrives the bar runs an indeterminate animation.
   const setBar = (pct, msg) => {
+    barLabel.style.display = 'flex';
     barWrap.style.display = 'block';
-    barWrap.firstChild.style.width = `${pct || 0}%`;
-    if (msg) { logBox.style.display = 'block'; logBox.textContent = msg + '\n' + logBox.textContent; }
+    if (typeof pct === 'number') {
+      lastPct = pct;
+      barFill.classList.remove('indeterminate');
+      barFill.style.width = `${pct}%`;
+      barPct.textContent = `${Math.round(pct)}%`;
+    } else if (lastPct === null) {           // unknown progress → indeterminate
+      barFill.classList.add('indeterminate');
+      barPct.textContent = '';
+    }
+    if (msg) {
+      barMsg.textContent = msg;
+      logBox.style.display = 'block';
+      logBox.textContent = msg + '\n' + logBox.textContent;
+    }
+  };
+  // Reset the bar to a clean indeterminate state at the start of a new job.
+  const resetBar = () => {
+    lastPct = null;
+    barFill.style.width = '0%'; barFill.classList.remove('indeterminate');
+    barPct.textContent = ''; barMsg.textContent = 'Starting…';
   };
 
   genBtn.onclick = async () => {
     const scan = scanInput.value.trim();
     if (!scan) { setBar(0, 'Enter a scan folder path'); return; }
     genBtn.disabled = true; logBox.textContent = ''; logBox.style.display = 'block';
+    resetBar();
     const type = typeSel.value;
     const options = type === 'splat'
       ? { splat_mode: methodSel.value, splat_voxel: parseFloat(voxelInput.value),
@@ -784,7 +818,7 @@ export function initLidarPanel() {
       el('label', { class: 'muted', style: 'flex:1' }, 'voxel', voxelInput),
       el('label', { class: 'muted', style: 'flex:1' }, 'noise σ', sorInput)),
     pSplatSize,
-    genBtn, barWrap, logBox,
+    genBtn, barLabel, barWrap, logBox,
     el('h4', {}, 'Visibility box'),
     pVis,
     el('h4', {}, 'Erase (primitives)'),
