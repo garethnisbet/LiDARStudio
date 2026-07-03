@@ -476,6 +476,9 @@ def train_splat(
     appearance: bool = True,
     opacity_reg: float = 0.004,
     scale_reg: float = 0.01,
+    min_opacity: float = 0.005,
+    flat_reg: float = 0.0,
+    min_scale: float = 0.001,
     appearance_reg: float = 0.05,
     pose_opt: bool = True,
     pose_opt_lr: float = 1e-2,
@@ -559,7 +562,7 @@ def train_splat(
             refine_start_iter=max(100, iters // 50),
             refine_stop_iter=int(iters * 0.8),
             refine_every=100,
-            min_opacity=0.005,
+            min_opacity=min_opacity,
             verbose=False,
         )
         strategy.check_sanity(params, optimizers)
@@ -593,10 +596,14 @@ def train_splat(
     scale_clamp = float(np.log(0.1))  # ≤0.1 unit (~0.3-0.5 m world): keeps
     # gaussians surface-sized — fewer tiles
     # each (less VRAM) and less radial blur.
-    # Floor the smallest axis too: without it the photometric loss collapses one
-    # axis → 0, making degenerate "needle" gaussians (aniso blew up to ~300:1 and
-    # crashed gsplat's tile intersection). This caps anisotropy at 0.3/3e-3 = 100:1.
-    scale_floor = float(np.log(3e-3))
+    # Floor the smallest axis in WORLD metres (min_scale / norm in normalised
+    # units). The old fixed floor of 3e-3 normalised ≈ 1 cm world silently pinned
+    # 95% of gaussians' thin axis — no reg could flatten them, and flat-reg could
+    # only "flatten" by inflating s_max (the 18.8→14.3 pancake failure). The
+    # needle crash the floor guarded against (aniso ~300:1 blew up gsplat's tile
+    # intersection) is handled by the per-gaussian anisotropy cap below instead.
+    scale_floor = float(np.log(min_scale / norm))
+    max_aniso_log = float(np.log(100.0))  # cap s_max/s_min at 100:1
     sh_increase_every = max(1, round(1000 * iters / 30_000))
 
     # Undistorted frames render as pinhole; legacy fisheye frames carry "radial".
@@ -681,6 +688,20 @@ def train_splat(
             + scale_reg
             * torch.exp(params["scales"].clamp(max=scale_clamp)).abs().mean()
         )
+        if flat_reg:
+            # Push gaussians toward flat surface discs (3DMakerpro min/max axis
+            # ratio ≈ 0.11 vs our spherical ~0.75): penalise the scale-invariant
+            # ratio exp(s_min − s_max) ∈ (0,1], 1 = sphere, →0 = pancake.
+            # s_max is DETACHED: without it the optimiser flattens by inflating
+            # the disc instead of thinning it (11 cm pancakes, PSNR 18.8→14.3).
+            s = params["scales"].clamp(max=scale_clamp)
+            loss = (
+                loss
+                + flat_reg
+                * torch.exp(
+                    s.min(dim=1).values - s.max(dim=1).values.detach()
+                ).mean()
+            )
         if appearance:  # keep the affine near identity
             assert app_gain is not None and app_bias is not None
             loss = (
@@ -718,6 +739,8 @@ def train_splat(
             pose_opt_optimizer.zero_grad(set_to_none=True)
         with torch.no_grad():  # bound scales: no overflow, no needles
             params["scales"].clamp_(min=scale_floor, max=scale_clamp)
+            smax = params["scales"].max(dim=1, keepdim=True).values
+            params["scales"].clamp_(min=smax - max_aniso_log)
         if strategy is not None:  # teleport / grow Gaussians (gradient-free)
             strategy.step_post_backward(
                 params, optimizers, strategy_state, step, info, lr=means_lr
@@ -998,6 +1021,41 @@ def main():
         help="initial (learned) gaussian opacity; reg pulls it lower",
     )
     p.add_argument(
+        "--opacity-reg",
+        type=float,
+        default=0.004,
+        help="weight of the mean-opacity penalty; too high pins most gaussians "
+        "at the MCMC min_opacity floor (transparent mush) — 3DMakerpro's "
+        "profile is median ~0.18",
+    )
+    p.add_argument(
+        "--scale-reg",
+        type=float,
+        default=0.01,
+        help="weight of the mean-scale penalty (pulls gaussians small)",
+    )
+    p.add_argument(
+        "--min-opacity",
+        type=float,
+        default=0.005,
+        help="MCMC relocation threshold: gaussians below this opacity get "
+        "teleported to useful regions instead of lingering as fog",
+    )
+    p.add_argument(
+        "--flat-reg",
+        type=float,
+        default=0.0,
+        help="weight pushing gaussians toward flat surface discs "
+        "(penalises min/max axis ratio; 0 = off)",
+    )
+    p.add_argument(
+        "--min-scale",
+        type=float,
+        default=0.001,
+        help="floor for a gaussian's smallest axis, in WORLD metres "
+        "(anisotropy is separately capped at 100:1)",
+    )
+    p.add_argument(
         "--no-appearance",
         dest="appearance",
         action="store_false",
@@ -1183,6 +1241,11 @@ def main():
         densify=args.densify,
         cap_max=args.cap_max,
         init_opacity=args.init_opacity,
+        opacity_reg=args.opacity_reg,
+        scale_reg=args.scale_reg,
+        min_opacity=args.min_opacity,
+        flat_reg=args.flat_reg,
+        min_scale=args.min_scale,
         appearance=args.appearance,
         pose_opt=args.pose_opt,
         pose_opt_lr=args.pose_opt_lr,
