@@ -137,10 +137,15 @@ def build_camera_frames(
     downscale: int,
     undistort: bool = True,
     undistort_fov: float = 120.0,
+    undistort_scale: float = 1.0,
     cam_time_offset: float = 0.0,
+    sfm_poses=None,
+    drop_blurry: float = 0.0,
 ):
     """
-    Return a list of {image HxWx3 float[0,1], K 3x3, viewmat 4x4 (world→cam)}.
+    Return a list of {image HxWx3 uint8 RGB, K 3x3, viewmat 4x4 (world→cam)}.
+    Images stay uint8 until the training step touches them: a float32 cache of
+    900+ full-res frames is tens of GB and OOM-kills modest machines.
 
     For each camera frame we query the LiDAR pose at its (offset-corrected) exact
     timestamp by SE(3) interpolation, P, and form the world→camera matrix
@@ -149,6 +154,12 @@ def build_camera_frames(
     image clock onto the LiDAR clock before the query (camera_ts + offset), to
     absorb a constant sensor time skew; sweep it if frames look consistently
     mis-registered.
+
+    ``sfm_poses`` (path to an npz with ``bag_ts_ns`` + ``viewmats``, from
+    align_sfm.py) replaces the odometry-derived pose of every frame it covers
+    with an externally-computed world→cam viewmat (already in the LiDAR world
+    frame, extrinsic included); frames it does not cover are DROPPED, since a
+    mix of SfM and odometry poses would be inconsistent.
 
     ``undistort`` (default) remaps each ~180° fisheye photo to a virtual PINHOLE
     of ``undistort_fov`` degrees horizontal, using OpenCV's own Kannala-Brandt
@@ -184,8 +195,20 @@ def build_camera_frames(
     maps = None  # (map1, map2, K_pinhole), built once
     offset_ns = int(round(cam_time_offset * 1e9))
     diag = {"n": 0, "clamped": 0, "snap_err_ns": [], "gap_ns": []}
+    sfm_vm = None
+    if sfm_poses is not None:
+        ext = np.load(sfm_poses)
+        sfm_vm = {
+            int(t): vm.astype(np.float64)
+            for t, vm in zip(ext["bag_ts_ns"], ext["viewmats"])
+        }
+        print(f"  external SfM poses: {len(sfm_vm)} frames from {sfm_poses}", flush=True)
+    skipped = 0
     frames = []
     for ts, img in ppc.read_images(img_bag, camera, rot=image_rot):
+        if sfm_vm is not None and int(ts) not in sfm_vm:
+            skipped += 1
+            continue
         h, w = img.shape[:2]
         K = K0.copy()
         if downscale > 1:
@@ -199,15 +222,20 @@ def build_camera_frames(
         if undistort:
             if maps is None:
                 # Virtual pinhole: f = (W/2)/tan(fov/2); centred principal point.
-                f = (W / 2.0) / np.tan(np.radians(undistort_fov) / 2.0)
-                Kp = np.array([[f, 0, W / 2.0], [0, f, H / 2.0], [0, 0, 1.0]])
+                # ``undistort_scale`` enlarges the output canvas beyond the source
+                # size: a wide-FOV tan projection at 1:1 samples the image centre
+                # BELOW the fisheye's native px/radian (e.g. 433 vs 563 at 120°),
+                # silently blurring the sharpest part of every training photo.
+                Wo, Ho = round(W * undistort_scale), round(H * undistort_scale)
+                f = (Wo / 2.0) / np.tan(np.radians(undistort_fov) / 2.0)
+                Kp = np.array([[f, 0, Wo / 2.0], [0, f, Ho / 2.0], [0, 0, 1.0]])
                 m1, m2 = cv2.fisheye.initUndistortRectifyMap(
-                    K, Dk, np.eye(3), Kp, (W, H), cv2.CV_16SC2
+                    K, Dk, np.eye(3), Kp, (Wo, Ho), cv2.CV_16SC2
                 )
                 maps = (m1, m2, Kp)
                 print(
                     f"  undistort: fisheye → pinhole {undistort_fov:.0f}° "
-                    f"(f={f:.1f}px, {W}×{H})",
+                    f"(f={f:.1f}px, {Wo}×{Ho})",
                     flush=True,
                 )
             img = cv2.remap(
@@ -218,24 +246,50 @@ def build_camera_frames(
                 borderMode=cv2.BORDER_CONSTANT,
             )
             K = maps[2]
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # uint8; float [0,1] on GPU
 
-        tq = int(ts) + offset_ns
-        P, a, gap = _interp_pose(traj_ts, poses, tq)
-        viewmat = T @ np.linalg.inv(P)  # world → camera
-        # Diagnostics: how far the old nearest-neighbour snap would have been, and
-        # the bracket size we interpolated across.
-        diag["n"] += 1
-        if gap == 0:
-            diag["clamped"] += 1
+        if sfm_vm is not None:
+            viewmat = sfm_vm[int(ts)]
         else:
-            diag["gap_ns"].append(gap)
-            diag["snap_err_ns"].append(min(a, 1.0 - a) * gap)
+            tq = int(ts) + offset_ns
+            P, a, gap = _interp_pose(traj_ts, poses, tq)
+            viewmat = T @ np.linalg.inv(P)  # world → camera
+            # Diagnostics: how far the old nearest-neighbour snap would have
+            # been, and the bracket size we interpolated across.
+            diag["n"] += 1
+            if gap == 0:
+                diag["clamped"] += 1
+            else:
+                diag["gap_ns"].append(gap)
+                diag["snap_err_ns"].append(min(a, 1.0 - a) * gap)
 
         frame = {"image": rgb, "K": K.astype(np.float64), "viewmat": viewmat}
+        if drop_blurry > 0:
+            # Laplacian variance as a sharpness score; motion-blurred handheld
+            # frames teach the model soft edges everywhere they're sampled.
+            frame["sharp"] = cv2.Laplacian(
+                cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.CV_64F
+            ).var()
         if not undistort:  # fisheye path keeps radial coeffs
             frame["radial"] = radial
         frames.append(frame)
+    if skipped:
+        print(
+            f"  dropped {skipped} frame(s) without an SfM pose "
+            f"({len(frames)} kept)",
+            flush=True,
+        )
+    if drop_blurry > 0 and frames:
+        scores = np.array([f.pop("sharp") for f in frames])
+        cut = np.quantile(scores, drop_blurry)
+        kept = [f for f, s in zip(frames, scores) if s >= cut]
+        print(
+            f"  sharpness filter: dropped {len(frames) - len(kept)} blurriest "
+            f"frame(s) of {len(frames)} (laplacian-var cut {cut:.1f}, "
+            f"median {np.median(scores):.1f})",
+            flush=True,
+        )
+        frames = kept
     if not frames:
         raise RuntimeError("no camera frames loaded from image bag")
     if diag["snap_err_ns"]:
@@ -646,8 +700,14 @@ def train_splat(
             return _se3_exp(pose_delta[fi]) @ f["viewmat_t"]
         return f["viewmat_t"]
 
+    # Images stay uint8 on the host; only the sampled frame is uploaded and
+    # converted each step (~10 MB — negligible next to the render). Pre-pinning
+    # float32 copies of every frame doubled a tens-of-GB cache and OOM-killed
+    # the host at downscale 2.
+    def frame_gt(f):
+        return torch.from_numpy(f["image"]).to(device).float().div_(255.0)
+
     for f in frames:
-        f["image_t"] = torch.tensor(f["image"]).pin_memory()
         f["K_t"] = torch.tensor(f["K"], dtype=torch.float32, device=device)
         f["viewmat_t"] = torch.tensor(f["viewmat"], dtype=torch.float32, device=device)
         if not pinhole:  # gsplat fisheye radial coeffs [C,4]
@@ -677,7 +737,7 @@ def train_splat(
             assert app_gain is not None and app_bias is not None
             pred = pred * app_gain[fi] + app_bias[fi]
         pred = pred.clamp(0, 1)
-        gt = f["image_t"].to(device, non_blocking=True)
+        gt = frame_gt(f)
         l1 = (pred - gt).abs().mean()
         loss = (1 - ssim_lambda) * l1 + ssim_lambda * (1 - windowed_ssim(pred, gt))
         # MCMC regularisers: push toward many small, faint Gaussians. exp(scale) is
@@ -781,7 +841,7 @@ def train_splat(
             if appearance:
                 assert app_gain is not None and app_bias is not None
                 pred = pred * app_gain[fi] + app_bias[fi]
-            mse = (pred.clamp(0, 1) - f["image_t"].to(device)).pow(2).mean()
+            mse = (pred.clamp(0, 1) - frame_gt(f)).pow(2).mean()
             tot += float(10 * torch.log10(1.0 / mse))
             n += 1
         print(f"  train-view PSNR (mean over {n} frames): {tot / n:.2f} dB", flush=True)
@@ -1110,6 +1170,28 @@ def main():
         "calibrate a constant sensor time skew",
     )
     p.add_argument(
+        "--undistort-scale",
+        type=float,
+        default=1.0,
+        help="undistorted canvas size as a multiple of the source frame; >1 "
+        "preserves the fisheye centre's native px/radian that a 1:1 "
+        "wide-FOV pinhole undersamples",
+    )
+    p.add_argument(
+        "--drop-blurry",
+        type=float,
+        default=0.0,
+        help="drop this fraction (0-1) of the blurriest frames "
+        "(Laplacian-variance sharpness) before training",
+    )
+    p.add_argument(
+        "--sfm-poses",
+        default=None,
+        help="npz of externally-computed world→cam viewmats keyed by "
+        "bag_ts_ns (from align_sfm.py); overrides the odometry pose of "
+        "every covered frame and drops uncovered frames",
+    )
+    p.add_argument(
         "--no-prefer-dense",
         dest="prefer_dense",
         action="store_false",
@@ -1219,7 +1301,10 @@ def main():
         args.downscale,
         undistort=args.undistort,
         undistort_fov=args.undistort_fov,
+        undistort_scale=args.undistort_scale,
         cam_time_offset=args.cam_time_offset,
+        sfm_poses=Path(args.sfm_poses) if args.sfm_poses else None,
+        drop_blurry=args.drop_blurry,
     )
     print(
         f"  {len(frames)} posed frames @ {frames[0]['image'].shape[1]}×"
