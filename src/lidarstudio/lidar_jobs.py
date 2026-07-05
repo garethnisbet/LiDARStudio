@@ -823,18 +823,43 @@ def _read_photo(scan: Path, index: int) -> bytes:
     raise RuntimeError("frame not found in bag")
 
 
+def _prep_photo(jpeg: bytes, rot: str, width: int) -> bytes:
+    """Optionally rotate to portrait and downscale for display."""
+    import cv2
+    import numpy as np
+
+    img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+    rot_map = {
+        "ccw": cv2.ROTATE_90_COUNTERCLOCKWISE,
+        "cw": cv2.ROTATE_90_CLOCKWISE,
+        "180": cv2.ROTATE_180,
+    }
+    if rot in rot_map:
+        img = cv2.rotate(img, rot_map[rot])
+    if width and img.shape[1] > width:
+        h = round(img.shape[0] * width / img.shape[1])
+        img = cv2.resize(img, (width, h), interpolation=cv2.INTER_AREA)
+    ok, out = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 87])
+    return out.tobytes() if ok else jpeg
+
+
 async def scan_photo_handler(request):
-    """GET /api/scan/photo?path=<scan>&index=N — one camera JPEG from the bag."""
+    """GET /api/scan/photo?path=<scan>&index=N[&rot=ccw&width=1600] — one
+    camera JPEG from the bag, optionally rotated/downscaled for display."""
     scan = Path(request.query.get("path", ""))
+    rot = request.query.get("rot", "")
     try:
         index = int(request.query.get("index", "0"))
+        width = int(request.query.get("width", "0"))
     except ValueError:
-        return web.Response(status=400, text="bad index")
+        return web.Response(status=400, text="bad index/width")
     if not scan.is_dir():
         return web.Response(status=404, text="scan folder not found")
     try:
         loop = asyncio.get_event_loop()
         jpeg = await loop.run_in_executor(None, _read_photo, scan, index)
+        if rot or width:
+            jpeg = await loop.run_in_executor(None, _prep_photo, jpeg, rot, width)
         return web.Response(body=jpeg, content_type="image/jpeg")
     except Exception as exc:
         return web.Response(status=500, text=str(exc))

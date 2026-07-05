@@ -256,88 +256,86 @@ export function initLidarPanel() {
     barPct.textContent = ''; barMsg.textContent = 'Starting…';
   };
 
-  // ── Scan photos: browse the raw camera JPEGs inside the IMAGE bag ──
-  // The bag stores CompressedImage messages (already JPEG); the server sends
-  // one frame at a time and the <img> is rotated to portrait in CSS, matching
-  // the pipeline's rotate_to_portrait convention.
-  const photoImg = el('img', { style:
-    'max-width:100%;max-height:340px;display:none;margin:4px auto;' +
-    'transform:rotate(-90deg) scale(0.75);transform-origin:center;' });
-  const photoSlider = el('input', { type: 'range', min: '0', max: '0', value: '0', style: 'flex:1' });
-  const photoNum = el('span', { class: 'muted', style: 'min-width:70px;text-align:right' }, '–');
-  const photoStat = el('div', { class: 'muted' }, 'Uses the scan folder above.');
-  let photoCount = 0, photoScan = null, photoTimer = null;
-  const showPhoto = () => {
-    if (!photoCount) return;
-    const i = Math.min(photoCount - 1, Math.max(0, parseInt(photoSlider.value) || 0));
-    photoNum.textContent = `${i} / ${photoCount - 1}`;
+  // ── Bag media viewer: one large closable floating panel over the main
+  // display, shared by Scan photos and LiDAR sweeps (the control panel only
+  // hosts the Load buttons — inline images there were too small to read).
+  const mvTitle = el('span', { style: 'font-weight:600' }, '');
+  const mvImg = el('img', { style:
+    'max-width:100%;max-height:calc(92vh - 110px);display:block;margin:0 auto;' +
+    'object-fit:contain;background:#000;border-radius:4px' });
+  const mvSlider = el('input', { type: 'range', min: '0', max: '0', value: '0', style: 'flex:1' });
+  const mvNum = el('span', { class: 'muted', style: 'min-width:86px;text-align:right' }, '–');
+  let mvSource = null, mvTimer = null;   // {title, count, url(i)}
+  const mvShow = () => {
+    if (!mvSource) return;
+    const i = Math.min(mvSource.count - 1, Math.max(0, parseInt(mvSlider.value) || 0));
+    mvNum.textContent = `${i} / ${mvSource.count - 1}`;
     // Debounce while scrubbing so we don't request every intermediate frame.
-    clearTimeout(photoTimer);
-    photoTimer = setTimeout(() => {
-      photoImg.src = `/api/scan/photo?path=${encodeURIComponent(photoScan)}&index=${i}`;
-      photoImg.style.display = 'block';
-    }, 120);
+    clearTimeout(mvTimer);
+    mvTimer = setTimeout(() => { mvImg.src = mvSource.url(i); }, 120);
   };
-  photoSlider.addEventListener('input', showPhoto);
-  const photoStep = (d) => { photoSlider.value = (parseInt(photoSlider.value) || 0) + d; showPhoto(); };
+  mvSlider.addEventListener('input', mvShow);
+  const mvStep = (d) => { mvSlider.value = (parseInt(mvSlider.value) || 0) + d; mvShow(); };
+  const mvPanel = el('div', { style:
+    'position:fixed;left:16px;top:16px;z-index:2000;display:none;' +
+    'width:min(74vw,1200px);background:rgba(18,20,26,0.95);border:1px solid #555;' +
+    'border-radius:8px;padding:10px;box-shadow:0 6px 30px rgba(0,0,0,0.5)' },
+    el('div', { class: 'row', style: 'align-items:center;margin-bottom:6px' },
+      mvTitle,
+      el('span', { style: 'flex:1' }),
+      el('button', { class: 'act', style: 'width:34px', onclick: () => mvStep(-1) }, '◀'),
+      el('button', { class: 'act', style: 'width:34px', onclick: () => mvStep(1) }, '▶'),
+      el('button', { class: 'act', style: 'width:30px;margin-left:8px;background:#a33',
+        onclick: () => { mvPanel.style.display = 'none'; } }, '✕')),
+    mvImg,
+    el('div', { class: 'row', style: 'margin-top:6px' }, mvSlider, mvNum));
+  document.body.appendChild(mvPanel);
+  const mvOpen = (source) => {
+    mvSource = source;
+    mvTitle.textContent = source.title;
+    mvSlider.max = String(Math.max(0, source.count - 1));
+    if (parseInt(mvSlider.value) >= source.count) mvSlider.value = '0';
+    mvPanel.style.display = 'block';
+    mvShow();
+  };
+
+  // ── Scan photos: raw camera JPEGs from the IMAGE bag (server rotates to
+  // portrait + downscales for display). ──
+  const photoStat = el('div', { class: 'muted' }, 'Uses the scan folder above.');
   const photoLoadBtn = el('button', { class: 'act', onclick: async () => {
     const scan = scanInput.value.trim();
     if (!scan) { photoStat.textContent = 'Enter a scan folder path above.'; return; }
     photoStat.textContent = 'Indexing bag…';
     try {
       const r = await api('/api/scan/photos', { path: scan });
-      photoScan = scan; photoCount = r.count;
-      photoSlider.max = String(Math.max(0, r.count - 1));
       photoStat.textContent = `${r.count} photos (${r.topic})`;
-      showPhoto();
+      mvOpen({
+        title: `Scan photos — ${r.count} frames`,
+        count: r.count,
+        url: (i) => `/api/scan/photo?path=${encodeURIComponent(scan)}&index=${i}&rot=ccw&width=1600`,
+      });
     } catch (e) { photoStat.textContent = 'Error: ' + e.message; }
   } }, 'Load photos');
-  const pPhotos = el('div', {},
-    photoStat,
-    el('div', { class: 'row' }, photoLoadBtn,
-      el('button', { class: 'act', style: 'width:34px', onclick: () => photoStep(-1) }, '◀'),
-      el('button', { class: 'act', style: 'width:34px', onclick: () => photoStep(1) }, '▶')),
-    el('div', { class: 'row' }, photoSlider, photoNum),
-    photoImg);
+  const pPhotos = el('div', {}, photoStat, el('div', { class: 'row' }, photoLoadBtn));
 
-  // ── LiDAR sweeps: browse per-sweep point clouds, server-rendered as
-  // top-down + side panels coloured by height (same pattern as Scan photos).
-  const sweepImg = el('img', { style: 'max-width:100%;display:none;margin:4px auto;' });
-  const sweepSlider = el('input', { type: 'range', min: '0', max: '0', value: '0', style: 'flex:1' });
-  const sweepNum = el('span', { class: 'muted', style: 'min-width:70px;text-align:right' }, '–');
+  // ── LiDAR sweeps: per-sweep clouds server-rendered as top-down + side
+  // height-coloured panels. ──
   const sweepStat = el('div', { class: 'muted' }, 'Uses the scan folder above.');
-  let sweepCount = 0, sweepScan = null, sweepTimer = null;
-  const showSweep = () => {
-    if (!sweepCount) return;
-    const i = Math.min(sweepCount - 1, Math.max(0, parseInt(sweepSlider.value) || 0));
-    sweepNum.textContent = `${i} / ${sweepCount - 1}`;
-    clearTimeout(sweepTimer);
-    sweepTimer = setTimeout(() => {
-      sweepImg.src = `/api/scan/sweep?path=${encodeURIComponent(sweepScan)}&index=${i}`;
-      sweepImg.style.display = 'block';
-    }, 120);
-  };
-  sweepSlider.addEventListener('input', showSweep);
-  const sweepStep = (d) => { sweepSlider.value = (parseInt(sweepSlider.value) || 0) + d; showSweep(); };
   const sweepLoadBtn = el('button', { class: 'act', onclick: async () => {
     const scan = scanInput.value.trim();
     if (!scan) { sweepStat.textContent = 'Enter a scan folder path above.'; return; }
     sweepStat.textContent = 'Indexing bag…';
     try {
       const r = await api('/api/scan/sweeps', { path: scan });
-      sweepScan = scan; sweepCount = r.count;
-      sweepSlider.max = String(Math.max(0, r.count - 1));
       sweepStat.textContent = `${r.count} sweeps (${r.topic})`;
-      showSweep();
+      mvOpen({
+        title: `LiDAR sweeps — ${r.count} sweeps`,
+        count: r.count,
+        url: (i) => `/api/scan/sweep?path=${encodeURIComponent(scan)}&index=${i}`,
+      });
     } catch (e) { sweepStat.textContent = 'Error: ' + e.message; }
   } }, 'Load sweeps');
-  const pSweeps = el('div', {},
-    sweepStat,
-    el('div', { class: 'row' }, sweepLoadBtn,
-      el('button', { class: 'act', style: 'width:34px', onclick: () => sweepStep(-1) }, '◀'),
-      el('button', { class: 'act', style: 'width:34px', onclick: () => sweepStep(1) }, '▶')),
-    el('div', { class: 'row' }, sweepSlider, sweepNum),
-    sweepImg);
+  const pSweeps = el('div', {}, sweepStat, el('div', { class: 'row' }, sweepLoadBtn));
 
   genBtn.onclick = async () => {
     const scan = scanInput.value.trim();
