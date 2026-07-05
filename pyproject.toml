@@ -18,6 +18,7 @@ dependencies = [
     "numpy",
     "open3d",
     "plyfile",
+    "rosbags",
 ]
 dynamic = ["version"]
 license.file = "LICENSE"
