@@ -765,6 +765,81 @@ async def edit_recolour_handler(request):
         return web.json_response({"error": str(exc)}, status=500)
 
 
+# Per-scan photo index: scan folder → list of (bag_ts_ns, connection topic).
+# Built once by iterating message headers (no JPEG decoding); lets the frame
+# endpoint jump straight to one message via a start/stop time window.
+_photo_index: dict = {}
+
+
+def _scan_photo_index(scan: Path):
+    if str(scan) in _photo_index:
+        return _photo_index[str(scan)]
+    from rosbags.highlevel import AnyReader
+
+    contents = _scan_contents(scan)
+    if not contents.get("image_bag"):
+        raise FileNotFoundError("no IMAGE_*.bag in scan folder")
+    bag = scan / contents["image_bag"]
+    ts = []
+    with AnyReader([bag]) as reader:
+        conns = [
+            c for c in reader.connections if "image" in c.topic and "camera" in c.topic
+        ] or list(reader.connections)
+        topic = conns[0].topic
+        conns = [c for c in conns if c.topic == topic]
+        for _conn, t, _raw in reader.messages(connections=conns):
+            ts.append(t)
+    _photo_index[str(scan)] = (bag, topic, ts)
+    return _photo_index[str(scan)]
+
+
+async def scan_photos_handler(request):
+    """POST /api/scan/photos — index the scan's camera images: {count, ts}."""
+    data = await request.json()
+    scan = Path((data.get("path") or "").strip())
+    if not scan.is_dir():
+        return web.json_response({"error": "scan folder not found"}, status=404)
+    try:
+        loop = asyncio.get_event_loop()
+        _bag, topic, ts = await loop.run_in_executor(None, _scan_photo_index, scan)
+        return web.json_response({"count": len(ts), "topic": topic})
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+def _read_photo(scan: Path, index: int) -> bytes:
+    from rosbags.highlevel import AnyReader
+
+    bag, topic, ts = _scan_photo_index(scan)
+    if not 0 <= index < len(ts):
+        raise IndexError(f"frame {index} out of range 0..{len(ts) - 1}")
+    with AnyReader([bag]) as reader:
+        conns = [c for c in reader.connections if c.topic == topic]
+        for conn, _t, raw in reader.messages(
+            connections=conns, start=ts[index], stop=ts[index] + 1
+        ):
+            msg = reader.deserialize(raw, conn.msgtype)
+            return bytes(msg.data)  # CompressedImage payload is already JPEG
+    raise RuntimeError("frame not found in bag")
+
+
+async def scan_photo_handler(request):
+    """GET /api/scan/photo?path=<scan>&index=N — one camera JPEG from the bag."""
+    scan = Path(request.query.get("path", ""))
+    try:
+        index = int(request.query.get("index", "0"))
+    except ValueError:
+        return web.Response(status=400, text="bad index")
+    if not scan.is_dir():
+        return web.Response(status=404, text="scan folder not found")
+    try:
+        loop = asyncio.get_event_loop()
+        jpeg = await loop.run_in_executor(None, _read_photo, scan, index)
+        return web.Response(body=jpeg, content_type="image/jpeg")
+    except Exception as exc:
+        return web.Response(status=500, text=str(exc))
+
+
 def _unique_output(src: Path, tag: str) -> str:
     """First free sibling name ``<stem>_<tag>.ply``, ``<stem>_<tag>2.ply``, … .
 
@@ -864,3 +939,5 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/process/events/{job_id}", process_events_handler)
     app.router.add_post("/api/project/outputs", project_outputs_handler)
     app.router.add_get("/api/scan/file", scan_file_handler)
+    app.router.add_post("/api/scan/photos", scan_photos_handler)
+    app.router.add_get("/api/scan/photo", scan_photo_handler)

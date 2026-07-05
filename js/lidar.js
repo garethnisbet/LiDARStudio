@@ -256,6 +256,50 @@ export function initLidarPanel() {
     barPct.textContent = ''; barMsg.textContent = 'Starting…';
   };
 
+  // ── Scan photos: browse the raw camera JPEGs inside the IMAGE bag ──
+  // The bag stores CompressedImage messages (already JPEG); the server sends
+  // one frame at a time and the <img> is rotated to portrait in CSS, matching
+  // the pipeline's rotate_to_portrait convention.
+  const photoImg = el('img', { style:
+    'max-width:100%;max-height:340px;display:none;margin:4px auto;' +
+    'transform:rotate(-90deg) scale(0.75);transform-origin:center;' });
+  const photoSlider = el('input', { type: 'range', min: '0', max: '0', value: '0', style: 'flex:1' });
+  const photoNum = el('span', { class: 'muted', style: 'min-width:70px;text-align:right' }, '–');
+  const photoStat = el('div', { class: 'muted' }, 'Uses the scan folder above.');
+  let photoCount = 0, photoScan = null, photoTimer = null;
+  const showPhoto = () => {
+    if (!photoCount) return;
+    const i = Math.min(photoCount - 1, Math.max(0, parseInt(photoSlider.value) || 0));
+    photoNum.textContent = `${i} / ${photoCount - 1}`;
+    // Debounce while scrubbing so we don't request every intermediate frame.
+    clearTimeout(photoTimer);
+    photoTimer = setTimeout(() => {
+      photoImg.src = `/api/scan/photo?path=${encodeURIComponent(photoScan)}&index=${i}`;
+      photoImg.style.display = 'block';
+    }, 120);
+  };
+  photoSlider.addEventListener('input', showPhoto);
+  const photoStep = (d) => { photoSlider.value = (parseInt(photoSlider.value) || 0) + d; showPhoto(); };
+  const photoLoadBtn = el('button', { class: 'act', onclick: async () => {
+    const scan = scanInput.value.trim();
+    if (!scan) { photoStat.textContent = 'Enter a scan folder path above.'; return; }
+    photoStat.textContent = 'Indexing bag…';
+    try {
+      const r = await api('/api/scan/photos', { path: scan });
+      photoScan = scan; photoCount = r.count;
+      photoSlider.max = String(Math.max(0, r.count - 1));
+      photoStat.textContent = `${r.count} photos (${r.topic})`;
+      showPhoto();
+    } catch (e) { photoStat.textContent = 'Error: ' + e.message; }
+  } }, 'Load photos');
+  const pPhotos = el('div', {},
+    photoStat,
+    el('div', { class: 'row' }, photoLoadBtn,
+      el('button', { class: 'act', style: 'width:34px', onclick: () => photoStep(-1) }, '◀'),
+      el('button', { class: 'act', style: 'width:34px', onclick: () => photoStep(1) }, '▶')),
+    el('div', { class: 'row' }, photoSlider, photoNum),
+    photoImg);
+
   genBtn.onclick = async () => {
     const scan = scanInput.value.trim();
     if (!scan) { setBar(0, 'Enter a scan folder path'); return; }
@@ -836,6 +880,8 @@ export function initLidarPanel() {
       el('label', { class: 'muted', style: 'flex:1' }, 'noise σ', sorInput)),
     pSplatSize,
     genBtn, barLabel, barWrap, logBox,
+    el('h4', {}, 'Scan photos'),
+    pPhotos,
     el('h4', {}, 'Visibility box'),
     pVis,
     el('h4', {}, 'Erase (primitives)'),

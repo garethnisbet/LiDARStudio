@@ -129,15 +129,22 @@ def _interp_pose(traj_ts, poses, ts):
     return out, a, gap
 
 
-def _dynamic_mask_png(img_bgr, K, viewmat, box):
-    """PNG-encoded loss mask (0 = exclude) for a dynamic object: pixels inside
-    the projected world-space ``box`` silhouette AND near saturated-blue paint.
+def _dynamic_mask_png(img_bgr, K, viewmat, box, canon_pts=None):
+    """PNG-encoded loss mask (0 = exclude) for a dynamic object.
 
-    The box alone over-masks (its silhouette from a nearby camera covers most
-    of the frame, blanking static walls behind the object); the colour gate
-    alone would also hit unrelated blue surfaces (ceiling banner). The
-    intersection masks just the object, in any joint configuration, wherever
-    the box says it can be.
+    Two regions are excluded, both clipped to the projected world-space
+    ``box`` silhouette:
+
+    1. Pixels near saturated-blue paint — the object wherever it has MOVED to
+       in this frame. The box gate keeps unrelated blue surfaces (ceiling
+       banner) trainable; the colour gate keeps walls behind the object
+       trainable (the raw silhouette from a nearby camera covers most of the
+       frame).
+    2. Pixels where the CANONICAL configuration stands (``canon_pts``, seed
+       points inside the box, world coords). Without this, late frames show
+       background where the object used to be and actively CARVE the
+       canonical reconstruction from the far side — half-built, half-erased
+       gaussians render as chaotic smear.
     """
     import cv2
     import numpy as np
@@ -165,8 +172,21 @@ def _dynamic_mask_png(img_bgr, K, viewmat, box):
     # Dilate so the object's non-blue parts (black wrist/joints) adjacent to
     # blue paint are covered too.
     k = max(31, (int(0.04 * W)) | 1)
-    arm = cv2.dilate(blue, np.ones((k, k), np.uint8))
-    keep = cv2.bitwise_not(cv2.bitwise_and(sil, arm))
+    excl = cv2.bitwise_and(sil, cv2.dilate(blue, np.ones((k, k), np.uint8)))
+    if canon_pts is not None and len(canon_pts):
+        Xc = (viewmat[:3, :3] @ canon_pts.T + viewmat[:3, 3:4]).T
+        front = Xc[:, 2] > 0.05
+        if front.any():
+            uv = (K @ Xc[front].T).T
+            uv = (uv[:, :2] / uv[:, 2:3]).astype(np.int32)
+            inb = (
+                (uv[:, 0] >= 0) & (uv[:, 0] < W) & (uv[:, 1] >= 0) & (uv[:, 1] < H)
+            )
+            canon = np.zeros((H, W), np.uint8)
+            canon[uv[inb, 1], uv[inb, 0]] = 255
+            kc = max(15, (int(0.02 * W)) | 1)
+            excl = cv2.bitwise_or(excl, cv2.dilate(canon, np.ones((kc, kc), np.uint8)))
+    keep = cv2.bitwise_not(excl)
     ok, png = cv2.imencode(".png", keep)
     return png if ok else None
 
@@ -185,6 +205,7 @@ def build_camera_frames(
     drop_blurry: float = 0.0,
     mask_box=None,
     mask_from: int = 0,
+    mask_canon_pts=None,
 ):
     """
     Return a list of {image HxWx3 uint8 RGB, K 3x3, viewmat 4x4 (world→cam)}.
@@ -309,7 +330,9 @@ def build_camera_frames(
 
         frame = {"image": rgb, "K": K.astype(np.float64), "viewmat": viewmat}
         if mask_box is not None and bag_i >= mask_from and undistort:
-            frame["mask_png"] = _dynamic_mask_png(img, K, viewmat, mask_box)
+            frame["mask_png"] = _dynamic_mask_png(
+                img, K, viewmat, mask_box, mask_canon_pts
+            )
         if drop_blurry > 0:
             # Laplacian variance as a sharpness score; motion-blurred handheld
             # frames teach the model soft edges everywhere they're sampled.
@@ -1371,12 +1394,24 @@ def main():
     progress(5, "Loading coloured cloud and camera poses…")
     pts, rgb = load_coloured_ply(seed_pc)
     mask_box = None
+    mask_canon = None
     if args.mask_box:
         v = [float(x) for x in args.mask_box.split(",")]
         mask_box = (
             [min(a, b) for a, b in zip(v[:3], v[3:])],
             [max(a, b) for a, b in zip(v[:3], v[3:])],
         )
+        # Blue seed points inside the box = the canonical configuration's own
+        # geometry (the seed cloud is expected to be ghost-filtered via
+        # --dynamic-box). Their projection is protected from carving in masked
+        # frames; the floor/walls inside the box stay supervised, so only the
+        # object itself is exempted. Dilation in the mask covers its adjacent
+        # non-blue parts.
+        inb = ((pts >= mask_box[0]) & (pts <= mask_box[1])).all(axis=1)
+        blue = (rgb[:, 2] > rgb[:, 0] + 0.12) & (rgb[:, 2] > rgb[:, 1] + 0.08)
+        canon = pts[inb & blue]
+        if len(canon):
+            mask_canon = canon[:: max(1, len(canon) // 20000)]
     frames = build_camera_frames(
         scan,
         traj_path,
@@ -1391,6 +1426,7 @@ def main():
         drop_blurry=args.drop_blurry,
         mask_box=mask_box,
         mask_from=args.mask_from,
+        mask_canon_pts=mask_canon,
     )
     print(
         f"  {len(frames)} posed frames @ {frames[0]['image'].shape[1]}×"
