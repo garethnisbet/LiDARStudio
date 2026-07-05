@@ -1326,6 +1326,7 @@ dependencies = [
     { name = "aiohttp" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "open3d" },
     { name = "plyfile" },
 ]
 
@@ -1356,6 +1357,7 @@ requires-dist = [
     { name = "aiohttp" },
     { name = "kiss-icp", marker = "extra == 'pipeline'" },
     { name = "numpy" },
+    { name = "open3d" },
     { name = "open3d", marker = "extra == 'pipeline'" },
     { name = "opencv-python-headless", marker = "extra == 'pipeline'" },
     { name = "plyfile" },

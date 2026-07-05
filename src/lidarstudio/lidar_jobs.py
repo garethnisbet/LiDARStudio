@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import threading
@@ -488,6 +489,17 @@ async def _job_splat(project_path, scan_path, options, queue):
     mode = options.get("splat_mode", "surfel")
     pc_dir = proj / "pointclouds"
 
+    # Explicit seed cloud (e.g. an edited one) — pins the splat to that file
+    # instead of the job's default (surfel: the scan's own dense cloud;
+    # trained/bootstrap: the latest project cloud).
+    seed = (options.get("pointcloud") or "").strip()
+    seed_p = Path(seed) if seed else None
+    if seed_p and not seed_p.exists():
+        await queue.put(
+            {"event": "error", "message": f"Selected seed cloud not found: {seed}"}
+        )
+        return
+
     if mode == "surfel":
         # Surfels need a *dense* cloud (small splats only look good when the
         # cloud is dense), so the splat job keeps its own fine-voxel cloud,
@@ -501,7 +513,7 @@ async def _job_splat(project_path, scan_path, options, queue):
             )
             return
         voxel = float(options.get("splat_voxel", 0.01))
-        dense = pc_dir / f"pointcloud_{ts}_dense.ply"
+        dense = seed_p or pc_dir / f"pointcloud_{ts}_dense.ply"
         if not dense.exists():
             pc_dir.mkdir(exist_ok=True)
             await queue.put(
@@ -553,9 +565,17 @@ async def _job_splat(project_path, scan_path, options, queue):
             str(options.get("surfel_sor", 2.0)),
         ]
     else:
-        # Legacy GPU-trained / bootstrap path (uses the latest coloured cloud).
-        pc_files = sorted(pc_dir.glob("pointcloud_*.ply")) if pc_dir.exists() else []
-        pc_files = [p for p in pc_files if not p.stem.endswith("_dense")] or pc_files
+        # Legacy GPU-trained / bootstrap path (explicit seed cloud if chosen,
+        # else the latest coloured cloud in the project).
+        if seed_p:
+            pc_files = [seed_p]
+        else:
+            pc_files = (
+                sorted(pc_dir.glob("pointcloud_*.ply")) if pc_dir.exists() else []
+            )
+            pc_files = [
+                p for p in pc_files if not p.stem.endswith("_dense")
+            ] or pc_files
         cmd = [
             sys.executable,
             str(ROOT / "process_splat.py"),
@@ -692,8 +712,9 @@ async def project_outputs_handler(request):
 async def edit_apply_handler(request):
     """POST /api/edit/apply — run one edit op on a cloud/splat PLY.
 
-    Body: {path, op, params, [output]}.  Writes a sibling *_edited.ply (chained
-    edits overwrite it) and returns the edit summary so the UI can reload it.
+    Body: {path, op, params, [output]}.  Writes a sibling *_edited.ply with a
+    unique numbered name (never overwriting an earlier edit) and returns the
+    edit summary so the UI can reload it.
     """
     data = await request.json()
     path = (data.get("path") or "").strip()
@@ -705,9 +726,7 @@ async def edit_apply_handler(request):
     if not src.exists():
         return web.json_response({"error": "file not found"}, status=404)
 
-    # <name>_edited.ply, re-editing the edited file in place (original untouched).
-    stem = src.stem[:-7] if src.stem.endswith("_edited") else src.stem
-    out = data.get("output") or str(src.with_name(f"{stem}_edited.ply"))
+    out = data.get("output") or _unique_output(src, "edited")
 
     try:
         from lidarstudio import edit_ops
@@ -732,8 +751,7 @@ async def edit_recolour_handler(request):
     src = Path(path)
     if not src.exists():
         return web.json_response({"error": "file not found"}, status=404)
-    stem = src.stem[:-12] if src.stem.endswith("_recoloured") else src.stem
-    out = data.get("output") or str(src.with_name(f"{stem}_recoloured.ply"))
+    out = data.get("output") or _unique_output(src, "recoloured")
     try:
         from lidarstudio import edit_ops
 
@@ -745,6 +763,24 @@ async def edit_recolour_handler(request):
         return web.json_response(result)
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
+
+
+def _unique_output(src: Path, tag: str) -> str:
+    """First free sibling name ``<stem>_<tag>.ply``, ``<stem>_<tag>2.ply``, … .
+
+    Never overwrites an earlier output. Chained edits (re-editing a file that
+    already carries the tag) collapse back to the base stem, so a second crop
+    of ``cloud_edited.ply`` becomes ``cloud_edited2.ply``, not
+    ``cloud_edited_edited.ply``.
+    """
+    stem = re.sub(rf"_{tag}\d*$", "", src.stem)
+    n = 1
+    while True:
+        name = f"{stem}_{tag}.ply" if n == 1 else f"{stem}_{tag}{n}.ply"
+        cand = src.with_name(name)
+        if not cand.exists():
+            return str(cand)
+        n += 1
 
 
 def _write_pose_sidecar(out_path, pose):

@@ -537,19 +537,20 @@ export function loadOBJFile(file, mtlFile) {
   doLoad();
 }
 
-export function loadPLYFile(file, transforms = null) {
+export function loadPLYFile(file, transforms = null, name = null) {
   // Resolves with the created scene entry so callers can re-select the result.
+  // ``file`` may be a File/Blob or a raw ArrayBuffer (server-side library
+  // loads pass the fetched buffer directly to avoid an extra multi-GB copy);
+  // for an ArrayBuffer, ``name`` supplies the filename.
   return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
+    const process = (buffer, fname) => {
       try {
-        const buffer = e.target.result;
-        const baseName = file.name.replace(/\.ply$/i, '');
+        const baseName = fname.replace(/\.ply$/i, '');
         const color = nextColor();
         const stlId = Date.now() + '_' + Math.random().toString(36).slice(2, 8);
         let entry;
         if (_isPLYGaussianSplat(buffer)) {
-          entry = _addSplatToScene(buffer, 'ply', baseName, color, stlId, transforms, file.name);
+          entry = _addSplatToScene(buffer, 'ply', baseName, color, stlId, transforms, fname);
         } else if (_isPLYPointCloud(buffer)) {
           const geometry = plyLoader.parse(buffer);
           entry = _addPointsToScene(geometry, buffer, baseName, color, stlId, transforms);
@@ -561,6 +562,12 @@ export function loadPLYFile(file, transforms = null) {
         resolve(entry);
       } catch (err) { reject(err); }
     };
+    if (file instanceof ArrayBuffer) {
+      process(file, name || 'untitled.ply');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (e) => process(e.target.result, file.name);
     reader.onerror = () => reject(reader.error);
     reader.readAsArrayBuffer(file);
   });

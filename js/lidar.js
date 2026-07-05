@@ -46,14 +46,16 @@ async function loadPlyFromServer(path, name, transforms = null) {
   const url = `/api/scan/file?path=${encodeURIComponent(path)}`;
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`load failed: ${resp.status}`);
-  const blob = await resp.blob();
+  // Straight to ArrayBuffer: wrapping the response in a Blob + File and
+  // re-reading it through FileReader held three full copies of a multi-GB
+  // splat in tab memory, which is what made big library loads fail as 'err'.
+  const buffer = await resp.arrayBuffer();
   const fname = name || path.split('/').pop();
-  const file = new File([blob], fname, { type: 'application/octet-stream' });
   objPaths[fname.replace(/\.ply$/i, '')] = path;   // entry.name is the basename
   // Library loads pass no pose, so restore it from the edit's sidecar (edits
   // keep the file in its local frame; the pose is saved alongside).
   if (!transforms) transforms = await fetchPose(path);
-  const entry = await loadPLYFile(file, transforms);
+  const entry = await loadPLYFile(buffer, transforms, fname);
   State.requestRender && State.requestRender();
   return entry;
 }
@@ -173,6 +175,13 @@ export function initLidarPanel() {
         ...(data.splats || []).map(f => ({ ...f, kind: 'splat' })),
         ...(data.pointclouds || []).map(f => ({ ...f, kind: 'cloud' })),
       ];
+      // Offer every project cloud as a splat seed, keeping the current choice
+      // across refreshes when it still exists.
+      const seedCur = seedSel.value;
+      seedSel.replaceChildren(
+        el('option', { value: '' }, 'seed cloud: auto'),
+        ...(data.pointclouds || []).map(f => el('option', { value: f.path }, `seed: ${f.name}`)));
+      seedSel.value = [...seedSel.options].some(o => o.value === seedCur) ? seedCur : '';
       outList.replaceChildren(...(items.length ? items.map(f =>
         el('div', { class: 'item' },
           el('span', { title: f.name }, `${f.kind === 'splat' ? '🟣' : '⚪'} ${f.name} `,
@@ -194,6 +203,11 @@ export function initLidarPanel() {
   const methodSel = el('select', {}, ...['surfel', 'trained', 'bootstrap'].map(m => el('option', { value: m }, m)));
   const voxelInput = el('input', { type: 'number', step: '0.005', min: '0.005', value: '0.01' });
   const sorInput = el('input', { type: 'number', step: '0.25', min: '1', value: '2' });
+  // Seed cloud for splat generation: 'auto' keeps the job's default (surfel:
+  // the scan's dense cloud; trained: the latest project cloud); any other
+  // entry pins the splat to that exact cloud — e.g. an edited one.
+  const seedSel = el('select', {}, el('option', { value: '' }, 'seed cloud: auto'));
+  const pSeed = el('div', { class: 'row' }, seedSel);
   // Bootstrap splat Gaussian radius (m) — smaller = finer splats, less blobby.
   const splatSizeInput = el('input', { type: 'number', step: '0.005', min: '0.001', value: '0.02' });
   const pSplatSize = el('div', { class: 'row' },
@@ -201,6 +215,7 @@ export function initLidarPanel() {
   // Blob size only applies to the bootstrap splat builder.
   const showGen = () => {
     pSplatSize.style.display = (typeSel.value === 'splat' && methodSel.value === 'bootstrap') ? 'flex' : 'none';
+    pSeed.style.display = typeSel.value === 'splat' ? 'flex' : 'none';
   };
   typeSel.addEventListener('change', showGen);
   methodSel.addEventListener('change', showGen);
@@ -249,7 +264,8 @@ export function initLidarPanel() {
     const type = typeSel.value;
     const options = type === 'splat'
       ? { splat_mode: methodSel.value, splat_voxel: parseFloat(voxelInput.value),
-          surfel_sor: parseFloat(sorInput.value), splat_size: parseFloat(splatSizeInput.value) }
+          surfel_sor: parseFloat(sorInput.value), splat_size: parseFloat(splatSizeInput.value),
+          ...(seedSel.value ? { pointcloud: seedSel.value } : {}) }
       : { voxel_size: parseFloat(voxelInput.value) };
     try {
       const { job_id } = await api('/api/process/start',
@@ -814,6 +830,7 @@ export function initLidarPanel() {
     el('h4', {}, 'Generate'),
     el('div', { class: 'muted' }, 'Scan folder (raw bags):'), scanInput,
     el('div', { class: 'row' }, typeSel, methodSel),
+    pSeed,
     el('div', { class: 'row' },
       el('label', { class: 'muted', style: 'flex:1' }, 'voxel', voxelInput),
       el('label', { class: 'muted', style: 'flex:1' }, 'noise σ', sorInput)),

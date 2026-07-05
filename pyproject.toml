@@ -16,6 +16,7 @@ description = "Browser-based studio for generating and editing LiDAR point cloud
 dependencies = [
     "aiohttp",
     "numpy",
+    "open3d",
     "plyfile",
 ]
 dynamic = ["version"]
