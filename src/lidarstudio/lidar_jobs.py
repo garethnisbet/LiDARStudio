@@ -840,6 +840,133 @@ async def scan_photo_handler(request):
         return web.Response(status=500, text=str(exc))
 
 
+# Per-scan LiDAR sweep index, mirroring the photo index.
+_sweep_index: dict = {}
+
+
+def _scan_sweep_index(scan: Path):
+    if str(scan) in _sweep_index:
+        return _sweep_index[str(scan)]
+    from rosbags.highlevel import AnyReader
+
+    contents = _scan_contents(scan)
+    if not contents.get("lidar_bag"):
+        raise FileNotFoundError("no LIDAR_*.bag in scan folder")
+    bag = scan / contents["lidar_bag"]
+    ts = []
+    with AnyReader([bag]) as reader:
+        conns = [c for c in reader.connections if "PointCloud2" in c.msgtype]
+        if not conns:
+            raise RuntimeError("no PointCloud2 topic in LIDAR bag")
+        topic = conns[0].topic
+        conns = [c for c in conns if c.topic == topic]
+        for _conn, t, _raw in reader.messages(connections=conns):
+            ts.append(t)
+    _sweep_index[str(scan)] = (bag, topic, ts)
+    return _sweep_index[str(scan)]
+
+
+async def scan_sweeps_handler(request):
+    """POST /api/scan/sweeps — index the scan's LiDAR sweeps: {count, topic}."""
+    data = await request.json()
+    scan = Path((data.get("path") or "").strip())
+    if not scan.is_dir():
+        return web.json_response({"error": "scan folder not found"}, status=404)
+    try:
+        loop = asyncio.get_event_loop()
+        _bag, topic, ts = await loop.run_in_executor(None, _scan_sweep_index, scan)
+        return web.json_response({"count": len(ts), "topic": topic})
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+def _render_sweep(scan: Path, index: int, half_range: float = 12.0) -> bytes:
+    """Render sweep N as a PNG: top-down (x/y) and side (x/z), coloured by z."""
+    import cv2
+    import numpy as np
+    from rosbags.highlevel import AnyReader
+
+    bag, topic, ts = _scan_sweep_index(scan)
+    if not 0 <= index < len(ts):
+        raise IndexError(f"sweep {index} out of range 0..{len(ts) - 1}")
+    xyz = None
+    with AnyReader([bag]) as reader:
+        conns = [c for c in reader.connections if c.topic == topic]
+        for conn, _t, raw in reader.messages(
+            connections=conns, start=ts[index], stop=ts[index] + 1
+        ):
+            msg = reader.deserialize(raw, conn.msgtype)
+            fields = {f.name: f for f in msg.fields}
+            offs = [fields[n].offset for n in ("x", "y", "z")]
+            n_pts = msg.width * msg.height
+            rawa = np.frombuffer(msg.data, np.uint8).reshape(n_pts, msg.point_step)
+            xyz = np.stack(
+                [
+                    np.frombuffer(rawa[:, o : o + 4].tobytes(), np.float32)
+                    for o in offs
+                ],
+                axis=1,
+            )
+            break
+    if xyz is None:
+        raise RuntimeError("sweep not found in bag")
+    ok = np.isfinite(xyz).all(1) & (np.abs(xyz) < half_range).all(1)
+    xyz = xyz[ok]
+    S = 640
+    canvas = np.full((S, 2 * S + 8, 3), 16, np.uint8)
+    # Height colouring, robust range.
+    z = xyz[:, 2]
+    zlo, zhi = (np.percentile(z, 2), np.percentile(z, 98)) if len(z) else (0, 1)
+    tn = np.clip((z - zlo) / max(zhi - zlo, 1e-6) * 255, 0, 255).astype(np.uint8)
+    colours = cv2.applyColorMap(tn.reshape(-1, 1), cv2.COLORMAP_TURBO).reshape(-1, 3)
+
+    def paint(u, v, xoff):
+        m = (u >= 0) & (u < S) & (v >= 0) & (v < S)
+        canvas[v[m], u[m] + xoff] = colours[m]
+
+    scale = S / (2 * half_range)
+    # Top-down: x right, y up.
+    paint(
+        (xyz[:, 0] * scale + S / 2).astype(np.int32),
+        (S / 2 - xyz[:, 1] * scale).astype(np.int32),
+        0,
+    )
+    # Side: x right, z up.
+    paint(
+        (xyz[:, 0] * scale + S / 2).astype(np.int32),
+        (S / 2 - xyz[:, 2] * scale).astype(np.int32),
+        S + 8,
+    )
+    for xoff, label in ((0, "top-down (x/y)"), (S + 8, "side (x/z)")):
+        cv2.drawMarker(canvas, (xoff + S // 2, S // 2), (255, 255, 255),
+                       cv2.MARKER_CROSS, 12, 1)
+        cv2.putText(canvas, label, (xoff + 8, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (200, 200, 200), 1)
+    cv2.putText(canvas, f"{len(xyz):,} pts  +/-{half_range:.0f} m",
+                (8, S - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+    ok2, png = cv2.imencode(".png", canvas)
+    if not ok2:
+        raise RuntimeError("png encode failed")
+    return png.tobytes()
+
+
+async def scan_sweep_handler(request):
+    """GET /api/scan/sweep?path=<scan>&index=N — rendered LiDAR sweep PNG."""
+    scan = Path(request.query.get("path", ""))
+    try:
+        index = int(request.query.get("index", "0"))
+    except ValueError:
+        return web.Response(status=400, text="bad index")
+    if not scan.is_dir():
+        return web.Response(status=404, text="scan folder not found")
+    try:
+        loop = asyncio.get_event_loop()
+        png = await loop.run_in_executor(None, _render_sweep, scan, index)
+        return web.Response(body=png, content_type="image/png")
+    except Exception as exc:
+        return web.Response(status=500, text=str(exc))
+
+
 def _unique_output(src: Path, tag: str) -> str:
     """First free sibling name ``<stem>_<tag>.ply``, ``<stem>_<tag>2.ply``, … .
 
@@ -941,3 +1068,5 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/scan/file", scan_file_handler)
     app.router.add_post("/api/scan/photos", scan_photos_handler)
     app.router.add_get("/api/scan/photo", scan_photo_handler)
+    app.router.add_post("/api/scan/sweeps", scan_sweeps_handler)
+    app.router.add_get("/api/scan/sweep", scan_sweep_handler)

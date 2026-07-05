@@ -300,6 +300,45 @@ export function initLidarPanel() {
     el('div', { class: 'row' }, photoSlider, photoNum),
     photoImg);
 
+  // ── LiDAR sweeps: browse per-sweep point clouds, server-rendered as
+  // top-down + side panels coloured by height (same pattern as Scan photos).
+  const sweepImg = el('img', { style: 'max-width:100%;display:none;margin:4px auto;' });
+  const sweepSlider = el('input', { type: 'range', min: '0', max: '0', value: '0', style: 'flex:1' });
+  const sweepNum = el('span', { class: 'muted', style: 'min-width:70px;text-align:right' }, '–');
+  const sweepStat = el('div', { class: 'muted' }, 'Uses the scan folder above.');
+  let sweepCount = 0, sweepScan = null, sweepTimer = null;
+  const showSweep = () => {
+    if (!sweepCount) return;
+    const i = Math.min(sweepCount - 1, Math.max(0, parseInt(sweepSlider.value) || 0));
+    sweepNum.textContent = `${i} / ${sweepCount - 1}`;
+    clearTimeout(sweepTimer);
+    sweepTimer = setTimeout(() => {
+      sweepImg.src = `/api/scan/sweep?path=${encodeURIComponent(sweepScan)}&index=${i}`;
+      sweepImg.style.display = 'block';
+    }, 120);
+  };
+  sweepSlider.addEventListener('input', showSweep);
+  const sweepStep = (d) => { sweepSlider.value = (parseInt(sweepSlider.value) || 0) + d; showSweep(); };
+  const sweepLoadBtn = el('button', { class: 'act', onclick: async () => {
+    const scan = scanInput.value.trim();
+    if (!scan) { sweepStat.textContent = 'Enter a scan folder path above.'; return; }
+    sweepStat.textContent = 'Indexing bag…';
+    try {
+      const r = await api('/api/scan/sweeps', { path: scan });
+      sweepScan = scan; sweepCount = r.count;
+      sweepSlider.max = String(Math.max(0, r.count - 1));
+      sweepStat.textContent = `${r.count} sweeps (${r.topic})`;
+      showSweep();
+    } catch (e) { sweepStat.textContent = 'Error: ' + e.message; }
+  } }, 'Load sweeps');
+  const pSweeps = el('div', {},
+    sweepStat,
+    el('div', { class: 'row' }, sweepLoadBtn,
+      el('button', { class: 'act', style: 'width:34px', onclick: () => sweepStep(-1) }, '◀'),
+      el('button', { class: 'act', style: 'width:34px', onclick: () => sweepStep(1) }, '▶')),
+    el('div', { class: 'row' }, sweepSlider, sweepNum),
+    sweepImg);
+
   genBtn.onclick = async () => {
     const scan = scanInput.value.trim();
     if (!scan) { setBar(0, 'Enter a scan folder path'); return; }
@@ -882,6 +921,8 @@ export function initLidarPanel() {
     genBtn, barLabel, barWrap, logBox,
     el('h4', {}, 'Scan photos'),
     pPhotos,
+    el('h4', {}, 'LiDAR sweeps'),
+    pSweeps,
     el('h4', {}, 'Visibility box'),
     pVis,
     el('h4', {}, 'Erase (primitives)'),

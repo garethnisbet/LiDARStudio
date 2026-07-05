@@ -17,6 +17,7 @@ dependencies = [
     "aiohttp",
     "numpy",
     "open3d",
+    "opencv-python-headless",
     "plyfile",
     "rosbags",
 ]

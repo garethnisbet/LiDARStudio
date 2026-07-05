@@ -1328,6 +1328,7 @@ dependencies = [
     { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "open3d" },
     { name = "plyfile" },
+    { name = "rosbags" },
 ]
 
 [package.optional-dependencies]
@@ -1361,6 +1362,7 @@ requires-dist = [
     { name = "open3d", marker = "extra == 'pipeline'" },
     { name = "opencv-python-headless", marker = "extra == 'pipeline'" },
     { name = "plyfile" },
+    { name = "rosbags" },
     { name = "rosbags", marker = "extra == 'pipeline'" },
     { name = "scipy", marker = "extra == 'pipeline'" },
 ]
