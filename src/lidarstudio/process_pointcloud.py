@@ -802,6 +802,20 @@ def main():
         default=20.0,
         help="max camera→point distance for multi-view colouring (m)",
     )
+    parser.add_argument(
+        "--dynamic-box",
+        default=None,
+        help="x1,y1,z1,x2,y2,z2 world-space box around an object that moved "
+        "mid-scan; points inside it are kept only from sweeps before "
+        "--dynamic-until-ns, so the cloud holds one canonical configuration",
+    )
+    parser.add_argument(
+        "--dynamic-until-ns",
+        type=int,
+        default=0,
+        help="absolute bag timestamp (ns): sweeps at/after it contribute no "
+        "points inside --dynamic-box",
+    )
     args = parser.parse_args()
 
     _require("rosbags", "numpy", "cv2")
@@ -938,6 +952,32 @@ def main():
     else:
         all_xyz_world = all_xyz
         print("  No IMU found — stacking frames without registration", flush=True)
+
+    # Dynamic-object filter: a scene object that MOVED mid-scan (e.g. a robot
+    # arm being operated) leaves ghost surfaces of every configuration in the
+    # accumulated cloud. Keep points inside its world-space box only from
+    # sweeps before the cutoff — the cloud then holds a single, canonical
+    # configuration, and the splat trainer's --mask-box handles the photos.
+    if args.dynamic_box and poses is not None:
+        v = [float(x) for x in args.dynamic_box.split(",")]
+        dlo = np.array([min(a, b) for a, b in zip(v[:3], v[3:])])
+        dhi = np.array([max(a, b) for a, b in zip(v[:3], v[3:])])
+        cut = int(args.dynamic_until_ns)
+        removed = 0
+        for i, ts in enumerate(lidar_timestamps):
+            if int(ts) < cut:
+                continue
+            w = all_xyz_world[i]
+            inside = np.all((w >= dlo) & (w <= dhi), axis=1)
+            if inside.any():
+                removed += int(inside.sum())
+                all_xyz_world[i] = w[~inside]
+                all_xyz[i] = all_xyz[i][~inside]
+        print(
+            f"  dynamic-box filter: removed {removed:,} points inside the box "
+            f"from sweeps at/after cutoff",
+            flush=True,
+        )
 
     # Geometry uses the world-frame points; colour projection below still uses
     # the per-frame sensor coordinates (the camera extrinsic is sensor-relative).

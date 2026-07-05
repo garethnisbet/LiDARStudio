@@ -129,6 +129,48 @@ def _interp_pose(traj_ts, poses, ts):
     return out, a, gap
 
 
+def _dynamic_mask_png(img_bgr, K, viewmat, box):
+    """PNG-encoded loss mask (0 = exclude) for a dynamic object: pixels inside
+    the projected world-space ``box`` silhouette AND near saturated-blue paint.
+
+    The box alone over-masks (its silhouette from a nearby camera covers most
+    of the frame, blanking static walls behind the object); the colour gate
+    alone would also hit unrelated blue surfaces (ceiling banner). The
+    intersection masks just the object, in any joint configuration, wherever
+    the box says it can be.
+    """
+    import cv2
+    import numpy as np
+
+    H, W = img_bgr.shape[:2]
+    lo, hi = (np.asarray(b, dtype=np.float64) for b in box)
+    g = np.linspace(0.0, 1.0, 6)
+    pts = np.array(
+        [lo + np.array([a, b, c]) * (hi - lo) for a in g for b in g for c in g]
+    )
+    Xc = (viewmat[:3, :3] @ pts.T + viewmat[:3, 3:4]).T
+    front = Xc[:, 2] > 0.05
+    sil = np.zeros((H, W), np.uint8)
+    if front.sum() >= 3:
+        uv = (K @ Xc[front].T).T
+        uv = np.clip(uv[:, :2] / uv[:, 2:3], -1e6, 1e6)
+        cv2.fillConvexPoly(sil, cv2.convexHull(uv.astype(np.int32)), 255)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    blue = (
+        (hsv[..., 0] >= 100)
+        & (hsv[..., 0] <= 130)
+        & (hsv[..., 1] > 80)
+        & (hsv[..., 2] > 50)
+    ).astype(np.uint8) * 255
+    # Dilate so the object's non-blue parts (black wrist/joints) adjacent to
+    # blue paint are covered too.
+    k = max(31, (int(0.04 * W)) | 1)
+    arm = cv2.dilate(blue, np.ones((k, k), np.uint8))
+    keep = cv2.bitwise_not(cv2.bitwise_and(sil, arm))
+    ok, png = cv2.imencode(".png", keep)
+    return png if ok else None
+
+
 def build_camera_frames(
     scan: Path,
     traj_path: Path,
@@ -141,6 +183,8 @@ def build_camera_frames(
     cam_time_offset: float = 0.0,
     sfm_poses=None,
     drop_blurry: float = 0.0,
+    mask_box=None,
+    mask_from: int = 0,
 ):
     """
     Return a list of {image HxWx3 uint8 RGB, K 3x3, viewmat 4x4 (world→cam)}.
@@ -205,7 +249,7 @@ def build_camera_frames(
         print(f"  external SfM poses: {len(sfm_vm)} frames from {sfm_poses}", flush=True)
     skipped = 0
     frames = []
-    for ts, img in ppc.read_images(img_bag, camera, rot=image_rot):
+    for bag_i, (ts, img) in enumerate(ppc.read_images(img_bag, camera, rot=image_rot)):
         if sfm_vm is not None and int(ts) not in sfm_vm:
             skipped += 1
             continue
@@ -264,6 +308,8 @@ def build_camera_frames(
                 diag["snap_err_ns"].append(min(a, 1.0 - a) * gap)
 
         frame = {"image": rgb, "K": K.astype(np.float64), "viewmat": viewmat}
+        if mask_box is not None and bag_i >= mask_from and undistort:
+            frame["mask_png"] = _dynamic_mask_png(img, K, viewmat, mask_box)
         if drop_blurry > 0:
             # Laplacian variance as a sharpness score; motion-blurred handheld
             # frames teach the model soft edges everywhere they're sampled.
@@ -290,6 +336,12 @@ def build_camera_frames(
             flush=True,
         )
         frames = kept
+    n_masked = sum(1 for f in frames if f.get("mask_png") is not None)
+    if n_masked:
+        print(
+            f"  dynamic-object mask active on {n_masked}/{len(frames)} frame(s)",
+            flush=True,
+        )
     if not frames:
         raise RuntimeError("no camera frames loaded from image bag")
     if diag["snap_err_ns"]:
@@ -539,6 +591,7 @@ def train_splat(
     pose_warmup: int = 300,
     pose_reg: float = 1e-3,
 ):
+    import cv2
     import numpy as np
     import torch
     from gsplat import rasterization
@@ -738,6 +791,16 @@ def train_splat(
             pred = pred * app_gain[fi] + app_bias[fi]
         pred = pred.clamp(0, 1)
         gt = frame_gt(f)
+        if f.get("mask_png") is not None:
+            # Dynamic-object mask: inside the masked region the GT is replaced
+            # by the (detached) render, so both L1 and SSIM gradients vanish
+            # there — the moved object teaches nothing, the rest of the frame
+            # trains normally.
+            m = cv2.imdecode(f["mask_png"], cv2.IMREAD_GRAYSCALE)
+            m_t = (
+                torch.from_numpy(m).to(device).float().div_(255.0).unsqueeze(-1)
+            )
+            gt = gt * m_t + pred.detach() * (1.0 - m_t)
         l1 = (pred - gt).abs().mean()
         loss = (1 - ssim_lambda) * l1 + ssim_lambda * (1 - windowed_ssim(pred, gt))
         # MCMC regularisers: push toward many small, faint Gaussians. exp(scale) is
@@ -1192,6 +1255,20 @@ def main():
         "every covered frame and drops uncovered frames",
     )
     p.add_argument(
+        "--mask-box",
+        default=None,
+        help="x1,y1,z1,x2,y2,z2 world-space box around a dynamic object "
+        "(e.g. a robot arm that moved mid-scan); its blue pixels are "
+        "excluded from the loss in frames >= --mask-from",
+    )
+    p.add_argument(
+        "--mask-from",
+        type=int,
+        default=0,
+        help="bag frame index from which the --mask-box region is excluded "
+        "(frames before it train the object's canonical configuration)",
+    )
+    p.add_argument(
         "--no-prefer-dense",
         dest="prefer_dense",
         action="store_false",
@@ -1293,6 +1370,13 @@ def main():
 
     progress(5, "Loading coloured cloud and camera poses…")
     pts, rgb = load_coloured_ply(seed_pc)
+    mask_box = None
+    if args.mask_box:
+        v = [float(x) for x in args.mask_box.split(",")]
+        mask_box = (
+            [min(a, b) for a, b in zip(v[:3], v[3:])],
+            [max(a, b) for a, b in zip(v[:3], v[3:])],
+        )
     frames = build_camera_frames(
         scan,
         traj_path,
@@ -1305,6 +1389,8 @@ def main():
         cam_time_offset=args.cam_time_offset,
         sfm_poses=Path(args.sfm_poses) if args.sfm_poses else None,
         drop_blurry=args.drop_blurry,
+        mask_box=mask_box,
+        mask_from=args.mask_from,
     )
     print(
         f"  {len(frames)} posed frames @ {frames[0]['image'].shape[1]}×"
