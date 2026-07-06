@@ -92,6 +92,19 @@ function poseOf(mesh, entry) {
   };
 }
 
+// The pose a splat should inherit from the cloud it was generated from, so it
+// reloads exactly where that seed sits. A splat is built in its seed's own
+// coordinate frame, but the seed's placement is a viewer-only transform the
+// fresh file wouldn't otherwise pick up. Prefer the seed's live viewer pose;
+// fall back to its saved .pose.json (an edited seed that isn't loaded here).
+async function seedPose(seedPath) {
+  if (!seedPath) return null;                       // 'auto' seed → no known frame
+  const entry = (State.importedSTLs || []).find((e) => objPaths[e.name] === seedPath);
+  const pose = entry && entry.mesh ? poseOf(entry.mesh, entry) : await fetchPose(seedPath);
+  if (pose) pose.visible = true;                    // a freshly generated splat should show
+  return pose;
+}
+
 // World matrix that maps the object's *file* coordinates to world — the same
 // frame the visibility clip tests against. For splats that's the inner splat
 // mesh (it carries the viewer's internal transform); for clouds it's the mesh
@@ -129,6 +142,48 @@ function el(tag, attrs = {}, ...kids) {
   return n;
 }
 
+// One shared explanation panel, docked just left of the control panel. Info
+// icons write into it rather than popping their own bubble (which the panel's
+// overflow clipping + label re-click behaviour made unreliable).
+let _infoPanel = null;
+function getInfoPanel() {
+  if (_infoPanel) return _infoPanel;
+  const body = el('div', { class: 'ls-info-body' });
+  const x = el('span', { class: 'ls-info-x', title: 'Close' }, '✕');
+  const heading = el('span', {}, 'Field info');
+  const panel = el('div', { id: 'ls-info-panel' },
+    el('div', { class: 'ls-info-title' }, heading, x), body);
+  const close = () => {
+    panel.style.display = 'none';
+    panel._for = null;
+    document.querySelectorAll('.ls-info.on').forEach((i) => i.classList.remove('on'));
+  };
+  x.addEventListener('click', close);
+  document.body.appendChild(panel);
+  Object.assign(panel, { _body: body, _heading: heading, _close: close });
+  _infoPanel = panel;
+  return panel;
+}
+
+// A clickable ⓘ that shows `text` (headed by `title`) in the shared side panel.
+// Clicking the same icon again closes it; clicking another switches content.
+function infoIcon(text, title = 'Field info') {
+  const icon = el('span', { class: 'ls-info', title: 'What is this?' }, 'ⓘ');
+  icon.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const panel = getInfoPanel();
+    if (panel.style.display === 'block' && panel._for === icon) { panel._close(); return; }
+    document.querySelectorAll('.ls-info.on').forEach((i) => i.classList.remove('on'));
+    icon.classList.add('on');
+    panel._heading.textContent = title;
+    panel._body.textContent = text;
+    panel._for = icon;
+    panel.style.display = 'block';
+  });
+  return icon;
+}
+
 export function initLidarPanel() {
   if (document.getElementById('lidar-panel')) return;
 
@@ -161,7 +216,20 @@ export function initLidarPanel() {
   #ls-bar.indeterminate{width:35%!important;animation:ls-indet 1.1s ease-in-out infinite}
   @keyframes ls-indet{0%{margin-left:-35%}100%{margin-left:100%}}
   #ls-log{font:10px/1.4 monospace;color:#9fb;background:#0c121b;border-radius:5px;padding:6px;
-    margin-top:6px;max-height:120px;overflow:auto;white-space:pre-wrap;display:none}`;
+    margin-top:6px;max-height:120px;overflow:auto;white-space:pre-wrap;display:none}
+  #lidar-panel .ls-info{flex:0 0 auto;cursor:pointer;color:#5a86c0;
+    font-size:12px;margin-left:4px;line-height:1;user-select:none}
+  #lidar-panel .ls-info:hover{color:#8fb4e8}
+  #lidar-panel .ls-info.on{color:#8fb4e8}
+  #ls-info-panel{display:none;position:fixed;top:10px;right:280px;width:250px;z-index:3000;
+    max-height:calc(100vh - 20px);overflow:auto;background:rgba(12,19,32,0.97);
+    border:1px solid #37506e;border-radius:8px;padding:12px 14px;color:#cdd6e3;
+    font:400 12px/1.6 system-ui;box-shadow:0 6px 30px rgba(0,0,0,.55)}
+  #ls-info-panel .ls-info-title{display:flex;justify-content:space-between;align-items:center;
+    gap:8px;font-weight:700;color:#9cf;font-size:11px;letter-spacing:.04em;
+    text-transform:uppercase;margin-bottom:8px}
+  #ls-info-panel .ls-info-x{cursor:pointer;color:#7d8aa0;font-size:15px;line-height:1;padding:0 2px}
+  #ls-info-panel .ls-info-x:hover{color:#cdd6e3}`;
   document.head.append(el('style', {}, css));
 
   // ── Library (existing outputs) ──
@@ -203,19 +271,108 @@ export function initLidarPanel() {
   const methodSel = el('select', {}, ...['surfel', 'trained', 'bootstrap'].map(m => el('option', { value: m }, m)));
   const voxelInput = el('input', { type: 'number', step: '0.005', min: '0.005', value: '0.01' });
   const sorInput = el('input', { type: 'number', step: '0.25', min: '1', value: '2' });
+  // voxel is used by both the pointcloud job and the surfel splat; noise σ is
+  // surfel-only. Wrapped so showGen() can toggle each independently.
+  const lblVoxel = el('label', { class: 'muted', style: 'flex:1' }, 'voxel',
+    infoIcon('Point-cloud voxel size in metres. Smaller = denser, finer cloud (and finer '
+      + 'surfels) but bigger and slower. 0.01 m is dense; 0.05 m is a light preview cloud.',
+      'Voxel'),
+    voxelInput);
+  const lblNoise = el('label', { class: 'muted', style: 'flex:1' }, 'noise σ',
+    infoIcon('Statistical-outlier-removal strength for surfels: points whose neighbours are '
+      + 'farther than σ standard deviations away are culled. Higher = more aggressive '
+      + 'despeckling.', 'Noise σ'),
+    sorInput);
+  const pVoxNoise = el('div', { class: 'row' }, lblVoxel, lblNoise);
+
+  // ── Trained-splat quality controls ──────────────────────────────────────
+  // One master 'quality' slider drives a set of individual controls (which
+  // stay editable for fine-tuning). Presets follow the splat-quality campaign
+  // arc: draft (fast preview) → max (the ds1 / 6M / 30k champion recipe).
+  // The shape/opacity recipe constants live as process_splat.py defaults; only
+  // the resolution / count / sharpness knobs scale with quality here.
+  const QUALITY = [
+    { name: 'draft',    iterations: 3000,  downscale: 4, cap: 1, dropBlurry: 0,    undistortScale: 1.0 },
+    { name: 'balanced', iterations: 7000,  downscale: 2, cap: 3, dropBlurry: 0.15, undistortScale: 1.0 },
+    { name: 'high',     iterations: 15000, downscale: 1, cap: 6, dropBlurry: 0.15, undistortScale: 1.0 },
+    { name: 'max',      iterations: 30000, downscale: 1, cap: 6, dropBlurry: 0.15, undistortScale: 1.3 },
+  ];
+  const qSlider = el('input', { type: 'range', min: '1', max: '4', step: '1', value: '3', style: 'flex:1' });
+  const qName = el('span', { class: 'muted', style: 'min-width:64px;text-align:right' }, 'high');
+  const iterInput = el('input', { type: 'number', step: '1000', min: '500', value: '15000' });
+  const downInput = el('input', { type: 'number', step: '1', min: '1', max: '8', value: '1' });
+  const capInput = el('input', { type: 'number', step: '0.5', min: '0.5', value: '6' });      // millions
+  const dropInput = el('input', { type: 'number', step: '0.05', min: '0', max: '0.9', value: '0.15' });
+  const usInput = el('input', { type: 'number', step: '0.1', min: '1', max: '2', value: '1.0' });
+  const sfmInput = el('input', { placeholder: 'SfM poses .npz (optional, biggest quality lever)' });
+  // Repopulate the individual controls from a quality preset (1-based index).
+  const applyQuality = (idx) => {
+    const q = QUALITY[Math.min(3, Math.max(0, idx - 1))];
+    qName.textContent = q.name;
+    iterInput.value = q.iterations; downInput.value = q.downscale;
+    capInput.value = q.cap; dropInput.value = q.dropBlurry; usInput.value = q.undistortScale;
+  };
+  qSlider.addEventListener('input', () => applyQuality(parseInt(qSlider.value)));
+  const qLbl = (t, inp, info) =>
+    el('label', { class: 'muted', style: 'flex:1' }, t, infoIcon(info, t), inp);
+  const pTrained = el('div', {},
+    el('div', { class: 'row', style: 'align-items:center' },
+      el('span', { class: 'muted', style: 'min-width:52px' }, 'quality'), qSlider, qName,
+      infoIcon('Master preset, from draft (fast preview) to max — the campaign champion: '
+        + 'full resolution, 6M splats, 30k iterations (~3–4 h). Moving the slider sets the '
+        + 'individual controls below, which you can still fine-tune by hand.', 'Quality')),
+    el('div', { class: 'row' },
+      qLbl('iterations', iterInput,
+        'How many training steps run. More = sharper and better-converged but slower '
+        + '(roughly linear in time). ~7k is a good balance; 30k is diminishing returns.'),
+      qLbl('downscale', downInput,
+        'Training-image shrink factor. 1 = full resolution (sharpest, most RAM/time); '
+        + '2–4 are faster previews. If a result looks soft, drop this toward 1.')),
+    el('div', { class: 'row' },
+      qLbl('max splats (M)', capInput,
+        'Cap on how many Gaussians (in millions) the trainer may grow to. More = finer '
+        + 'detail but larger files and more GPU memory. Reference scans use ~3–6M.'),
+      qLbl('drop blurry', dropInput,
+        'Fraction of the blurriest source photos to discard before training (ranked by '
+        + 'Laplacian sharpness). 0.15 drops the shakiest ~15%; 0 keeps every frame. '
+        + 'Removes motion-blurred photos that would soften the result.')),
+    el('div', { class: 'row' },
+      qLbl('sharpen ×', usInput,
+        "Undistorted-canvas size vs the source photo. Above 1 preserves the fisheye "
+        + "centre's native detail that a 1:1 wide-angle pinhole under-samples. 1.3 sharpens "
+        + 'the centre at ~1.7× training cost.')),
+    el('div', { class: 'row', style: 'align-items:center' },
+      el('label', { class: 'muted', style: 'flex:1' }, 'SfM poses', sfmInput),
+      infoIcon('Optional .npz of camera poses from Structure-from-Motion (COLMAP/GLOMAP, '
+        + 'aligned to the LiDAR frame). The single biggest quality lever (~+4 dB, '
+        + 'walls-to-parity) — it corrects per-frame camera drift. Leave empty to use the '
+        + 'LiDAR-odometry poses.', 'SfM poses')));
   // Seed cloud for splat generation: 'auto' keeps the job's default (surfel:
   // the scan's dense cloud; trained: the latest project cloud); any other
   // entry pins the splat to that exact cloud — e.g. an edited one.
   const seedSel = el('select', {}, el('option', { value: '' }, 'seed cloud: auto'));
-  const pSeed = el('div', { class: 'row' }, seedSel);
+  const pSeed = el('div', { class: 'row', style: 'align-items:center' }, seedSel,
+    infoIcon("Which point cloud the splat is built from. 'auto' lets the job pick (surfel: "
+      + 'the scan’s dense cloud; trained: the latest project cloud). Choose a specific '
+      + 'or edited cloud to pin the splat to it.', 'Seed cloud'));
   // Bootstrap splat Gaussian radius (m) — smaller = finer splats, less blobby.
   const splatSizeInput = el('input', { type: 'number', step: '0.005', min: '0.001', value: '0.02' });
   const pSplatSize = el('div', { class: 'row' },
-    el('label', { class: 'muted', style: 'flex:1' }, 'blob size (m)', splatSizeInput));
+    el('label', { class: 'muted', style: 'flex:1' }, 'blob size (m)',
+      infoIcon('Gaussian radius for the bootstrap builder, in metres. Smaller = finer, '
+        + 'less blobby splats. Only applies to the bootstrap method.', 'Blob size'),
+      splatSizeInput));
   // Blob size only applies to the bootstrap splat builder.
   const showGen = () => {
-    pSplatSize.style.display = (typeSel.value === 'splat' && methodSel.value === 'bootstrap') ? 'flex' : 'none';
-    pSeed.style.display = typeSel.value === 'splat' ? 'flex' : 'none';
+    const isSplat = typeSel.value === 'splat';
+    const m = methodSel.value;
+    pSeed.style.display = isSplat ? 'flex' : 'none';
+    pSplatSize.style.display = (isSplat && m === 'bootstrap') ? 'flex' : 'none';
+    pTrained.style.display = (isSplat && m === 'trained') ? 'block' : 'none';
+    // voxel: pointcloud job or surfel splat; noise σ: surfel only.
+    const showVox = (typeSel.value === 'pointcloud') || (isSplat && m === 'surfel');
+    pVoxNoise.style.display = showVox ? 'flex' : 'none';
+    lblNoise.style.display = (isSplat && m === 'surfel') ? '' : 'none';
   };
   typeSel.addEventListener('change', showGen);
   methodSel.addEventListener('change', showGen);
@@ -343,9 +500,22 @@ export function initLidarPanel() {
     genBtn.disabled = true; logBox.textContent = ''; logBox.style.display = 'block';
     resetBar();
     const type = typeSel.value;
+    // Remember the chosen seed so the finished splat can reload at the seed's
+    // placement (captured now, since the dropdown may change during the run).
+    const seedSelPath = type === 'splat' ? seedSel.value : '';
+    // Trained-mode quality knobs are harmless for surfel/bootstrap (the
+    // backend only reads them on the trained path).
+    const capM = parseFloat(capInput.value) || 6;
     const options = type === 'splat'
       ? { splat_mode: methodSel.value, splat_voxel: parseFloat(voxelInput.value),
           surfel_sor: parseFloat(sorInput.value), splat_size: parseFloat(splatSizeInput.value),
+          iterations: parseInt(iterInput.value) || 7000,
+          downscale: parseInt(downInput.value) || 1,
+          cap_max: Math.round(capM * 1e6),
+          max_init_points: Math.round(Math.min(3, capM) * 1e6),
+          drop_blurry: parseFloat(dropInput.value) || 0,
+          undistort_scale: parseFloat(usInput.value) || 1.0,
+          ...(sfmInput.value.trim() ? { sfm_poses: sfmInput.value.trim() } : {}),
           ...(seedSel.value ? { pointcloud: seedSel.value } : {}) }
       : { voxel_size: parseFloat(voxelInput.value) };
     try {
@@ -360,7 +530,12 @@ export function initLidarPanel() {
         else if (d.event === 'error') { setBar(0, 'ERROR: ' + d.message); es.close(); genBtn.disabled = false; }
         else if (d.event === 'result') {
           setBar(100, `Done: ${d.filename} — loading…`);
-          try { await loadPlyFromServer(d.path, d.filename); } catch (e) { console.error(e); }
+          // Reload the new splat at the seed cloud's position/rotation so it
+          // lands where the seed sits (rather than springing to the origin).
+          try {
+            const pose = await seedPose(seedSelPath);
+            await loadPlyFromServer(d.path, d.filename, pose);
+          } catch (e) { console.error(e); }
         }
       };
       es.onerror = () => { es.close(); genBtn.disabled = false; };
@@ -910,11 +1085,14 @@ export function initLidarPanel() {
     outList,
     el('h4', {}, 'Generate'),
     el('div', { class: 'muted' }, 'Scan folder (raw bags):'), scanInput,
-    el('div', { class: 'row' }, typeSel, methodSel),
+    el('div', { class: 'row', style: 'align-items:center' }, typeSel, methodSel,
+      infoIcon('Output kind and builder. splat = photoreal Gaussians; pointcloud = raw '
+        + 'coloured LiDAR points. Splat methods: surfel (fast LiDAR discs, no training), '
+        + 'trained (GPU-trained, photoreal — has the quality slider below), or bootstrap '
+        + '(quick Gaussians seeded from the cloud).', 'Type & method')),
     pSeed,
-    el('div', { class: 'row' },
-      el('label', { class: 'muted', style: 'flex:1' }, 'voxel', voxelInput),
-      el('label', { class: 'muted', style: 'flex:1' }, 'noise σ', sorInput)),
+    pTrained,
+    pVoxNoise,
     pSplatSize,
     genBtn, barLabel, barWrap, logBox,
     el('h4', {}, 'Scan photos'),
@@ -937,6 +1115,9 @@ export function initLidarPanel() {
       project: projectInput.value, scan: scanInput.value,
       type: typeSel.value, method: methodSel.value,
       voxel: voxelInput.value, noise: sorInput.value, splatSize: splatSizeInput.value,
+      quality: qSlider.value, iterations: iterInput.value, downscale: downInput.value,
+      cap: capInput.value, dropBlurry: dropInput.value, undistortScale: usInput.value,
+      sfm: sfmInput.value,
       editOp: editOp.value, factor: facInput.value,
       sorNb: sorNb.value, sorStd: sorStd.value,
       cropInvert: invCb.checked, regionLimit: regionCb.checked,
@@ -949,6 +1130,12 @@ export function initLidarPanel() {
     setVal(projectInput, 'project'); setVal(scanInput, 'scan');
     setVal(typeSel, 'type'); setVal(methodSel, 'method');
     setVal(voxelInput, 'voxel'); setVal(sorInput, 'noise'); setVal(splatSizeInput, 'splatSize');
+    // Restore saved knobs verbatim (don't re-derive from the quality preset —
+    // the user may have hand-tuned individual controls before saving).
+    setVal(qSlider, 'quality'); setVal(iterInput, 'iterations'); setVal(downInput, 'downscale');
+    setVal(capInput, 'cap'); setVal(dropInput, 'dropBlurry'); setVal(usInput, 'undistortScale');
+    setVal(sfmInput, 'sfm');
+    if (s.quality != null) qName.textContent = (QUALITY[parseInt(s.quality) - 1] || {}).name || '';
     setVal(editOp, 'editOp'); setVal(facInput, 'factor');
     setVal(sorNb, 'sorNb'); setVal(sorStd, 'sorStd');
     if (typeof s.cropInvert === 'boolean') invCb.checked = s.cropInvert;

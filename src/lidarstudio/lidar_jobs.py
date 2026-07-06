@@ -500,6 +500,15 @@ async def _job_splat(project_path, scan_path, options, queue):
         )
         return
 
+    # Optional externally-computed SfM camera poses (the campaign's biggest
+    # quality lever). Validate up front so a typo fails fast, not 40 min in.
+    sfm_poses = (options.get("sfm_poses") or "").strip()
+    if sfm_poses and not Path(sfm_poses).exists():
+        await queue.put(
+            {"event": "error", "message": f"SfM poses file not found: {sfm_poses}"}
+        )
+        return
+
     if mode == "surfel":
         # Surfels need a *dense* cloud (small splats only look good when the
         # cloud is dense), so the splat job keeps its own fine-voxel cloud,
@@ -588,6 +597,26 @@ async def _job_splat(project_path, scan_path, options, queue):
         ]
         if mode == "bootstrap":
             cmd += ["--bootstrap", "--splat-size", str(options.get("splat_size", 0.05))]
+        elif mode == "trained":
+            # Quality knobs driven by the UI 'quality' slider (draft→max). The
+            # shape/opacity/pose-association recipe constants (opacity-reg,
+            # flat-reg, min-opacity, min-scale, cam-time-offset) now come from
+            # process_splat.py's own champion defaults, so we only pass the
+            # resolution/count/sharpness knobs that scale with quality.
+            cmd += [
+                "--downscale",
+                str(int(options.get("downscale", 1))),
+                "--max-init-points",
+                str(int(options.get("max_init_points", 3_000_000))),
+                "--cap-max",
+                str(int(options.get("cap_max", 6_000_000))),
+                "--undistort-scale",
+                str(float(options.get("undistort_scale", 1.0))),
+                "--drop-blurry",
+                str(float(options.get("drop_blurry", 0.15))),
+            ]
+            if sfm_poses:
+                cmd += ["--sfm-poses", sfm_poses]
         if pc_files:
             cmd += ["--pointcloud", str(pc_files[-1])]
             await queue.put(

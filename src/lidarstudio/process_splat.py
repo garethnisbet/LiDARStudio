@@ -1169,10 +1169,11 @@ def main():
     p.add_argument(
         "--opacity-reg",
         type=float,
-        default=0.004,
+        default=2e-5,
         help="weight of the mean-opacity penalty; too high pins most gaussians "
         "at the MCMC min_opacity floor (transparent mush) — 3DMakerpro's "
-        "profile is median ~0.18",
+        "profile is median ~0.18. Default is the campaign champion (fog-axis "
+        "ds1_op run); 0.004 was the original mush-inducing value",
     )
     p.add_argument(
         "--scale-reg",
@@ -1183,16 +1184,17 @@ def main():
     p.add_argument(
         "--min-opacity",
         type=float,
-        default=0.005,
+        default=0.03,
         help="MCMC relocation threshold: gaussians below this opacity get "
-        "teleported to useful regions instead of lingering as fog",
+        "teleported to useful regions instead of lingering as fog "
+        "(0.03 = campaign champion; the old floor was 0.005)",
     )
     p.add_argument(
         "--flat-reg",
         type=float,
-        default=0.0,
+        default=0.1,
         help="weight pushing gaussians toward flat surface discs "
-        "(penalises min/max axis ratio; 0 = off)",
+        "(penalises min/max axis ratio; 0 = off; 0.1 = campaign champion)",
     )
     p.add_argument(
         "--min-scale",
@@ -1250,10 +1252,11 @@ def main():
     p.add_argument(
         "--cam-time-offset",
         type=float,
-        default=0.0,
+        default=-0.025,
         help="camera↔LiDAR clock offset in SECONDS added to each image "
         "timestamp before the continuous-time pose query; sweep to "
-        "calibrate a constant sensor time skew",
+        "calibrate a constant sensor time skew. Default -0.025 is this "
+        "rig's calibrated skew (sweep peak); use 0 for other hardware",
     )
     p.add_argument(
         "--undistort-scale",
