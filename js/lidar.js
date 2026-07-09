@@ -184,6 +184,48 @@ function infoIcon(text, title = 'Field info') {
   return icon;
 }
 
+// Startup hardware check: a green/amber/red light for CPU, RAM and GPU. If all
+// three are green it self-dismisses after 1s; otherwise it stays until the user
+// acknowledges (so a weak machine can't be missed).
+async function showStartupHealth() {
+  let data;
+  try {
+    const r = await fetch('/api/system');
+    if (!r.ok) return;
+    data = await r.json();
+  } catch { return; }                       // endpoint unavailable → skip silently
+  const COLOR = { green: '#3fbf5f', amber: '#e0a02a', red: '#d94a3d' };
+  const row = (label, info) => el('div',
+    { style: 'display:flex;align-items:center;gap:11px;margin:8px 0' },
+    el('span', { style:
+      `flex:0 0 auto;width:13px;height:13px;border-radius:50%;` +
+      `background:${COLOR[info && info.grade] || '#777'};` +
+      `box-shadow:0 0 7px ${COLOR[info && info.grade] || '#777'}` }),
+    el('span', { style: 'flex:0 0 40px;font-weight:600' }, label),
+    el('span', { style: 'flex:1;color:#9fb0c8;font-size:12px' }, (info && info.detail) || '—'));
+  const allGreen = ['cpu', 'ram', 'gpu'].every((k) => data[k] && data[k].grade === 'green');
+  const card = el('div', { style:
+    'position:fixed;top:22px;left:50%;transform:translateX(-50%);z-index:4000;' +
+    'min-width:290px;background:rgba(18,22,30,0.97);border:1px solid #37506e;' +
+    'border-radius:10px;padding:14px 18px;color:#e6ecf5;font:13px system-ui;' +
+    'box-shadow:0 8px 40px rgba(0,0,0,0.6);transition:opacity .4s' },
+    el('div', { style: 'font-weight:700;letter-spacing:.03em;margin-bottom:6px' }, 'System check'),
+    row('CPU', data.cpu), row('RAM', data.ram), row('GPU', data.gpu));
+  document.body.appendChild(card);
+  if (allGreen) {
+    setTimeout(() => { card.style.opacity = '0'; }, 3000);
+    setTimeout(() => card.remove(), 3450);
+  } else {
+    card.append(
+      el('div', { style: 'margin-top:8px;color:#d6b24a;font-size:11px;max-width:300px' },
+        'Some resources are limited — high-quality splats may run slowly or run out ' +
+        'of GPU memory. Lower the quality slider (e.g. downscale 2, fewer splats) if so.'),
+      el('button', { style:
+        'margin-top:10px;width:100%;background:#2a6df0;color:#fff;border:0;border-radius:6px;' +
+        'padding:8px;font-weight:600;cursor:pointer', onclick: () => card.remove() }, 'OK'));
+  }
+}
+
 export function initLidarPanel() {
   if (document.getElementById('lidar-panel')) return;
 
@@ -205,6 +247,8 @@ export function initLidarPanel() {
   #lidar-panel .item>span{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #lidar-panel .item button{flex:0 0 auto;width:auto;margin:0;background:#2c7;border:0;color:#04210f;border-radius:4px;padding:3px 9px;
     font-weight:700;cursor:pointer;font-size:11px}
+  #lidar-panel .item button.del{background:#a33;color:#fff}
+  #lidar-panel .item button:disabled{opacity:.5;cursor:default}
   #lidar-panel .muted{color:#7d8aa0;font-size:11px}
   #ls-bar-label{display:none;justify-content:space-between;align-items:baseline;gap:8px;
     margin-top:8px;font-size:11px;color:#aeb9cc}
@@ -216,7 +260,12 @@ export function initLidarPanel() {
   #ls-bar.indeterminate{width:35%!important;animation:ls-indet 1.1s ease-in-out infinite}
   @keyframes ls-indet{0%{margin-left:-35%}100%{margin-left:100%}}
   #ls-log{font:10px/1.4 monospace;color:#9fb;background:#0c121b;border-radius:5px;padding:6px;
-    margin-top:6px;max-height:120px;overflow:auto;white-space:pre-wrap;display:none}
+    margin-top:6px;max-height:120px;overflow:auto;white-space:pre-wrap}
+  #ls-log-wrap{display:none;position:relative}
+  #ls-log-copy{display:none;position:absolute;top:9px;right:6px;width:auto;margin:0;padding:2px 6px;
+    background:#243247;color:#cdd8ec;border:1px solid #3a4a63;border-radius:4px;
+    font-size:12px;line-height:1;cursor:pointer;opacity:.85}
+  #ls-log-copy:hover{opacity:1;background:#2c3d55}
   #lidar-panel .ls-info{flex:0 0 auto;cursor:pointer;color:#5a86c0;
     font-size:12px;margin-left:4px;line-height:1;user-select:none}
   #lidar-panel .ls-info:hover{color:#8fb4e8}
@@ -241,6 +290,7 @@ export function initLidarPanel() {
       const data = await api('/api/project/outputs', { path: projectInput.value.trim() });
       const items = [
         ...(data.splats || []).map(f => ({ ...f, kind: 'splat' })),
+        ...(data.meshes || []).map(f => ({ ...f, kind: 'mesh' })),
         ...(data.pointclouds || []).map(f => ({ ...f, kind: 'cloud' })),
       ];
       // Offer every project cloud as a splat seed, keeping the current choice
@@ -252,13 +302,19 @@ export function initLidarPanel() {
       seedSel.value = [...seedSel.options].some(o => o.value === seedCur) ? seedCur : '';
       outList.replaceChildren(...(items.length ? items.map(f =>
         el('div', { class: 'item' },
-          el('span', { title: f.name }, `${f.kind === 'splat' ? '🟣' : '⚪'} ${f.name} `,
+          el('span', { title: f.name }, `${f.kind === 'splat' ? '🟣' : f.kind === 'mesh' ? '🔷' : '⚪'} ${f.name} `,
             el('span', { class: 'muted' }, `${f.size_mb}MB`)),
           el('button', { onclick: async (e) => {
             e.target.disabled = true; e.target.textContent = '…';
             try { await loadPlyFromServer(f.path, f.name); e.target.textContent = '✓'; }
             catch (err) { e.target.textContent = 'err'; console.error(err); }
-          } }, 'Load'))
+          } }, 'Load'),
+          el('button', { class: 'del', title: 'Delete file (and its sidecars)', onclick: async (e) => {
+            if (!confirm(`Delete ${f.name}?\nThis permanently removes the file and its .pose/.traj sidecars.`)) return;
+            e.target.disabled = true; e.target.textContent = '…';
+            try { await api('/api/project/delete', { path: f.path }); refresh(); }
+            catch (err) { e.target.textContent = 'err'; e.target.disabled = false; console.error(err); }
+          } }, '🗑'))
       ) : [el('div', { class: 'muted' }, 'No outputs in this project.')]));
     } catch (err) {
       outList.replaceChildren(el('div', { class: 'muted' }, 'Error: ' + err.message));
@@ -267,23 +323,14 @@ export function initLidarPanel() {
 
   // ── Generate ──
   const scanInput = el('input', { id: 'ls-scan', placeholder: '/path/to/scan_folder' });
-  const typeSel = el('select', {}, ...['splat', 'pointcloud'].map(t => el('option', { value: t }, t)));
-  const methodSel = el('select', {}, ...['surfel', 'trained', 'bootstrap'].map(m => el('option', { value: m }, m)));
+  const typeSel = el('select', {}, ...['splat', 'pointcloud', 'mesh'].map(t => el('option', { value: t }, t)));
   const voxelInput = el('input', { type: 'number', step: '0.005', min: '0.005', value: '0.01' });
-  const sorInput = el('input', { type: 'number', step: '0.25', min: '1', value: '2' });
-  // voxel is used by both the pointcloud job and the surfel splat; noise σ is
-  // surfel-only. Wrapped so showGen() can toggle each independently.
+  // voxel is used only by the point-cloud job (splats are always GPU-trained).
   const lblVoxel = el('label', { class: 'muted', style: 'flex:1' }, 'voxel',
-    infoIcon('Point-cloud voxel size in metres. Smaller = denser, finer cloud (and finer '
-      + 'surfels) but bigger and slower. 0.01 m is dense; 0.05 m is a light preview cloud.',
-      'Voxel'),
+    infoIcon('Point-cloud voxel size in metres. Smaller = denser, finer cloud but bigger '
+      + 'and slower. 0.01 m is dense; 0.05 m is a light preview cloud.', 'Voxel'),
     voxelInput);
-  const lblNoise = el('label', { class: 'muted', style: 'flex:1' }, 'noise σ',
-    infoIcon('Statistical-outlier-removal strength for surfels: points whose neighbours are '
-      + 'farther than σ standard deviations away are culled. Higher = more aggressive '
-      + 'despeckling.', 'Noise σ'),
-    sorInput);
-  const pVoxNoise = el('div', { class: 'row' }, lblVoxel, lblNoise);
+  const pVoxel = el('div', { class: 'row' }, lblVoxel);
 
   // ── Trained-splat quality controls ──────────────────────────────────────
   // One master 'quality' slider drives a set of individual controls (which
@@ -347,35 +394,21 @@ export function initLidarPanel() {
         + 'aligned to the LiDAR frame). The single biggest quality lever (~+4 dB, '
         + 'walls-to-parity) — it corrects per-frame camera drift. Leave empty to use the '
         + 'LiDAR-odometry poses.', 'SfM poses')));
-  // Seed cloud for splat generation: 'auto' keeps the job's default (surfel:
-  // the scan's dense cloud; trained: the latest project cloud); any other
-  // entry pins the splat to that exact cloud — e.g. an edited one.
+  // Seed cloud: 'auto' uses the latest project cloud; any other entry pins the
+  // splat to that exact cloud — e.g. an edited one.
   const seedSel = el('select', {}, el('option', { value: '' }, 'seed cloud: auto'));
   const pSeed = el('div', { class: 'row', style: 'align-items:center' }, seedSel,
-    infoIcon("Which point cloud the splat is built from. 'auto' lets the job pick (surfel: "
-      + 'the scan’s dense cloud; trained: the latest project cloud). Choose a specific '
-      + 'or edited cloud to pin the splat to it.', 'Seed cloud'));
-  // Bootstrap splat Gaussian radius (m) — smaller = finer splats, less blobby.
-  const splatSizeInput = el('input', { type: 'number', step: '0.005', min: '0.001', value: '0.02' });
-  const pSplatSize = el('div', { class: 'row' },
-    el('label', { class: 'muted', style: 'flex:1' }, 'blob size (m)',
-      infoIcon('Gaussian radius for the bootstrap builder, in metres. Smaller = finer, '
-        + 'less blobby splats. Only applies to the bootstrap method.', 'Blob size'),
-      splatSizeInput));
-  // Blob size only applies to the bootstrap splat builder.
+    infoIcon("Which point cloud the splat is trained from. 'auto' uses the latest project "
+      + 'cloud; choose a specific or edited cloud to pin the splat to it.', 'Seed cloud'));
   const showGen = () => {
-    const isSplat = typeSel.value === 'splat';
-    const m = methodSel.value;
-    pSeed.style.display = isSplat ? 'flex' : 'none';
-    pSplatSize.style.display = (isSplat && m === 'bootstrap') ? 'flex' : 'none';
-    pTrained.style.display = (isSplat && m === 'trained') ? 'block' : 'none';
-    // voxel: pointcloud job or surfel splat; noise σ: surfel only.
-    const showVox = (typeSel.value === 'pointcloud') || (isSplat && m === 'surfel');
-    pVoxNoise.style.display = showVox ? 'flex' : 'none';
-    lblNoise.style.display = (isSplat && m === 'surfel') ? '' : 'none';
+    const type = typeSel.value;
+    // Seed cloud applies to splats and meshes (both reconstruct from a cloud);
+    // the trained-quality panel is splat-only; voxel is point-cloud-only.
+    pSeed.style.display = (type === 'splat' || type === 'mesh') ? 'flex' : 'none';
+    pTrained.style.display = type === 'splat' ? 'block' : 'none';
+    pVoxel.style.display = type === 'pointcloud' ? 'flex' : 'none';
   };
   typeSel.addEventListener('change', showGen);
-  methodSel.addEventListener('change', showGen);
   showGen();
   const barMsg = el('span', { class: 'ls-bar-msg' }, 'Starting…');
   const barPct = el('span', { class: 'ls-bar-pct' }, '');
@@ -383,7 +416,32 @@ export function initLidarPanel() {
   const barFill = el('div', { id: 'ls-bar' });
   const barWrap = el('div', { id: 'ls-bar-wrap' }, barFill);
   const logBox = el('div', { id: 'ls-log' });
+  // Copy icon overlaid on the log so an error is one click to copy.
+  const logCopyBtn = el('button', { id: 'ls-log-copy', title: 'Copy output',
+    onclick: async () => {
+      try {
+        await navigator.clipboard.writeText(logBox.textContent.trim());
+        logCopyBtn.textContent = '✓';
+        setTimeout(() => { logCopyBtn.textContent = '📋'; }, 1200);
+      } catch (e) { console.error('copy failed', e); }
+    } }, '📋');
+  const logWrap = el('div', { id: 'ls-log-wrap' }, logBox, logCopyBtn);
   const genBtn = el('button', { class: 'act' }, 'Generate');
+  // Stop button: interrupts the running job (shown only while one runs).
+  const stopBtn = el('button', { class: 'act', style: 'display:none;background:#a33' }, 'Stop');
+  let currentJobId = null;
+  const endRun = () => {
+    genBtn.disabled = false;
+    stopBtn.style.display = 'none';
+    stopBtn.disabled = false; stopBtn.textContent = 'Stop';
+    currentJobId = null;
+  };
+  stopBtn.onclick = async () => {
+    if (!currentJobId) return;
+    stopBtn.disabled = true; stopBtn.textContent = 'Stopping…';
+    try { await api('/api/process/cancel', { job_id: currentJobId }); }
+    catch (e) { console.error('cancel failed', e); }
+  };
 
   let lastPct = null;
   // Drive the progress bar. pct === undefined ⇒ keep current % (log-only update);
@@ -402,7 +460,7 @@ export function initLidarPanel() {
     }
     if (msg) {
       barMsg.textContent = msg;
-      logBox.style.display = 'block';
+      logWrap.style.display = 'block';
       logBox.textContent = msg + '\n' + logBox.textContent;
     }
   };
@@ -497,19 +555,16 @@ export function initLidarPanel() {
   genBtn.onclick = async () => {
     const scan = scanInput.value.trim();
     if (!scan) { setBar(0, 'Enter a scan folder path'); return; }
-    genBtn.disabled = true; logBox.textContent = ''; logBox.style.display = 'block';
+    genBtn.disabled = true; logBox.textContent = ''; logWrap.style.display = 'block';
+    logCopyBtn.style.display = 'none';   // copy icon appears only on error
     resetBar();
     const type = typeSel.value;
     // Remember the chosen seed so the finished splat can reload at the seed's
     // placement (captured now, since the dropdown may change during the run).
     const seedSelPath = type === 'splat' ? seedSel.value : '';
-    // Trained-mode quality knobs are harmless for surfel/bootstrap (the
-    // backend only reads them on the trained path).
     const capM = parseFloat(capInput.value) || 6;
     const options = type === 'splat'
-      ? { splat_mode: methodSel.value, splat_voxel: parseFloat(voxelInput.value),
-          surfel_sor: parseFloat(sorInput.value), splat_size: parseFloat(splatSizeInput.value),
-          iterations: parseInt(iterInput.value) || 7000,
+      ? { iterations: parseInt(iterInput.value) || 7000,
           downscale: parseInt(downInput.value) || 1,
           cap_max: Math.round(capM * 1e6),
           max_init_points: Math.round(Math.min(3, capM) * 1e6),
@@ -517,17 +572,28 @@ export function initLidarPanel() {
           undistort_scale: parseFloat(usInput.value) || 1.0,
           ...(sfmInput.value.trim() ? { sfm_poses: sfmInput.value.trim() } : {}),
           ...(seedSel.value ? { pointcloud: seedSel.value } : {}) }
+      : type === 'mesh'
+      // Surface-mesh defaults land the champion recipe (outlier-clean + Taubin
+      // smooth); a chosen seed pins which cloud it reconstructs from.
+      ? { depth: 10, smooth: 15, density_quantile: 0.03,
+          ...(seedSel.value ? { pointcloud: seedSel.value } : {}) }
       : { voxel_size: parseFloat(voxelInput.value) };
     try {
       const { job_id } = await api('/api/process/start',
         { type, project_path: projectInput.value.trim(), scan_path: scan, options });
+      currentJobId = job_id; stopBtn.style.display = 'block';
       const es = new EventSource(`/api/process/events/${job_id}`);
-      es.addEventListener('done', () => { es.close(); genBtn.disabled = false; refresh(); });
+      es.addEventListener('done', () => { es.close(); endRun(); refresh(); });
       es.onmessage = async (ev) => {
         const d = JSON.parse(ev.data);
         if (d.event === 'progress') setBar(d.percent, d.message);
         else if (d.event === 'log') setBar(undefined, d.message);
-        else if (d.event === 'error') { setBar(0, 'ERROR: ' + d.message); es.close(); genBtn.disabled = false; }
+        else if (d.event === 'error') {
+          const m = String(d.message || '').replace(/^\s*ERROR:\s*/i, '');
+          setBar(0, 'ERROR: ' + m); logCopyBtn.style.display = 'block';
+          es.close(); endRun();
+        }
+        else if (d.event === 'cancelled') { setBar(0, d.message); es.close(); endRun(); }
         else if (d.event === 'result') {
           setBar(100, `Done: ${d.filename} — loading…`);
           // Reload the new splat at the seed cloud's position/rotation so it
@@ -538,8 +604,8 @@ export function initLidarPanel() {
           } catch (e) { console.error(e); }
         }
       };
-      es.onerror = () => { es.close(); genBtn.disabled = false; };
-    } catch (err) { setBar(0, 'ERROR: ' + err.message); genBtn.disabled = false; }
+      es.onerror = () => { es.close(); endRun(); };
+    } catch (err) { setBar(0, 'ERROR: ' + err.message); logCopyBtn.style.display = 'block'; endRun(); }
   };
 
   // ── Edit (operates on the selected cloud/splat) ──
@@ -1085,16 +1151,13 @@ export function initLidarPanel() {
     outList,
     el('h4', {}, 'Generate'),
     el('div', { class: 'muted' }, 'Scan folder (raw bags):'), scanInput,
-    el('div', { class: 'row', style: 'align-items:center' }, typeSel, methodSel,
-      infoIcon('Output kind and builder. splat = photoreal Gaussians; pointcloud = raw '
-        + 'coloured LiDAR points. Splat methods: surfel (fast LiDAR discs, no training), '
-        + 'trained (GPU-trained, photoreal — has the quality slider below), or bootstrap '
-        + '(quick Gaussians seeded from the cloud).', 'Type & method')),
+    el('div', { class: 'row', style: 'align-items:center' }, typeSel,
+      infoIcon('Output kind. splat = photoreal GPU-trained Gaussians (uses the quality '
+        + 'slider below); pointcloud = raw coloured LiDAR points.', 'Output type')),
     pSeed,
     pTrained,
-    pVoxNoise,
-    pSplatSize,
-    genBtn, barLabel, barWrap, logBox,
+    pVoxel,
+    genBtn, stopBtn, barLabel, barWrap, logWrap,
     el('h4', {}, 'Scan photos'),
     pPhotos,
     el('h4', {}, 'LiDAR sweeps'),
@@ -1113,8 +1176,7 @@ export function initLidarPanel() {
   function collectWorkflow() {
     return {
       project: projectInput.value, scan: scanInput.value,
-      type: typeSel.value, method: methodSel.value,
-      voxel: voxelInput.value, noise: sorInput.value, splatSize: splatSizeInput.value,
+      type: typeSel.value, voxel: voxelInput.value,
       quality: qSlider.value, iterations: iterInput.value, downscale: downInput.value,
       cap: capInput.value, dropBlurry: dropInput.value, undistortScale: usInput.value,
       sfm: sfmInput.value,
@@ -1128,8 +1190,7 @@ export function initLidarPanel() {
     if (!s) return false;
     const setVal = (elm, k) => { if (s[k] != null) elm.value = s[k]; };
     setVal(projectInput, 'project'); setVal(scanInput, 'scan');
-    setVal(typeSel, 'type'); setVal(methodSel, 'method');
-    setVal(voxelInput, 'voxel'); setVal(sorInput, 'noise'); setVal(splatSizeInput, 'splatSize');
+    setVal(typeSel, 'type'); setVal(voxelInput, 'voxel');
     // Restore saved knobs verbatim (don't re-derive from the quality preset —
     // the user may have hand-tuned individual controls before saving).
     setVal(qSlider, 'quality'); setVal(iterInput, 'iterations'); setVal(downInput, 'downscale');
@@ -1167,6 +1228,8 @@ export function initLidarPanel() {
   const host = document.getElementById('panel') || document.body;
   host.insertBefore(panel, host.firstChild);
   host.insertBefore(head, panel);
+
+  showStartupHealth();   // one-time hardware traffic-light panel
 
   // Resolve the gizmo for the currently-active box (falling back to whichever
   // box exists if none has been explicitly focused yet).

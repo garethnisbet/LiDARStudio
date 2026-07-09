@@ -816,6 +816,15 @@ def main():
         help="absolute bag timestamp (ns): sweeps at/after it contribute no "
         "points inside --dynamic-box",
     )
+    parser.add_argument(
+        "--self-view-box",
+        default=None,
+        help="x1,y1,z1,x2,y2,z2 SENSOR-frame box around the scanner's own "
+        "handle/mount; points inside are dropped from every sweep before the "
+        "world transform, so the mount doesn't smear into a 'snake' along the "
+        "trajectory (in the cloud, mesh, and the splat seeded from it). For the "
+        "Vanjee 722z: -0.3,0.3,-0.2,0.3,0.7,0.25",
+    )
     args = parser.parse_args()
 
     _require("rosbags", "numpy", "cv2")
@@ -934,6 +943,31 @@ def main():
                 "stacking (run: pip install kiss-icp)",
                 flush=True,
             )
+
+    # Self-view filter: the handheld unit's own handle/mount (and the operator's
+    # hand gripping it) sit at a FIXED position in the sensor frame, so every
+    # sweep records them at the same spot. Posed into the world each sweep, those
+    # points smear into a 'snake' tracing the whole trajectory — and, because the
+    # splat seeds from this cloud, the snake is inherited by the splat too. Drop
+    # points inside a sensor-frame box (per sweep, before the world transform) so
+    # the mount never enters the cloud/mesh/splat seed. Box is in the deskewed
+    # sensor frame; for the Vanjee 722z the mount clusters near (0, +0.45, 0).
+    if args.self_view_box:
+        sv = [float(x) for x in args.self_view_box.split(",")]
+        slo = np.array([min(sv[0], sv[3]), min(sv[1], sv[4]), min(sv[2], sv[5])])
+        shi = np.array([max(sv[0], sv[3]), max(sv[1], sv[4]), max(sv[2], sv[5])])
+        sv_removed = 0
+        for i in range(frame_count):
+            x = all_xyz[i]
+            keep = ~np.all((x >= slo) & (x <= shi), axis=1)
+            if not keep.all():
+                sv_removed += int((~keep).sum())
+                all_xyz[i] = x[keep]
+        print(
+            f"  self-view filter: removed {sv_removed:,} handle/mount points "
+            f"inside sensor-frame box {slo.round(2)}..{shi.round(2)}",
+            flush=True,
+        )
 
     if poses is not None:
         all_xyz_world = [

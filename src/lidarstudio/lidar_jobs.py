@@ -10,11 +10,13 @@ Open http://localhost:8090/ in your browser.
 """
 
 import asyncio
+import functools
 import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import uuid
@@ -142,8 +144,8 @@ def _scan_contents(scan_path: Path) -> dict:
 
 
 def _list_outputs(project_path: Path) -> dict:
-    result: dict = {"pointclouds": [], "splats": []}
-    for kind in ("pointclouds", "splats"):
+    result: dict = {"pointclouds": [], "splats": [], "meshes": []}
+    for kind in ("pointclouds", "splats", "meshes"):
         d = project_path / kind
         if d.exists():
             result[kind] = [
@@ -321,9 +323,9 @@ async def process_start_handler(request):
     scan_path = data.get("scan_path")
     options = data.get("options", {})
 
-    if job_type not in ("pointcloud", "splat"):
+    if job_type not in ("pointcloud", "splat", "mesh"):
         return web.json_response(
-            {"error": "type must be 'pointcloud' or 'splat'"}, status=400
+            {"error": "type must be 'pointcloud', 'splat' or 'mesh'"}, status=400
         )
     if not project_path or not scan_path:
         return web.json_response(
@@ -340,21 +342,46 @@ async def process_start_handler(request):
 
 
 async def _run_job(job_id, job_type, project_path, scan_path, options):
-    queue = jobs[job_id]["queue"]
+    job = jobs[job_id]
+    queue = job["queue"]
     try:
         if job_type == "pointcloud":
-            await _job_pointcloud(project_path, scan_path, options, queue)
+            await _job_pointcloud(project_path, scan_path, options, queue, job)
+        elif job_type == "mesh":
+            await _job_mesh(project_path, scan_path, options, queue, job)
         else:
-            await _job_splat(project_path, scan_path, options, queue)
+            await _job_splat(project_path, scan_path, options, queue, job)
     except Exception as exc:
         await queue.put({"event": "error", "message": str(exc)})
     finally:
-        jobs[job_id]["done"] = True
+        job["done"] = True
         await queue.put(None)  # sentinel
 
 
-async def _stream_proc(proc, queue) -> int:
-    """Stream stdout of a subprocess to the job queue. Returns exit code."""
+async def process_cancel_handler(request):
+    """POST /api/process/cancel — stop a running job by killing its subprocess."""
+    data = await request.json()
+    job_id = (data.get("job_id") or "").strip()
+    job = jobs.get(job_id)
+    if not job:
+        return web.json_response({"error": "job not found"}, status=404)
+    job["cancelled"] = True
+    proc = job.get("proc")
+    if proc is not None and proc.returncode is None:
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+    return web.json_response({"stopped": True})
+
+
+async def _stream_proc(proc, queue):
+    """Stream a subprocess's stdout to the job queue.
+
+    Returns ``(exit_code, last_error_line)`` — the most recent ``ERROR:`` line,
+    so the caller can report *why* a job failed rather than just its exit code.
+    """
+    last_error = None
     async for raw in proc.stdout:
         text = raw.decode(errors="replace").rstrip()
         if not text:
@@ -365,9 +392,11 @@ async def _stream_proc(proc, queue) -> int:
             msg = parts[2] if len(parts) > 2 else ""
             await queue.put({"event": "progress", "percent": pct, "message": msg})
         else:
+            if text.lstrip().startswith("ERROR"):
+                last_error = text.strip()
             await queue.put({"event": "log", "message": text})
     await proc.wait()
-    return proc.returncode
+    return proc.returncode, last_error
 
 
 def _pointcloud_cmd(scan, contents, output_file, voxel):
@@ -391,7 +420,8 @@ def _pointcloud_cmd(scan, contents, output_file, voxel):
     return cmd
 
 
-async def _job_pointcloud(project_path, scan_path, options, queue):
+async def _job_pointcloud(project_path, scan_path, options, queue, job=None):
+    job = job if job is not None else {}
     proj = Path(project_path)
     scan = Path(scan_path)
     contents = _scan_contents(scan)
@@ -443,9 +473,18 @@ async def _job_pointcloud(project_path, scan_path, options, queue):
         )
         return
 
-    rc = await _stream_proc(proc, queue)
+    job["proc"] = proc
+    if job.get("cancelled"):
+        proc.terminate()
 
-    if rc == 0 and output_file.exists():
+    rc, err = await _stream_proc(proc, queue)
+    job["proc"] = None
+
+    if job.get("cancelled"):
+        await queue.put(
+            {"event": "cancelled", "message": "Point cloud generation stopped."}
+        )
+    elif rc == 0 and output_file.exists():
         size_mb = round(output_file.stat().st_size / 1_048_576, 1)
         await queue.put({"event": "progress", "percent": 100, "message": "Complete!"})
         await queue.put(
@@ -461,12 +500,264 @@ async def _job_pointcloud(project_path, scan_path, options, queue):
         await queue.put(
             {
                 "event": "error",
-                "message": f"process_pointcloud.py exited with code {rc}",
+                "message": err or f"process_pointcloud.py exited with code {rc}",
             }
         )
 
 
-async def _job_splat(project_path, scan_path, options, queue):
+def _mesh_cmd(scan, contents, cloud_file, output_file, options):
+    """Build the process_mesh.py argv for a scan + seed cloud."""
+    cmd = [
+        sys.executable,
+        str(ROOT / "process_mesh.py"),
+        "--cloud",
+        str(cloud_file),
+        "--image-bag",
+        str(scan / contents["image_bag"]),
+        "--output",
+        str(output_file),
+        "--camera",
+        str(options.get("camera", "front")),
+        "--depth",
+        str(int(options.get("depth", 10))),
+        "--density-quantile",
+        str(float(options.get("density_quantile", 0.03))),
+        "--decimate",
+        str(int(options.get("decimate", 0))),
+        "--outlier-neighbors",
+        str(int(options.get("outlier_neighbors", 20))),
+        "--outlier-std",
+        str(float(options.get("outlier_std", 2.0))),
+        "--pre-voxel",
+        str(float(options.get("pre_voxel", 0.0))),
+        "--smooth",
+        str(int(options.get("smooth", 15))),
+        "--colour-range",
+        str(float(options.get("colour_range", 20.0))),
+    ]
+    if contents.get("calibration"):
+        cmd += ["--calibration", str(scan / "calibration")]
+    return cmd
+
+
+async def _job_mesh(project_path, scan_path, options, queue, job=None):
+    job = job if job is not None else {}
+    proj = Path(project_path)
+    scan = Path(scan_path)
+    contents = _scan_contents(scan)
+
+    await queue.put(
+        {"event": "progress", "percent": 0, "message": "Starting mesh generation…"}
+    )
+
+    if not contents.get("valid"):
+        await queue.put(
+            {"event": "error", "message": "Scan folder is missing required bag files"}
+        )
+        return
+
+    out_dir = proj / "meshes"
+    out_dir.mkdir(exist_ok=True)
+
+    stem = Path(contents.get("lidar_bag") or "LIDAR_output.bag").stem
+    ts = stem.split("_", 1)[1] if "_" in stem else stem
+    output_file = out_dir / f"mesh_{ts}.ply"
+
+    # Seed cloud: an explicit one (e.g. an edited cloud) pins the mesh; otherwise
+    # pick the latest project cloud that has a trajectory sidecar (required for
+    # camera-oriented normals + photo colouring). Unlike splats, a *dense* cloud
+    # is preferred here — Poisson is only as good as its point density.
+    from lidarstudio import edit_ops
+
+    seed = (options.get("pointcloud") or "").strip()
+    seed_p = Path(seed) if seed else None
+    if seed_p and not seed_p.exists():
+        await queue.put(
+            {"event": "error", "message": f"Selected seed cloud not found: {seed}"}
+        )
+        return
+
+    if seed_p:
+        cloud_file = seed_p
+    else:
+        pc_dir = proj / "pointclouds"
+        pc_files = sorted(pc_dir.glob("pointcloud_*.ply")) if pc_dir.exists() else []
+        pc_files = [p for p in pc_files if edit_ops._find_traj(p)]
+        if not pc_files:
+            await queue.put(
+                {
+                    "event": "error",
+                    "message": "No point cloud with a trajectory sidecar found — "
+                    "generate a point cloud first.",
+                }
+            )
+            return
+        dense = [p for p in pc_files if p.stem.endswith("_dense")]
+        cloud_file = (dense or pc_files)[-1]
+
+    if edit_ops._find_traj(cloud_file) is None:
+        await queue.put(
+            {
+                "event": "error",
+                "message": f"{cloud_file.name} has no trajectory sidecar (.traj.npz); "
+                "mesh colouring needs camera poses. Re-generate the cloud.",
+            }
+        )
+        return
+
+    await queue.put(
+        {"event": "log", "message": f"Meshing from cloud: {cloud_file.name}"}
+    )
+
+    cmd = _mesh_cmd(scan, contents, cloud_file, output_file, options)
+
+    await queue.put(
+        {"event": "progress", "percent": 5, "message": "Launching process_mesh.py…"}
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except FileNotFoundError:
+        await queue.put(
+            {"event": "error", "message": "process_mesh.py not found."}
+        )
+        return
+
+    job["proc"] = proc
+    if job.get("cancelled"):
+        proc.terminate()
+
+    rc, err = await _stream_proc(proc, queue)
+    job["proc"] = None
+
+    if job.get("cancelled"):
+        await queue.put({"event": "cancelled", "message": "Mesh generation stopped."})
+    elif rc == 0 and output_file.exists():
+        size_mb = round(output_file.stat().st_size / 1_048_576, 1)
+        await queue.put({"event": "progress", "percent": 100, "message": "Complete!"})
+        await queue.put(
+            {
+                "event": "result",
+                "type": "mesh",
+                "path": str(output_file),
+                "filename": output_file.name,
+                "size_mb": size_mb,
+            }
+        )
+    else:
+        await queue.put(
+            {
+                "event": "error",
+                "message": err or f"process_mesh.py exited with code {rc}",
+            }
+        )
+
+
+@functools.lru_cache(maxsize=1)
+def _system_health() -> dict:
+    """Grade CPU / RAM / GPU for splat work as green|amber|red. Cached (static)."""
+
+    def grade(v, good, ok):
+        return "green" if v >= good else "amber" if v >= ok else "red"
+
+    # CPU: logical cores (point-cloud + undistort are CPU-bound).
+    cores = os.cpu_count() or 0
+    cpu = {"grade": grade(cores, 8, 4), "detail": f"{cores} logical cores"}
+
+    # RAM: full-res frame caches are memory-hungry (32 GB comfortable, 16 tight).
+    ram_gb = 0.0
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    ram_gb = int(line.split()[1]) / 1024 / 1024
+                    break
+    except OSError:
+        pass
+    ram = {"grade": grade(ram_gb, 32, 16), "detail": f"{ram_gb:.0f} GB"}
+
+    # GPU: needs an NVIDIA card + the torch/gsplat stack; VRAM sets the ceiling.
+    name, vram_gb = None, 0.0
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            nm, mem = r.stdout.strip().splitlines()[0].split(",")
+            name, vram_gb = nm.strip(), float(mem) / 1024  # MiB → GiB
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    stack_ok = False
+    try:
+        rr = subprocess.run(
+            [_splat_python(), "-c",
+             "import torch, gsplat; print(int(torch.cuda.is_available()))"],
+            capture_output=True, text=True, timeout=120,
+        )
+        stack_ok = rr.returncode == 0 and rr.stdout.strip().endswith("1")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if not stack_ok or name is None:
+        gpu = {
+            "grade": "red",
+            "detail": (f"{name} — no CUDA/torch stack" if name else "no CUDA GPU"),
+        }
+    else:
+        gpu = {
+            "grade": grade(vram_gb, 12, 8),
+            "detail": f"{name}, {vram_gb:.0f} GB VRAM",
+        }
+    return {"cpu": cpu, "ram": ram, "gpu": gpu}
+
+
+async def system_health_handler(request):
+    """GET /api/system — CPU/RAM/GPU health grades for the startup panel."""
+    return web.json_response(await asyncio.to_thread(_system_health))
+
+
+@functools.lru_cache(maxsize=1)
+def _splat_python() -> str:
+    """A Python interpreter that has the splat-training stack (torch + gsplat).
+
+    The server can run in a venv without the heavy CUDA deps, so process_splat
+    may need a different interpreter than the server itself. Checked once and
+    cached. Override with $LIDARSTUDIO_SPLAT_PYTHON.
+    """
+    seen = set()
+    for cand in (
+        os.environ.get("LIDARSTUDIO_SPLAT_PYTHON"),
+        sys.executable,
+        shutil.which("python3"),
+        "/usr/bin/python3",
+    ):
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        try:
+            r = subprocess.run(
+                [cand, "-c", "import torch, gsplat"],
+                capture_output=True,
+                timeout=120,
+            )
+            if r.returncode == 0:
+                if cand != sys.executable:
+                    logging.info("splat training will use %s (has torch/gsplat)", cand)
+                return cand
+        except (OSError, subprocess.SubprocessError):
+            continue
+    # None found — fall back to the server's own; process_splat then emits its
+    # own clear "torch/gsplat not installed" error.
+    return sys.executable
+
+
+async def _job_splat(project_path, scan_path, options, queue, job=None):
+    job = job if job is not None else {}
     proj = Path(project_path)
     scan = Path(scan_path)
     contents = _scan_contents(scan)
@@ -486,12 +777,10 @@ async def _job_splat(project_path, scan_path, options, queue):
     ts = stem.split("_", 1)[1] if "_" in stem else stem
     output_file = out_dir / f"splat_{ts}.ply"
 
-    mode = options.get("splat_mode", "surfel")
     pc_dir = proj / "pointclouds"
 
-    # Explicit seed cloud (e.g. an edited one) — pins the splat to that file
-    # instead of the job's default (surfel: the scan's own dense cloud;
-    # trained/bootstrap: the latest project cloud).
+    # Explicit seed cloud (e.g. an edited one) pins the splat to that file;
+    # otherwise the latest trainable project cloud is used.
     seed = (options.get("pointcloud") or "").strip()
     seed_p = Path(seed) if seed else None
     if seed_p and not seed_p.exists():
@@ -509,120 +798,76 @@ async def _job_splat(project_path, scan_path, options, queue):
         )
         return
 
-    if mode == "surfel":
-        # Surfels need a *dense* cloud (small splats only look good when the
-        # cloud is dense), so the splat job keeps its own fine-voxel cloud,
-        # separate from the coarser one used for the on-screen cloud view.
-        if not contents.get("valid"):
-            await queue.put(
-                {
-                    "event": "error",
-                    "message": "Scan folder is missing required bag files",
-                }
-            )
-            return
-        voxel = float(options.get("splat_voxel", 0.01))
-        dense = seed_p or pc_dir / f"pointcloud_{ts}_dense.ply"
-        if not dense.exists():
-            pc_dir.mkdir(exist_ok=True)
-            await queue.put(
-                {
-                    "event": "progress",
-                    "percent": 5,
-                    "message": f"Building dense cloud for splat (voxel {voxel} m)…",
-                }
-            )
-            pc_cmd = _pointcloud_cmd(scan, contents, dense, voxel)
-            try:
-                pc_proc = await asyncio.create_subprocess_exec(
-                    *pc_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                )
-            except FileNotFoundError:
-                await queue.put(
-                    {"event": "error", "message": "process_pointcloud.py not found."}
-                )
-                return
-            prc = await _stream_proc(pc_proc, queue)
-            if prc != 0 or not dense.exists():
-                await queue.put(
-                    {
-                        "event": "error",
-                        "message": f"Dense cloud step failed (code {prc})",
-                    }
-                )
-                return
-        else:
-            await queue.put(
-                {"event": "log", "message": f"Using dense cloud: {dense.name}"}
-            )
+    # GPU-trained splat: explicit seed cloud if chosen, else the latest
+    # trainable coloured cloud in the project.
+    from lidarstudio import edit_ops
 
-        cmd = [
-            sys.executable,
-            str(ROOT / "process_splat.py"),
-            "--scan",
-            str(scan),
-            "--output",
-            str(output_file),
-            "--pointcloud",
-            str(dense),
-            "--surfel",
-            "--surfel-flatten",
-            str(options.get("surfel_flatten", 0.2)),
-            "--surfel-sor",
-            str(options.get("surfel_sor", 2.0)),
-        ]
+    if seed_p:
+        pc_files = [seed_p]
     else:
-        # Legacy GPU-trained / bootstrap path (explicit seed cloud if chosen,
-        # else the latest coloured cloud in the project).
-        if seed_p:
-            pc_files = [seed_p]
-        else:
-            pc_files = (
-                sorted(pc_dir.glob("pointcloud_*.ply")) if pc_dir.exists() else []
-            )
-            pc_files = [
-                p for p in pc_files if not p.stem.endswith("_dense")
-            ] or pc_files
-        cmd = [
-            sys.executable,
-            str(ROOT / "process_splat.py"),
-            "--scan",
-            str(scan),
-            "--output",
-            str(output_file),
-            "--iterations",
-            str(options.get("iterations", 7000)),
-        ]
-        if mode == "bootstrap":
-            cmd += ["--bootstrap", "--splat-size", str(options.get("splat_size", 0.05))]
-        elif mode == "trained":
-            # Quality knobs driven by the UI 'quality' slider (draft→max). The
-            # shape/opacity/pose-association recipe constants (opacity-reg,
-            # flat-reg, min-opacity, min-scale, cam-time-offset) now come from
-            # process_splat.py's own champion defaults, so we only pass the
-            # resolution/count/sharpness knobs that scale with quality.
-            cmd += [
-                "--downscale",
-                str(int(options.get("downscale", 1))),
-                "--max-init-points",
-                str(int(options.get("max_init_points", 3_000_000))),
-                "--cap-max",
-                str(int(options.get("cap_max", 6_000_000))),
-                "--undistort-scale",
-                str(float(options.get("undistort_scale", 1.0))),
-                "--drop-blurry",
-                str(float(options.get("drop_blurry", 0.15))),
-            ]
-            if sfm_poses:
-                cmd += ["--sfm-poses", sfm_poses]
-        if pc_files:
-            cmd += ["--pointcloud", str(pc_files[-1])]
+        pc_files = sorted(pc_dir.glob("pointcloud_*.ply")) if pc_dir.exists() else []
+        pc_files = [p for p in pc_files if not p.stem.endswith("_dense")] or pc_files
+        # Training needs a trajectory sidecar; the latest cloud may be an edited
+        # one without it. Prefer a trainable auto-seed when one exists.
+        trainable = [p for p in pc_files if edit_ops._find_traj(p)]
+        if trainable:
+            pc_files = trainable
+
+    cmd = [
+        _splat_python(),
+        str(ROOT / "process_splat.py"),
+        "--scan",
+        str(scan),
+        "--output",
+        str(output_file),
+        "--iterations",
+        str(options.get("iterations", 7000)),
+        # Quality knobs driven by the UI 'quality' slider (draft→max). The
+        # shape/opacity/pose-association recipe constants (opacity-reg, flat-reg,
+        # min-opacity, min-scale, cam-time-offset) come from process_splat.py's
+        # own champion defaults, so we only pass the knobs that scale with quality.
+        "--downscale",
+        str(int(options.get("downscale", 1))),
+        "--max-init-points",
+        str(int(options.get("max_init_points", 3_000_000))),
+        "--cap-max",
+        str(int(options.get("cap_max", 6_000_000))),
+        "--undistort-scale",
+        str(float(options.get("undistort_scale", 1.0))),
+        "--drop-blurry",
+        str(float(options.get("drop_blurry", 0.15))),
+        # In-training pose-opt defaults ON but diverges on these SfM/odometry
+        # poses (the campaign retired it); keep it off for app runs.
+        "--no-pose-opt",
+        # Patch training: render random crops so GPU memory is bounded by the
+        # patch, not the (downscale-1) frame size — lets high-quality runs fit
+        # without OOM. Frames smaller than this render whole (no-op).
+        "--patch-size",
+        str(int(options.get("patch_size", 1600))),
+        # On-disk frame cache: the undistorted uint8 frames can exceed host RAM
+        # at downscale-1 / high undistort-scale; memmap them so RSS stays flat.
+        "--memmap-frames",
+    ]
+    if sfm_poses:
+        cmd += ["--sfm-poses", sfm_poses]
+    if pc_files:
+        cmd += ["--pointcloud", str(pc_files[-1])]
+        await queue.put(
+            {
+                "event": "log",
+                "message": f"Using existing point cloud: {pc_files[-1].name}",
+            }
+        )
+        # Training needs the seed's trajectory sidecar; warn up front if missing.
+        if edit_ops._find_traj(pc_files[-1]) is None:
             await queue.put(
                 {
                     "event": "log",
-                    "message": f"Using existing point cloud: {pc_files[-1].name}",
+                    "message": (
+                        f"⚠ {pc_files[-1].name} has no trajectory sidecar "
+                        "(.traj.npz), which training requires. Re-run the edit "
+                        "(edits now carry the trajectory) or pick a generated cloud."
+                    ),
                 }
             )
 
@@ -630,11 +875,15 @@ async def _job_splat(project_path, scan_path, options, queue):
         {"event": "progress", "percent": 5, "message": "Launching process_splat.py…"}
     )
 
+    # expandable_segments cuts CUDA fragmentation, which is what tips heavy
+    # (downscale-1 / 6M) runs into OOM on smaller-VRAM cards.
+    splat_env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=splat_env,
         )
     except FileNotFoundError:
         await queue.put(
@@ -645,9 +894,17 @@ async def _job_splat(project_path, scan_path, options, queue):
         )
         return
 
-    rc = await _stream_proc(proc, queue)
+    # Register the process so a /cancel can kill it; honour a cancel that raced in.
+    job["proc"] = proc
+    if job.get("cancelled"):
+        proc.terminate()
 
-    if rc == 0 and output_file.exists():
+    rc, err = await _stream_proc(proc, queue)
+    job["proc"] = None
+
+    if job.get("cancelled"):
+        await queue.put({"event": "cancelled", "message": "Splat generation stopped."})
+    elif rc == 0 and output_file.exists():
         size_mb = round(output_file.stat().st_size / 1_048_576, 1)
         await queue.put({"event": "progress", "percent": 100, "message": "Complete!"})
         await queue.put(
@@ -661,7 +918,10 @@ async def _job_splat(project_path, scan_path, options, queue):
         )
     else:
         await queue.put(
-            {"event": "error", "message": f"process_splat.py exited with code {rc}"}
+            {
+                "event": "error",
+                "message": err or f"process_splat.py exited with code {rc}",
+            }
         )
 
 
@@ -736,6 +996,35 @@ async def project_outputs_handler(request):
     if not p.exists():
         return web.json_response({"error": "Project not found"}, status=404)
     return web.json_response(_list_outputs(p))
+
+
+async def project_delete_handler(request):
+    """POST /api/project/delete — remove an output ``.ply`` and its sidecars.
+
+    Restricted to files inside a project's ``pointclouds``/``splats`` folder, so
+    it can't be used to delete arbitrary paths.
+    """
+    data = await request.json()
+    path = (data.get("path") or "").strip()
+    if not path:
+        return web.json_response({"error": "path required"}, status=400)
+    p = Path(path)
+    if p.suffix.lower() != ".ply" or p.parent.name not in ("pointclouds", "splats"):
+        return web.json_response(
+            {"error": "only output .ply files can be deleted"}, status=403
+        )
+    if not p.exists():
+        return web.json_response({"error": "file not found"}, status=404)
+    removed = []
+    # The .ply plus the sidecars that ride with it (viewer pose + trajectory).
+    for f in (p, Path(str(p) + ".pose.json"), Path(str(p) + ".traj.npz")):
+        try:
+            if f.exists():
+                f.unlink()
+                removed.append(f.name)
+        except OSError as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+    return web.json_response({"deleted": removed})
 
 
 async def edit_apply_handler(request):
@@ -1116,9 +1405,12 @@ def register_routes(app: web.Application) -> None:
     app.router.add_post("/api/project/create", project_create_handler)
     app.router.add_post("/api/project/open", project_open_handler)
     app.router.add_post("/api/scan/validate", scan_validate_handler)
+    app.router.add_get("/api/system", system_health_handler)
     app.router.add_post("/api/process/start", process_start_handler)
+    app.router.add_post("/api/process/cancel", process_cancel_handler)
     app.router.add_get("/api/process/events/{job_id}", process_events_handler)
     app.router.add_post("/api/project/outputs", project_outputs_handler)
+    app.router.add_post("/api/project/delete", project_delete_handler)
     app.router.add_get("/api/scan/file", scan_file_handler)
     app.router.add_post("/api/scan/photos", scan_photos_handler)
     app.router.add_get("/api/scan/photo", scan_photo_handler)

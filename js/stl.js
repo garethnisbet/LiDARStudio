@@ -459,7 +459,10 @@ export function _addMeshToScene(geometry, buffer, fileType, name, color, stlId, 
     mesh.rotation.set(...transforms.rotation);
     mesh.scale.set(...transforms.scale);
     mesh.visible = transforms.visible;
-  } else {
+  } else if (fileType !== 'ply') {
+    // STL/GLB are authored in millimetres — shrink to metres. PLY meshes here
+    // come from the LiDAR pipeline already in world metres (same frame as the
+    // clouds/splats), so they must load at scale 1, not 1/1000.
     const box = new THREE.Box3().setFromObject(mesh);
     const size = box.getSize(new THREE.Vector3());
     if (size.length() > 1) mesh.scale.setScalar(0.001);

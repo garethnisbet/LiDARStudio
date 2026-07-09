@@ -11,16 +11,16 @@ each image's world→camera matrix is the LiDAR pose at that timestamp composed
 with the fixed lidar→camera extrinsic from ``calibration/calib.json``.  The
 coloured cloud seeds the Gaussians, the photos supervise their colour/opacity.
 
-GPU: training uses gsplat's CUDA rasterizer (needs an NVIDIA GPU + nvcc).  If
-gsplat/CUDA or the trajectory is unavailable, falls back to a CPU "bootstrap"
-that turns each point into one isotropic Gaussian (viewable, not optimised).
+GPU: training uses gsplat's CUDA rasterizer (needs an NVIDIA GPU + nvcc) and the
+KISS-ICP trajectory sidecar (``<cloud>.traj.npz``); it errors out if either is
+missing rather than emitting a low-value CPU splat.
 
 Usage (called automatically by lidar_server.py):
     python process_splat.py
         --scan       /path/to/20260527195949
         --output     /project/splats/splat_20260527195949.ply
         --pointcloud /project/pointclouds/pointcloud_20260527195949.ply
-        [--iterations 7000] [--downscale 4] [--image-rot ccw] [--surfel]
+        [--iterations 7000] [--downscale 1] [--image-rot ccw]
 
 Progress protocol:
     Print "PROGRESS:<percent>:<message>" for the UI progress bar; other lines
@@ -28,8 +28,11 @@ Progress protocol:
 """
 
 import argparse
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 # Reduce CUDA fragmentation before torch initialises its caching allocator — the
@@ -191,6 +194,31 @@ def _dynamic_mask_png(img_bgr, K, viewmat, box, canon_pts=None):
     return png if ok else None
 
 
+def _frame_cache_root(explicit=None, need_bytes=0):
+    """Pick a directory on a real disk with room for the frame cache. The default
+    temp dir is often small (or tmpfs = RAM, which would defeat the purpose), so
+    prefer an explicit dir / $LIDARSTUDIO_FRAME_CACHE, then the biggest-free of a
+    few real-disk candidates. Never a Dropbox-synced path (would trigger a sync)."""
+    cands = [explicit, os.environ.get("LIDARSTUDIO_FRAME_CACHE")]
+    cands += ["/FastDrive", tempfile.gettempdir(), str(Path.home())]
+    usable = []
+    for c in cands:
+        if not c or not os.path.isdir(c) or not os.access(c, os.W_OK):
+            continue
+        if "dropbox" in c.lower():
+            continue
+        try:
+            free = shutil.disk_usage(c).free
+        except OSError:
+            continue
+        if c in (explicit, os.environ.get("LIDARSTUDIO_FRAME_CACHE")) and free > need_bytes:
+            return c  # honour an explicit choice that fits
+        usable.append((free, c))
+    if not usable:
+        return tempfile.gettempdir()
+    return max(usable)[1]  # most free space
+
+
 def build_camera_frames(
     scan: Path,
     traj_path: Path,
@@ -206,6 +234,8 @@ def build_camera_frames(
     mask_box=None,
     mask_from: int = 0,
     mask_canon_pts=None,
+    memmap_frames: bool = False,
+    frame_cache_dir=None,
 ):
     """
     Return a list of {image HxWx3 uint8 RGB, K 3x3, viewmat 4x4 (world→cam)}.
@@ -270,6 +300,12 @@ def build_camera_frames(
         print(f"  external SfM poses: {len(sfm_vm)} frames from {sfm_poses}", flush=True)
     skipped = 0
     frames = []
+    # Optional on-disk frame cache: instead of holding every uint8 frame in host
+    # RAM (~size × count — 56 GB at downscale-1/us-1.5), stream them to a single
+    # memmap file and hand out memmap views. The OS page cache keeps hot frames
+    # resident, so RSS stays bounded by RAM regardless of resolution × count.
+    mm_file = mm_path = mm_shape = None
+    mm_count = 0
     for bag_i, (ts, img) in enumerate(ppc.read_images(img_bag, camera, rot=image_rot)):
         if sfm_vm is not None and int(ts) not in sfm_vm:
             skipped += 1
@@ -328,7 +364,29 @@ def build_camera_frames(
                 diag["gap_ns"].append(gap)
                 diag["snap_err_ns"].append(min(a, 1.0 - a) * gap)
 
-        frame = {"image": rgb, "K": K.astype(np.float64), "viewmat": viewmat}
+        if memmap_frames:
+            if mm_file is None:
+                mm_shape = rgb.shape  # (H, W, 3), shared by all frames this run
+                root = _frame_cache_root(frame_cache_dir)
+                cdir = tempfile.mkdtemp(prefix="lidarstudio_frames_", dir=root)
+                atexit.register(shutil.rmtree, cdir, ignore_errors=True)
+                mm_path = os.path.join(cdir, "frames.u8")
+                mm_file = open(mm_path, "wb", buffering=1 << 20)
+                print(
+                    f"  frame cache: disk memmap at {cdir} "
+                    f"({int(np.prod(mm_shape)) / 1e6:.0f} MB/frame → host RAM stays flat)",
+                    flush=True,
+                )
+            if rgb.shape != mm_shape:
+                raise RuntimeError(
+                    f"frame shape {rgb.shape} != {mm_shape}; the memmap cache "
+                    "requires uniform frame sizes"
+                )
+            np.ascontiguousarray(rgb).tofile(mm_file)
+            frame = {"idx": mm_count, "K": K.astype(np.float64), "viewmat": viewmat}
+            mm_count += 1
+        else:
+            frame = {"image": rgb, "K": K.astype(np.float64), "viewmat": viewmat}
         if mask_box is not None and bag_i >= mask_from and undistort:
             frame["mask_png"] = _dynamic_mask_png(
                 img, K, viewmat, mask_box, mask_canon_pts
@@ -359,6 +417,15 @@ def build_camera_frames(
             flush=True,
         )
         frames = kept
+    if memmap_frames and mm_file is not None:
+        # Close the writer and re-open read-only; hand each surviving frame a
+        # memmap view (dropped frames keep their slot on disk but are never read).
+        mm_file.close()
+        mm = np.memmap(
+            mm_path, dtype=np.uint8, mode="r", shape=(mm_count, *mm_shape)
+        )
+        for f in frames:
+            f["image"] = mm[f.pop("idx")]
     n_masked = sum(1 for f in frames if f.get("mask_png") is not None)
     if n_masked:
         print(
@@ -413,9 +480,8 @@ def pca_surfel_frame(
 
     Returns (log_scales Nx3, quats_wxyz Nx4): two in-plane axes sized to the local
     point spacing and a thin normal axis (``flatten``×), oriented by the surface
-    tangent plane. This is the same surface-fitting that ``surfel_splat_from_ply``
-    does — factored out so trained splats can *seed* anisotropy from the (accurate)
-    LiDAR geometry instead of trying to learn it from inconsistent fisheye photos.
+    tangent plane. Lets trained splats *seed* anisotropy from the (accurate) LiDAR
+    geometry instead of trying to learn it from inconsistent fisheye photos.
     """
     import numpy as np
     from scipy.spatial import cKDTree
@@ -603,7 +669,7 @@ def train_splat(
     cap_max: int = 3_000_000,
     init_opacity: float = 0.5,
     appearance: bool = True,
-    opacity_reg: float = 0.004,
+    opacity_reg: float = 2e-5,  # campaign champion (near-zero); 0.004 induced mush
     scale_reg: float = 0.01,
     min_opacity: float = 0.005,
     flat_reg: float = 0.0,
@@ -613,6 +679,8 @@ def train_splat(
     pose_opt_lr: float = 1e-2,
     pose_warmup: int = 300,
     pose_reg: float = 1e-3,
+    patch_size: int = 0,
+    densify_strategy: str = "mcmc",
 ):
     import cv2
     import numpy as np
@@ -682,7 +750,28 @@ def train_splat(
 
     strategy = None
     strategy_state = None
-    if densify:
+    if densify and densify_strategy == "default":
+        # Original 3DGS Adaptive Density Control: gradient-driven clone (small
+        # Gaussians in under-reconstructed regions) / split (large ones) at
+        # grad2d 2e-4, with a periodic opacity reset and no fixed cap. Targets
+        # exactly the soft, high-residual regions (e.g. the near-field arm) that
+        # MCMC's capped relocation can starve. Pair with --opacity-reg 0 (this
+        # strategy resets opacity itself, so a persistent penalty fights it).
+        from gsplat.strategy import DefaultStrategy
+
+        strategy = DefaultStrategy(
+            prune_opa=min_opacity,
+            grow_grad2d=0.0002,
+            grow_scale3d=0.01,
+            refine_start_iter=max(100, iters // 60),
+            refine_stop_iter=int(iters * 0.5),
+            reset_every=3000,
+            refine_every=100,
+            verbose=False,
+        )
+        strategy.check_sanity(params, optimizers)
+        strategy_state = strategy.initialize_state()
+    elif densify:
         # noise_lr well below the 5e5 default: the seeds are already on-surface
         # from LiDAR, so we want gentle teleport/growth, not heavy position noise
         # that scrambles the geometry (which flat-lined the fit in testing).
@@ -743,7 +832,19 @@ def train_splat(
         flush=True,
     )
 
-    def render(p, f, sh_deg, W, H, viewmat):
+    def render(p, f, sh_deg, viewmat, y0=0, x0=0, ch=None, cw=None):
+        # Render a crop [y0:y0+ch, x0:x0+cw] of the frame (default = full frame).
+        # Rendering only the crop is what makes VRAM independent of the source
+        # resolution: shift the principal point into the crop and shrink the
+        # raster to the crop size (gaussians outside are culled).
+        H0, W0 = f["image"].shape[:2]
+        ch = H0 if ch is None else ch
+        cw = W0 if cw is None else cw
+        K = f["K_t"]
+        if x0 or y0:
+            K = K.clone()
+            K[0, 2] -= x0
+            K[1, 2] -= y0
         cam = (
             {"camera_model": "pinhole"}
             if pinhole
@@ -760,9 +861,9 @@ def train_splat(
             opacities=torch.sigmoid(p["opacities"]),
             colors=torch.cat([p["sh0"], p["shN"]], dim=1),
             viewmats=viewmat[None],
-            Ks=f["K_t"][None],
-            width=W,
-            height=H,
+            Ks=K[None],
+            width=cw,
+            height=ch,
             sh_degree=sh_deg,
             packed=True,
             **cam,
@@ -780,8 +881,28 @@ def train_splat(
     # converted each step (~10 MB — negligible next to the render). Pre-pinning
     # float32 copies of every frame doubled a tens-of-GB cache and OOM-killed
     # the host at downscale 2.
-    def frame_gt(f):
-        return torch.from_numpy(f["image"]).to(device).float().div_(255.0)
+    def frame_gt(f, y0=0, x0=0, ch=None, cw=None):
+        img = f["image"]
+        if ch is not None:
+            img = np.ascontiguousarray(img[y0 : y0 + ch, x0 : x0 + cw])
+        return torch.from_numpy(img).to(device).float().div_(255.0)
+
+    def pick_crop(H, W, centre=False):
+        """A (y0, x0, ch, cw) render window. When ``patch_size`` is set and the
+        frame exceeds it, return a random (or centre, for eval) patch; otherwise
+        the full frame — so smaller frames are unchanged and patching is opt-in."""
+        if patch_size and (W > patch_size or H > patch_size):
+            ch = min(patch_size, H)
+            cw = min(patch_size, W)
+            if centre:
+                return (H - ch) // 2, (W - cw) // 2, ch, cw
+            return (
+                int(rng.integers(0, H - ch + 1)),
+                int(rng.integers(0, W - cw + 1)),
+                ch,
+                cw,
+            )
+        return 0, 0, H, W
 
     for f in frames:
         f["K_t"] = torch.tensor(f["K"], dtype=torch.float32, device=device)
@@ -802,10 +923,11 @@ def train_splat(
         f = frames[fi]
         cur += 1
         H, W = f["image"].shape[:2]
+        y0, x0, ch, cw = pick_crop(H, W)
         sh_deg = min(sh_degree, step // sh_increase_every)
         use_pose = pose_opt and step >= pose_warmup
         viewmat = frame_viewmat(fi, f, step)
-        renders, alphas, info = render(params, f, sh_deg, W, H, viewmat)
+        renders, alphas, info = render(params, f, sh_deg, viewmat, y0, x0, ch, cw)
         if strategy is not None:
             strategy.step_pre_backward(params, optimizers, strategy_state, step, info)
         pred = renders[0]
@@ -813,15 +935,21 @@ def train_splat(
             assert app_gain is not None and app_bias is not None
             pred = pred * app_gain[fi] + app_bias[fi]
         pred = pred.clamp(0, 1)
-        gt = frame_gt(f)
+        gt = frame_gt(f, y0, x0, ch, cw)
         if f.get("mask_png") is not None:
             # Dynamic-object mask: inside the masked region the GT is replaced
             # by the (detached) render, so both L1 and SSIM gradients vanish
             # there — the moved object teaches nothing, the rest of the frame
-            # trains normally.
-            m = cv2.imdecode(f["mask_png"], cv2.IMREAD_GRAYSCALE)
+            # trains normally. Crop the mask to the same window as the render.
+            m = cv2.imdecode(f["mask_png"], cv2.IMREAD_GRAYSCALE)[
+                y0 : y0 + ch, x0 : x0 + cw
+            ]
             m_t = (
-                torch.from_numpy(m).to(device).float().div_(255.0).unsqueeze(-1)
+                torch.from_numpy(np.ascontiguousarray(m))
+                .to(device)
+                .float()
+                .div_(255.0)
+                .unsqueeze(-1)
             )
             gt = gt * m_t + pred.detach() * (1.0 - m_t)
         l1 = (pred - gt).abs().mean()
@@ -887,10 +1015,23 @@ def train_splat(
             params["scales"].clamp_(min=scale_floor, max=scale_clamp)
             smax = params["scales"].max(dim=1, keepdim=True).values
             params["scales"].clamp_(min=smax - max_aniso_log)
-        if strategy is not None:  # teleport / grow Gaussians (gradient-free)
-            strategy.step_post_backward(
-                params, optimizers, strategy_state, step, info, lr=means_lr
-            )
+        if strategy is not None:  # grow / relocate Gaussians
+            if densify_strategy == "default":
+                strategy.step_post_backward(
+                    params, optimizers, strategy_state, step, info, packed=True
+                )
+            else:
+                strategy.step_post_backward(
+                    params, optimizers, strategy_state, step, info, lr=means_lr
+                )
+        # Periodic defrag: packed rasterisation allocates variable-size
+        # intersection buffers each step, so on a full cap (6M) run the CUDA heap
+        # fragments over thousands of steps until a large alloc fails mid-training
+        # even with headroom (observed: OOM ~step 10k on a 24 GB card). Returning
+        # cached-but-free blocks to the driver here lets the next big alloc find a
+        # contiguous span. Off the fast path (every 500 steps → negligible cost).
+        if step and step % 500 == 0:
+            torch.cuda.empty_cache()
         if step % 100 == 0:
             with torch.no_grad():
                 op_med = float(torch.sigmoid(params["opacities"]).median())
@@ -921,13 +1062,16 @@ def train_splat(
         for fi in range(0, len(frames), max(1, len(frames) // 20)):
             f = frames[fi]
             H, W = f["image"].shape[:2]
+            # Same crop policy as training (centre patch) so the eval render can't
+            # OOM at full resolution after a memory-frugal patched run.
+            y0, x0, ch, cw = pick_crop(H, W, centre=True)
             vm = frame_viewmat(fi, f, iters)  # with the learned pose delta
-            out, _, _ = render(params, f, sh_degree, W, H, vm)
+            out, _, _ = render(params, f, sh_degree, vm, y0, x0, ch, cw)
             pred = out[0]
             if appearance:
                 assert app_gain is not None and app_bias is not None
                 pred = pred * app_gain[fi] + app_bias[fi]
-            mse = (pred.clamp(0, 1) - frame_gt(f)).pow(2).mean()
+            mse = (pred.clamp(0, 1) - frame_gt(f, y0, x0, ch, cw)).pow(2).mean()
             tot += float(10 * torch.log10(1.0 / mse))
             n += 1
         print(f"  train-view PSNR (mean over {n} frames): {tot / n:.2f} dB", flush=True)
@@ -943,189 +1087,6 @@ def train_splat(
     print(f"Saved: {out_path} ({params['means'].shape[0]:,} gaussians)", flush=True)
 
 
-# ── CPU fallback: bootstrap one Gaussian per point ───────────────────
-
-
-def bootstrap_splat_from_ply(input_ply: Path, output_ply: Path, size: float = 0.05):
-    """Unoptimised splat: each coloured point → one isotropic Gaussian (no GPU).
-
-    ``size`` is the Gaussian radius (std-dev) in metres for every splat. Smaller
-    values give finer splats instead of large blobs (the field stores log-scale)."""
-    import numpy as np
-
-    progress(10, f"Bootstrap (no training, size={size} m) from {input_ply.name}…")
-    pts, rgb = load_coloured_ply(input_ply)
-    n = len(pts)
-    dc = rgb_to_sh(rgb).astype(np.float32)
-    scale = np.full((n, 3), float(np.log(max(size, 1e-4))), np.float32)
-    rot = np.zeros((n, 4), np.float32)
-    rot[:, 0] = 1.0
-    opac = np.full((n, 1), 2.197, np.float32)
-    header = (
-        "ply\nformat binary_little_endian 1.0\n"
-        f"element vertex {n}\n"
-        + "".join(
-            f"property float {p}\n"
-            for p in [
-                "x",
-                "y",
-                "z",
-                "nx",
-                "ny",
-                "nz",
-                "f_dc_0",
-                "f_dc_1",
-                "f_dc_2",
-                "opacity",
-                "scale_0",
-                "scale_1",
-                "scale_2",
-                "rot_0",
-                "rot_1",
-                "rot_2",
-                "rot_3",
-            ]
-        )
-        + "end_header\n"
-    )
-    data = np.concatenate(
-        [pts, np.zeros((n, 3), np.float32), dc, opac, scale, rot], axis=1
-    ).astype(np.float32)
-    output_ply.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_ply, "wb") as fh:
-        fh.write(header.encode())
-        fh.write(data.tobytes())
-    print(f"Saved (bootstrap): {output_ply}", flush=True)
-    progress(100, "Complete (bootstrap — no GPU training)!")
-
-
-# ── Surfel splat: one anisotropic surface-aligned disc per point ─────
-
-
-def surfel_splat_from_ply(
-    input_ply: Path,
-    output_ply: Path,
-    k: int = 12,
-    radius_factor: float = 0.6,
-    flatten: float = 0.2,
-    opacity: float = 0.9,
-    sor_std: float = 2.0,
-):
-    """Turn the coloured cloud into 3DMakerpro-style surfels (no GPU/training).
-
-    Each point becomes a small Gaussian *disc* lying in the local surface: we
-    PCA the ``k`` nearest neighbours, orient the disc in the tangent plane and
-    squash it along the surface normal.  Disc radius tracks the local point
-    spacing so the discs tile the surface without blobbing.  This is what makes
-    the splat look photoreal (tiny, anisotropic, surface-aligned) rather than a
-    field of fat isotropic balls.
-
-    Two guards keep it from turning into a "snowstorm" of spikes on noisy clouds:
-    statistical outlier removal drops floater points, and the disc radius is
-    capped so a sparse/isolated point can't spawn one giant edge-on spike.
-    """
-    import numpy as np
-    from scipy.spatial import cKDTree
-    from scipy.spatial.transform import Rotation
-
-    progress(10, f"Surfel splat from {input_ply.name}…")
-    pts, rgb = load_coloured_ply(input_ply)
-
-    coloured = rgb.sum(1) > 0.02  # drop unseen (black) points
-    pts, rgb = pts[coloured], rgb[coloured]
-    print(f"  {len(pts):,} coloured points", flush=True)
-
-    progress(30, "Estimating local surface (kNN PCA)…")
-    tree = cKDTree(pts)
-    d, idx = tree.query(pts, k=k + 1, workers=-1)  # (n,k+1) incl. self
-
-    # Statistical outlier removal: drop points whose mean neighbour distance is
-    # far above the global mean — these are the floaters that read as fuzz.
-    mdist = d[:, 1:].mean(1)
-    keep = mdist < (mdist.mean() + sor_std * mdist.std())
-    if not keep.all():
-        print(
-            f"  outlier removal: dropped {int((~keep).sum()):,}"
-            f" / {len(pts):,} floaters",
-            flush=True,
-        )
-        pts, rgb, idx, d = pts[keep], rgb[keep], idx[keep], d[keep]
-    n = len(pts)
-    # idx still references the pre-filter array, so PCA reads original neighbours.
-    nn = np.clip(d[:, 1], 1e-4, None)  # nearest-neighbour dist
-
-    nbr_src = tree.data  # full point set for neighbour lookup
-    nbr = nbr_src[idx[:, 1:]]  # (n,k,3)
-    cen = nbr - nbr.mean(1, keepdims=True)
-    cov = np.einsum("nki,nkj->nij", cen, cen) / k  # (n,3,3) covariance
-    evals, evecs = np.linalg.eigh(cov)  # ascending; evecs cols
-    # Smallest-variance axis = normal; the other two span the tangent plane.
-    R = np.stack(
-        [evecs[:, :, 2], evecs[:, :, 1], evecs[:, :, 0]], axis=2
-    )  # cols [t1,t2,n]
-    det = np.linalg.det(R)
-    R[det < 0, :, 2] *= -1.0  # keep right-handed (proper rotation)
-
-    quat_xyzw = Rotation.from_matrix(R).as_quat()  # [x,y,z,w]
-    quats = np.column_stack([quat_xyzw[:, 3], quat_xyzw[:, :3]]).astype(
-        np.float32
-    )  # [w,x,y,z]
-
-    # In-plane radius ~ local spacing, but capped at 3× the median so sparse
-    # points don't become giant spikes (the dominant snowstorm cause).
-    r_in = nn * radius_factor
-    cap = float(np.median(r_in)) * 3.0
-    r_in = np.minimum(r_in, cap)
-    s_in = np.log(np.clip(r_in, 1e-4, None))
-    s_nrm = np.log(np.clip(r_in * flatten, 1e-5, None))  # squash along normal
-    scale = np.stack([s_in, s_in, s_nrm], axis=1).astype(np.float32)
-
-    dc = rgb_to_sh(rgb).astype(np.float32)
-    opac = np.full((n, 1), float(np.log(opacity / (1 - opacity))), np.float32)
-    print(
-        f"  {n:,} surfels; disc radius median {np.median(r_in) * 1000:.1f} mm "
-        f"(cap {cap * 1000:.1f} mm), flatten {flatten:g}, aniso {1 / flatten:.0f}:1",
-        flush=True,
-    )
-
-    progress(80, f"Writing {n:,} surfels…")
-    header = (
-        "ply\nformat binary_little_endian 1.0\n"
-        f"element vertex {n}\n"
-        + "".join(
-            f"property float {p}\n"
-            for p in [
-                "x",
-                "y",
-                "z",
-                "nx",
-                "ny",
-                "nz",
-                "f_dc_0",
-                "f_dc_1",
-                "f_dc_2",
-                "opacity",
-                "scale_0",
-                "scale_1",
-                "scale_2",
-                "rot_0",
-                "rot_1",
-                "rot_2",
-                "rot_3",
-            ]
-        )
-        + "end_header\n"
-    )
-    normals = R[:, :, 2].astype(np.float32)  # write the real surface normal
-    data = np.concatenate([pts, normals, dc, opac, scale, quats], axis=1).astype(
-        np.float32
-    )
-    output_ply.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_ply, "wb") as fh:
-        fh.write(header.encode())
-        fh.write(data.tobytes())
-    print(f"Saved (surfel): {output_ply}", flush=True)
-    progress(100, "Complete (surfel — no GPU training)!")
 
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -1153,6 +1114,15 @@ def main():
         action="store_false",
         default=True,
         help="disable MCMC densification (refine-only — the old behaviour)",
+    )
+    p.add_argument(
+        "--densify-strategy",
+        choices=["mcmc", "default"],
+        default="mcmc",
+        help="densification scheme: 'mcmc' = fixed-cap MCMC relocation (our "
+        "default); 'default' = original 3DGS Adaptive Density Control (gradient "
+        "clone/split at grad2d 2e-4, opacity reset every 3000, no cap). Use "
+        "--opacity-reg 0 with 'default'.",
     )
     p.add_argument(
         "--cap-max",
@@ -1195,6 +1165,29 @@ def main():
         default=0.1,
         help="weight pushing gaussians toward flat surface discs "
         "(penalises min/max axis ratio; 0 = off; 0.1 = campaign champion)",
+    )
+    p.add_argument(
+        "--memmap-frames",
+        action="store_true",
+        help="stream undistorted frames to an on-disk memmap instead of holding "
+        "them all in host RAM — keeps RSS flat regardless of resolution × frame "
+        "count (essential for downscale-1 / high undistort-scale, where the RAM "
+        "cache can exceed host memory).",
+    )
+    p.add_argument(
+        "--frame-cache-dir",
+        default=None,
+        help="directory for the --memmap-frames cache (default: auto-pick a real "
+        "disk with the most free space; honours $LIDARSTUDIO_FRAME_CACHE).",
+    )
+    p.add_argument(
+        "--patch-size",
+        type=int,
+        default=0,
+        help="train (and eval) on random NxN-pixel crops instead of whole "
+        "frames; 0 = full frame. Decouples GPU memory from image resolution — a "
+        "1600 patch of a 4800×6400 frame cuts render VRAM ~9× at equivalent "
+        "quality, so downscale-1 / high-cap runs fit on smaller cards.",
     )
     p.add_argument(
         "--min-scale",
@@ -1301,35 +1294,6 @@ def main():
         default=True,
         help="don't auto-seed from a sibling *_dense.ply if present",
     )
-    p.add_argument(
-        "--splat-size",
-        type=float,
-        default=0.05,
-        help="bootstrap Gaussian radius (m) — smaller = finer splats, less blobby",
-    )
-    p.add_argument(
-        "--bootstrap",
-        action="store_true",
-        help="skip GPU training; one isotropic Gaussian per point (CPU)",
-    )
-    p.add_argument(
-        "--surfel",
-        action="store_true",
-        help="skip GPU training; one anisotropic surface-aligned disc "
-        "per point (CPU). Best match to 3DMakerpro on a dense cloud.",
-    )
-    p.add_argument(
-        "--surfel-flatten",
-        type=float,
-        default=0.2,
-        help="surfel thickness as a fraction of disc radius (smaller = flatter)",
-    )
-    p.add_argument(
-        "--surfel-sor",
-        type=float,
-        default=2.0,
-        help="outlier removal strength (σ); lower = drop more floaters",
-    )
     args = p.parse_args()
 
     scan = Path(args.scan)
@@ -1347,43 +1311,26 @@ def main():
 
     traj_path = Path(str(pc) + ".traj.npz")
 
-    # Surfel mode short-circuits everything: a fast CPU anisotropic-disc splat
-    # straight from the coloured cloud (no poses/GPU needed).
-    if args.surfel:
-        surfel_splat_from_ply(
-            pc, out, flatten=args.surfel_flatten, sor_std=args.surfel_sor
+    # GPU training needs the KISS-ICP trajectory sidecar + CUDA. Fail loudly
+    # rather than emit a low-value CPU splat when either is missing.
+    if not traj_path.exists():
+        print(
+            f"ERROR: no trajectory sidecar ({traj_path.name}) — GPU training needs "
+            "it. Regenerate the point cloud, re-run the edit (edits carry the "
+            "trajectory), or pick a generated cloud as the seed.",
+            flush=True,
         )
-        return
+        sys.exit(1)
+    ensure_cuda_home()
+    try:
+        import torch
 
-    # Decide path: real GPU training when we have a trajectory + CUDA, else bootstrap.
-    can_train = traj_path.exists() and not args.bootstrap
-    if can_train:
-        ensure_cuda_home()
-        try:
-            import torch
-
-            if not torch.cuda.is_available():
-                print(
-                    "  No CUDA GPU available — falling back to CPU bootstrap.",
-                    flush=True,
-                )
-                can_train = False
-        except ImportError:
-            print(
-                "  torch/gsplat not installed — falling back to CPU bootstrap.",
-                flush=True,
-            )
-            can_train = False
-
-    if not can_train:
-        if not traj_path.exists():
-            print(
-                f"  No trajectory sidecar ({traj_path.name}) — bootstrap only. "
-                "Regenerate the point cloud to enable trained splats.",
-                flush=True,
-            )
-        bootstrap_splat_from_ply(pc, out, size=args.splat_size)
-        return
+        if not torch.cuda.is_available():
+            print("ERROR: no CUDA GPU available — splat training needs one.", flush=True)
+            sys.exit(1)
+    except ImportError:
+        print("ERROR: torch/gsplat not installed — splat training needs them.", flush=True)
+        sys.exit(1)
 
     # Prefer a denser sibling cloud for the seed (e.g. *_dense.ply): 3DMakerpro's
     # reference splat is ~3.4M gaussians, and a richer seed → far more detail.
@@ -1430,6 +1377,8 @@ def main():
         mask_box=mask_box,
         mask_from=args.mask_from,
         mask_canon_pts=mask_canon,
+        memmap_frames=args.memmap_frames,
+        frame_cache_dir=args.frame_cache_dir,
     )
     print(
         f"  {len(frames)} posed frames @ {frames[0]['image'].shape[1]}×"
@@ -1437,31 +1386,53 @@ def main():
         flush=True,
     )
     progress(10, f"Training {args.iterations}-iter splat on GPU…")
-    train_splat(
-        frames,
-        pts,
-        rgb,
-        out,
-        args.iterations,
-        args.sh_degree,
-        args.ssim_lambda,
-        args.max_init_points,
-        args.crop_to_init,
-        args.crop_margin,
-        densify=args.densify,
-        cap_max=args.cap_max,
-        init_opacity=args.init_opacity,
-        opacity_reg=args.opacity_reg,
-        scale_reg=args.scale_reg,
-        min_opacity=args.min_opacity,
-        flat_reg=args.flat_reg,
-        min_scale=args.min_scale,
-        appearance=args.appearance,
-        pose_opt=args.pose_opt,
-        pose_opt_lr=args.pose_opt_lr,
-        pose_warmup=args.pose_warmup,
-        pose_reg=args.pose_reg,
-    )
+    try:
+        train_splat(
+            frames,
+            pts,
+            rgb,
+            out,
+            args.iterations,
+            args.sh_degree,
+            args.ssim_lambda,
+            args.max_init_points,
+            args.crop_to_init,
+            args.crop_margin,
+            densify=args.densify,
+            cap_max=args.cap_max,
+            init_opacity=args.init_opacity,
+            opacity_reg=args.opacity_reg,
+            scale_reg=args.scale_reg,
+            min_opacity=args.min_opacity,
+            flat_reg=args.flat_reg,
+            min_scale=args.min_scale,
+            appearance=args.appearance,
+            pose_opt=args.pose_opt,
+            pose_opt_lr=args.pose_opt_lr,
+            pose_warmup=args.pose_warmup,
+            pose_reg=args.pose_reg,
+            patch_size=args.patch_size,
+            densify_strategy=args.densify_strategy,
+        )
+    except RuntimeError as exc:
+        # Turn a CUDA OOM traceback into one actionable line (the server surfaces
+        # ``ERROR:`` lines to the UI); other RuntimeErrors keep their traceback.
+        if "out of memory" not in str(exc).lower():
+            raise
+        try:
+            import torch
+
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        print(
+            f"ERROR: GPU ran out of memory at {frames[0]['image'].shape[1]}×"
+            f"{frames[0]['image'].shape[0]}, {args.cap_max // 1_000_000}M splats. "
+            "Lower the quality — set downscale to 2, reduce max splats (e.g. 3M), "
+            "or lower sharpen× — then retry.",
+            flush=True,
+        )
+        sys.exit(1)
     progress(100, "Complete!")
 
 

@@ -8,6 +8,8 @@ the splat's per-gaussian attributes (scale/rotation/opacity/SH) survive untouche
 
 from __future__ import annotations
 
+import re
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -135,6 +137,11 @@ def apply_edit(in_path, out_path, op, params):
     else:
         cloud_ops.save(cloud_ops.select(pcd, keep), str(out_path))
 
+    # Frame-preserving edit → keep the result trainable (bake/transform returned
+    # earlier, before this point, so its new frame is correctly excluded).
+    if kind != "splat":
+        _copy_traj(in_path, out_path)
+
     return {
         "kind": kind,
         "total": int(n),
@@ -145,16 +152,28 @@ def apply_edit(in_path, out_path, op, params):
 
 
 def _find_traj(path):
-    """Locate the trajectory sidecar for a cloud/splat (handles _edited names)."""
+    """Locate the trajectory sidecar for a cloud/splat, resolving chained and
+    numbered ``_edited`` / ``_recoloured`` names back to the base cloud (e.g.
+    ``pointcloud_x_edited3.ply`` → ``pointcloud_x.ply.traj.npz``)."""
     p = Path(path)
-    base = p.stem
-    for suf in ("_edited", "_recoloured"):
-        if base.endswith(suf):
-            base = base[: -len(suf)]
+    base = re.sub(r"(_(?:edited|recoloured)\d*)+$", "", p.stem)
     for cand in (Path(str(p) + ".traj.npz"), p.with_name(base + ".ply.traj.npz")):
         if cand.exists():
             return cand
     return None
+
+
+def _copy_traj(in_path, out_path):
+    """Carry the trajectory sidecar onto an edited/recoloured output so the
+    result stays trainable: a crop/decimate/denoise/recolour keeps the cloud in
+    the same world frame, so the KISS-ICP camera path still applies. Bake /
+    transform edits change the frame and must NOT call this."""
+    src = _find_traj(in_path)
+    if src is None:
+        return
+    dst = Path(str(out_path) + ".traj.npz")
+    if src.resolve() != dst.resolve():
+        shutil.copy2(src, dst)
 
 
 def recolour(
@@ -208,6 +227,8 @@ def recolour(
         save_splat(out_path, data)
     else:
         ppc.write_ply(Path(out_path), pts, rgb)
+        # Recolour is frame-preserving → keep the recoloured cloud trainable.
+        _copy_traj(in_path, out_path)
 
     return {
         "kind": kind,
