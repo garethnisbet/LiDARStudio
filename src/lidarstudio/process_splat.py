@@ -669,7 +669,7 @@ def train_splat(
     cap_max: int = 3_000_000,
     init_opacity: float = 0.5,
     appearance: bool = True,
-    opacity_reg: float = 2e-5,  # campaign champion (near-zero); 0.004 induced mush
+    opacity_reg: float = 1e-4,  # holds opacity ~0.13, prevents footprint-bloat OOM
     scale_reg: float = 0.01,
     min_opacity: float = 0.005,
     flat_reg: float = 0.0,
@@ -822,7 +822,15 @@ def train_splat(
     # needle crash the floor guarded against (aniso ~300:1 blew up gsplat's tile
     # intersection) is handled by the per-gaussian anisotropy cap below instead.
     scale_floor = float(np.log(min_scale / norm))
-    max_aniso_log = float(np.log(100.0))  # cap s_max/s_min at 100:1
+    # Cap s_max/s_min. 100:1 was too loose: the optimiser drives the median
+    # ratio to the ceiling (a field of maximal needles, aniso~100), and at
+    # downscale-1 / 6M those needles project to enormous footprints that blow
+    # gsplat's packed tile-intersection buffer — OOMing even a 512 px patch
+    # mid-run. The flat-surfel target is 3DMakerpro's ~0.11 min/max ratio (≈9:1),
+    # so
+    # 20:1 leaves generous headroom for genuinely thin structure while keeping
+    # per-gaussian footprints (and VRAM) bounded for the whole run.
+    max_aniso_log = float(np.log(20.0))  # cap s_max/s_min at 20:1
     sh_increase_every = max(1, round(1000 * iters / 30_000))
 
     # Undistorted frames render as pinhole; legacy fisheye frames carry "radial".
@@ -887,13 +895,23 @@ def train_splat(
             img = np.ascontiguousarray(img[y0 : y0 + ch, x0 : x0 + cw])
         return torch.from_numpy(img).to(device).float().div_(255.0)
 
+    # Effective render-patch cap. Starts at the requested --patch-size but
+    # auto-shrinks if a training step hits a CUDA OOM (huge frames + a full 6M
+    # cap + needle-anisotropy can blow the packed rasteriser's intersection
+    # buffer even with patching + periodic empty_cache). Shrinking in-place keeps
+    # a long run alive instead of throwing away thousands of steps.
+    MIN_PATCH = 512
+    eff_patch = [patch_size]
+
     def pick_crop(H, W, centre=False):
-        """A (y0, x0, ch, cw) render window. When ``patch_size`` is set and the
-        frame exceeds it, return a random (or centre, for eval) patch; otherwise
-        the full frame — so smaller frames are unchanged and patching is opt-in."""
-        if patch_size and (W > patch_size or H > patch_size):
-            ch = min(patch_size, H)
-            cw = min(patch_size, W)
+        """A (y0, x0, ch, cw) render window. When the effective patch cap is set
+        and the frame exceeds it, return a random (or centre, for eval) patch;
+        otherwise the full frame — so smaller frames are unchanged and patching
+        is opt-in."""
+        ps = eff_patch[0]
+        if ps and (W > ps or H > ps):
+            ch = min(ps, H)
+            cw = min(ps, W)
             if centre:
                 return (H - ch) // 2, (W - cw) // 2, ch, cw
             return (
@@ -915,13 +933,11 @@ def train_splat(
     rng = np.random.default_rng(0)
     order = rng.permutation(len(frames))
     cur = 0
-    for step in range(iters):
-        if cur >= len(order):
-            order = rng.permutation(len(frames))
-            cur = 0
-        fi = int(order[cur])
-        f = frames[fi]
-        cur += 1
+    def run_step(step, fi, f):
+        """One optimiser step for frame ``fi``. Returns the loss tensor, or None
+        when the step was skipped (non-finite loss). May raise a CUDA out-of-
+        memory RuntimeError, which the caller recovers from by shrinking the
+        render patch instead of aborting the whole run."""
         H, W = f["image"].shape[:2]
         y0, x0, ch, cw = pick_crop(H, W)
         sh_deg = min(sh_degree, step // sh_increase_every)
@@ -993,7 +1009,7 @@ def train_splat(
             if pose_opt_optimizer is not None:
                 pose_opt_optimizer.zero_grad(set_to_none=True)
             print(f"  step {step}: non-finite loss, skipped", flush=True)
-            continue
+            return None
         loss.backward()
         for opt in optimizers.values():
             opt.step()
@@ -1024,6 +1040,57 @@ def train_splat(
                 strategy.step_post_backward(
                     params, optimizers, strategy_state, step, info, lr=means_lr
                 )
+        return loss
+
+    def zero_all_grads():
+        for opt in optimizers.values():
+            opt.zero_grad(set_to_none=True)
+        if app_opt is not None:
+            app_opt.zero_grad(set_to_none=True)
+        if pose_opt_optimizer is not None:
+            pose_opt_optimizer.zero_grad(set_to_none=True)
+
+    for step in range(iters):
+        if cur >= len(order):
+            order = rng.permutation(len(frames))
+            cur = 0
+        fi = int(order[cur])
+        f = frames[fi]
+        cur += 1
+        try:
+            loss = run_step(step, fi, f)
+        except RuntimeError as exc:
+            # Recover from a mid-training CUDA OOM rather than throwing away the
+            # thousands of steps already trained: drop the half-built step, free
+            # the cache, and permanently shrink the render patch so later steps
+            # fit. Only give up once we're already at the smallest patch.
+            if "out of memory" not in str(exc).lower():
+                raise
+            # Drop the traceback BEFORE freeing: exc.__traceback__ pins
+            # run_step's frame, which pins every tensor from the step that blew
+            # up (render output + the half-built autograd graph). empty_cache()
+            # reclaims nothing while those are alive, so the retry starts on a
+            # still-full heap and re-OOMs immediately. Clear the frames first.
+            exc = exc.with_traceback(None)
+            del exc
+            zero_all_grads()
+            import gc
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            H, W = f["image"].shape[:2]
+            base = eff_patch[0] or max(H, W)
+            if base <= MIN_PATCH:
+                raise  # already at the floor and still OOM — nothing left to trade
+            eff_patch[0] = max(MIN_PATCH, base // 2)
+            print(
+                f"  step {step}: CUDA out of memory — shrinking render patch "
+                f"{base}px → {eff_patch[0]}px and continuing",
+                flush=True,
+            )
+            continue
+        if loss is None:  # non-finite step, already zeroed
+            continue
         # Periodic defrag: packed rasterisation allocates variable-size
         # intersection buffers each step, so on a full cap (6M) run the CUDA heap
         # fragments over thousands of steps until a large alloc fails mid-training
@@ -1037,6 +1104,22 @@ def train_splat(
                 op_med = float(torch.sigmoid(params["opacities"]).median())
                 sw = torch.exp(params["scales"])
                 aniso = float((sw.amax(1) / sw.amin(1).clamp_min(1e-9)).median())
+                # World-metre footprint of the largest axis: p50/p99 tell us
+                # whether the packed intersection buffer is creeping because
+                # Gaussians are physically inflating (scale growth) vs. just
+                # covering more of each frame as the splat fills in.
+                smax_m = (sw.amax(1) * norm)
+                fp50 = float(smax_m.median())
+                fp99 = float(torch.quantile(smax_m[:: max(1, smax_m.numel() // 100000)], 0.99))
+            mem_dbg = ""
+            if torch.cuda.is_available():
+                gib = 1024**3
+                mem_dbg = (
+                    f"  mem alloc {torch.cuda.memory_allocated() / gib:.1f}"
+                    f"/resv {torch.cuda.memory_reserved() / gib:.1f}"
+                    f"/peak {torch.cuda.max_memory_allocated() / gib:.1f}G"
+                    f"  fp50/99 {fp50 * 100:.1f}/{fp99 * 100:.1f}cm"
+                )
             pose_dbg = ""
             if pose_opt and pose_delta is not None:
                 with torch.no_grad():
@@ -1047,7 +1130,7 @@ def train_splat(
             print(
                 f"  step {step:6d}  loss {loss.item():.4f}  "
                 f"gaussians {params['means'].shape[0]:,}  "
-                f"opacity~{op_med:.2f}  aniso~{aniso:.1f}{pose_dbg}",
+                f"opacity~{op_med:.2f}  aniso~{aniso:.1f}{pose_dbg}{mem_dbg}",
                 flush=True,
             )
             print(f"PROGRESS {step + 1}/{iters}", flush=True)
@@ -1139,11 +1222,14 @@ def main():
     p.add_argument(
         "--opacity-reg",
         type=float,
-        default=2e-5,
-        help="weight of the mean-opacity penalty; too high pins most gaussians "
-        "at the MCMC min_opacity floor (transparent mush) — 3DMakerpro's "
-        "profile is median ~0.18. Default is the campaign champion (fog-axis "
-        "ds1_op run); 0.004 was the original mush-inducing value",
+        default=1e-4,
+        help="weight of the mean-opacity penalty. Too high (0.004) pins most "
+        "gaussians at the MCMC min_opacity floor (transparent mush); too low "
+        "(2e-5) lets opacity collapse to ~0.03, and the reconstruction loss then "
+        "inflates the faint gaussians to the scale ceiling (~30 cm), blowing the "
+        "packed rasteriser's intersection buffer → OOM at downscale-1/6M around "
+        "step 8500. 1e-4 holds median opacity ~0.13 and footprints ~1 cm: 6M/ds1/"
+        "30k trains full-frame in ~9 GB and scored 23.03 dB (dense deskew seed).",
     )
     p.add_argument(
         "--scale-reg",
@@ -1194,7 +1280,7 @@ def main():
         type=float,
         default=0.001,
         help="floor for a gaussian's smallest axis, in WORLD metres "
-        "(anisotropy is separately capped at 100:1)",
+        "(anisotropy is separately capped at 20:1)",
     )
     p.add_argument(
         "--no-appearance",

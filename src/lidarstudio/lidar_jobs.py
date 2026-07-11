@@ -36,6 +36,73 @@ jobs: dict = {}
 # ── Native folder picker ───────────────────────────────────────────────────────
 
 
+def _has_display() -> bool:
+    """True if a graphical session is available to open a native dialog on."""
+    if sys.platform != "linux":
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _tk_available() -> bool:
+    """True if tkinter can be imported (the last-resort native dialog backend)."""
+    try:
+        import tkinter  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _desktop_browse_folder(title: str, initial: str) -> tuple[bool, str | None]:
+    """Open the desktop's own folder picker via zenity (GTK) or kdialog (KDE).
+
+    These render the modern system file navigator that matches the user's
+    desktop, unlike tkinter's dated Motif-style chooser. Returns
+    ``(handled, path)``: ``handled`` is True when such a tool ran to a definite
+    answer (``path`` = the choice, or None if cancelled), and False when no tool
+    is installed so the caller should fall back to tkinter. This split keeps a
+    cancelled zenity dialog from immediately popping a second tkinter dialog.
+    """
+    start = (initial or os.path.expanduser("~")).rstrip("/") or "/"
+
+    zenity = shutil.which("zenity") or shutil.which("qarma")
+    if zenity:
+        try:
+            out = subprocess.run(
+                [zenity, "--file-selection", "--directory",
+                 f"--title={title}", f"--filename={start}/"],
+                capture_output=True, text=True, timeout=300,
+            )
+            # 0 = selected, 1 = cancelled; both are definitive answers.
+            if out.returncode in (0, 1):
+                return True, (out.stdout.strip() or None)
+        except Exception:
+            pass
+
+    kdialog = shutil.which("kdialog")
+    if kdialog:
+        try:
+            out = subprocess.run(
+                [kdialog, "--getexistingdirectory", start, "--title", title],
+                capture_output=True, text=True, timeout=300,
+            )
+            if out.returncode in (0, 1):
+                return True, (out.stdout.strip() or None)
+        except Exception:
+            pass
+
+    return False, None
+
+
+def _native_browse_folder(title: str = "Select Folder", initial: str = "") -> str | None:
+    """Open a native folder picker: the desktop chooser if possible, else tkinter."""
+    if not _has_display():
+        return None  # headless — no display
+    handled, chosen = _desktop_browse_folder(title, initial)
+    if handled:
+        return chosen
+    return _tk_browse_folder(title, initial)
+
+
 def _tk_browse_folder(title: str = "Select Folder", initial: str = "") -> str | None:
     """Open a native folder picker dialog. Returns the chosen path or None."""
     if sys.platform == "linux" and not os.environ.get("DISPLAY"):
@@ -178,20 +245,24 @@ async def browse_handler(request):
     initial = data.get("initial", "")
 
     loop = asyncio.get_event_loop()
-    path = await loop.run_in_executor(None, lambda: _tk_browse_folder(title, initial))
+    path = await loop.run_in_executor(None, lambda: _native_browse_folder(title, initial))
 
     if path is not None:
         return web.json_response({"path": path})
 
-    # Check whether tkinter is available but user cancelled vs. not available
-    try:
-        import tkinter  # noqa: F401
+    # No path came back. Distinguish "the native picker isn't usable here"
+    # (headless server, or no picker tool → the client should fall back to the
+    # in-browser navigator) from "the dialog opened and the user cancelled".
+    native_ok = _has_display() and (
+        bool(shutil.which("zenity") or shutil.which("qarma") or shutil.which("kdialog"))
+        or _tk_available()
+    )
 
+    if native_ok:
         return web.json_response({"path": None, "cancelled": True})
-    except ImportError:
-        return web.json_response(
-            {"path": None, "error": "tkinter not available — type the path manually"}
-        )
+    return web.json_response(
+        {"path": None, "error": "no native picker — use the in-browser navigator"}
+    )
 
 
 async def browse_dir_handler(request):
@@ -399,7 +470,7 @@ async def _stream_proc(proc, queue):
     return proc.returncode, last_error
 
 
-def _pointcloud_cmd(scan, contents, output_file, voxel):
+def _pointcloud_cmd(scan, contents, output_file, voxel, mono=False, keep_self_view=False):
     """Build the process_pointcloud.py argv for a scan."""
     cmd = [
         sys.executable,
@@ -413,6 +484,12 @@ def _pointcloud_cmd(scan, contents, output_file, voxel):
         "--voxel-size",
         str(voxel),
     ]
+    if mono:
+        # Monochromatic: skip photo colouring (much faster), shade by intensity.
+        cmd += ["--mono"]
+    if keep_self_view:
+        # Default removes the scanner's own handle/mount; this keeps it.
+        cmd += ["--keep-self-view"]
     if contents.get("project_parameters"):
         cmd += ["--params", str(scan / "project_parameters.json")]
     if contents.get("calibration"):
@@ -448,7 +525,14 @@ async def _job_pointcloud(project_path, scan_path, options, queue, job=None):
     ts = stem.split("_", 1)[1] if "_" in stem else stem
     output_file = out_dir / f"pointcloud_{ts}.ply"
 
-    cmd = _pointcloud_cmd(scan, contents, output_file, options.get("voxel_size", 0.05))
+    cmd = _pointcloud_cmd(
+        scan,
+        contents,
+        output_file,
+        options.get("voxel_size", 0.05),
+        mono=bool(options.get("mono", False)),
+        keep_self_view=bool(options.get("keep_self_view", False)),
+    )
 
     await queue.put(
         {

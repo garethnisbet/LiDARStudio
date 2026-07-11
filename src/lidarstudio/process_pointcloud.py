@@ -35,6 +35,12 @@ import json
 import sys
 from pathlib import Path
 
+# Sensor-frame box (x1,y1,z1,x2,y2,z2) around the handheld unit's own handle/
+# mount, removed from every sweep by default. Sized to the Vanjee 722z, whose
+# mount cluster sits at ~(0, +0.45, 0) in the sensor frame (empirically the
+# most time-persistent close-range points across all sweeps).
+DEFAULT_SELF_VIEW_BOX = "-0.3,0.3,-0.2,0.3,0.7,0.25"
+
 # ── Dependency check ─────────────────────────────────────────────────
 
 
@@ -137,7 +143,20 @@ def read_lidar_points(bag_path: Path):
                     pt_ts = np.frombuffer(
                         raw[:, tf.offset : tf.offset + sz].tobytes(), dtype=dt
                     ).astype(np.float64)
-            yield timestamp, xyz, pt_ts
+            # Per-point LiDAR intensity/reflectivity, for monochromatic colouring
+            # without the (slow) photo projection. None if the sensor omits it.
+            intensity = None
+            if "intensity" in fields:
+                inf = fields["intensity"]
+                idt = {2: (np.uint8, 1), 7: (np.float32, 4), 8: (np.float64, 8)}.get(
+                    inf.datatype
+                )
+                if idt is not None:
+                    idtype, isz = idt
+                    intensity = np.frombuffer(
+                        raw[:, inf.offset : inf.offset + isz].tobytes(), dtype=idtype
+                    ).astype(np.float64)
+            yield timestamp, xyz, pt_ts, intensity
 
 
 def rotate_to_portrait(img, rot: str):
@@ -803,6 +822,13 @@ def main():
         help="max camera→point distance for multi-view colouring (m)",
     )
     parser.add_argument(
+        "--mono",
+        action="store_true",
+        help="monochromatic: skip the slow multi-view photo colouring and shade "
+        "points by LiDAR intensity (grey if unavailable). Much faster; needs no "
+        "images.",
+    )
+    parser.add_argument(
         "--dynamic-box",
         default=None,
         help="x1,y1,z1,x2,y2,z2 world-space box around an object that moved "
@@ -822,8 +848,14 @@ def main():
         help="x1,y1,z1,x2,y2,z2 SENSOR-frame box around the scanner's own "
         "handle/mount; points inside are dropped from every sweep before the "
         "world transform, so the mount doesn't smear into a 'snake' along the "
-        "trajectory (in the cloud, mesh, and the splat seeded from it). For the "
-        "Vanjee 722z: -0.3,0.3,-0.2,0.3,0.7,0.25",
+        "trajectory (in the cloud, mesh, and the splat seeded from it). Overrides "
+        f"the built-in default ({DEFAULT_SELF_VIEW_BOX}, sized for the Vanjee 722z).",
+    )
+    parser.add_argument(
+        "--keep-self-view",
+        action="store_true",
+        help="keep the scanner's own handle/mount instead of removing it "
+        "(disables the default self-view box).",
     )
     args = parser.parse_args()
 
@@ -851,11 +883,13 @@ def main():
     progress(10, "Reading LIDAR bag…")
     all_xyz = []
     all_pt_ts = []
+    all_intensity = []
     frame_count = 0
     lidar_timestamps = []
-    for ts, xyz, pt_ts in read_lidar_points(lidar_bag):
+    for ts, xyz, pt_ts, intensity in read_lidar_points(lidar_bag):
         all_xyz.append(xyz)
         all_pt_ts.append(pt_ts)
+        all_intensity.append(intensity)
         lidar_timestamps.append(ts)
         frame_count += 1
         if frame_count % 10 == 0:
@@ -937,12 +971,18 @@ def main():
                 f"(full 6-DoF odometry, {mode}), gravity-levelled",
                 flush=True,
             )
-        except ImportError:
-            print(
-                "  kiss-icp not installed — falling back to gyro-only "
-                "stacking (run: pip install kiss-icp)",
-                flush=True,
-            )
+        except ImportError as exc:
+            # A silent gyro-only fallback here produces an un-registered,
+            # smeared cloud (no translation → the walk-through stacks on top of
+            # itself and inflates). That looked like "point cloud generation is
+            # broken". Fail loudly instead; --no-slam is the explicit opt-in for
+            # gyro-only tripod stacks.
+            raise SystemExit(
+                "ERROR: kiss-icp is required to register a moving scan but is "
+                "not installed in this interpreter "
+                f"({sys.executable}). Install it (pip install kiss-icp), or pass "
+                "--no-slam for a stationary/tripod gyro-only stack."
+            ) from exc
 
     # Self-view filter: the handheld unit's own handle/mount (and the operator's
     # hand gripping it) sit at a FIXED position in the sensor frame, so every
@@ -952,8 +992,14 @@ def main():
     # points inside a sensor-frame box (per sweep, before the world transform) so
     # the mount never enters the cloud/mesh/splat seed. Box is in the deskewed
     # sensor frame; for the Vanjee 722z the mount clusters near (0, +0.45, 0).
-    if args.self_view_box:
-        sv = [float(x) for x in args.self_view_box.split(",")]
+    # By default, remove the handheld unit's own handle/mount — a persistent
+    # sensor-frame cluster at ~(0, +0.45, 0) for the Vanjee 722z. --self-view-box
+    # overrides the box for other rigs; --keep-self-view disables removal.
+    sv_spec = args.self_view_box or (
+        None if args.keep_self_view else DEFAULT_SELF_VIEW_BOX
+    )
+    if sv_spec:
+        sv = [float(x) for x in sv_spec.split(",")]
         slo = np.array([min(sv[0], sv[3]), min(sv[1], sv[4]), min(sv[2], sv[5])])
         shi = np.array([max(sv[0], sv[3]), max(sv[1], sv[4]), max(sv[2], sv[5])])
         sv_removed = 0
@@ -963,6 +1009,8 @@ def main():
             if not keep.all():
                 sv_removed += int((~keep).sum())
                 all_xyz[i] = x[keep]
+                if all_intensity[i] is not None:
+                    all_intensity[i] = all_intensity[i][keep]
         print(
             f"  self-view filter: removed {sv_removed:,} handle/mount points "
             f"inside sensor-frame box {slo.round(2)}..{shi.round(2)}",
@@ -1007,6 +1055,8 @@ def main():
                 removed += int(inside.sum())
                 all_xyz_world[i] = w[~inside]
                 all_xyz[i] = all_xyz[i][~inside]
+                if all_intensity[i] is not None:
+                    all_intensity[i] = all_intensity[i][~inside]
         print(
             f"  dynamic-box filter: removed {removed:,} points inside the box "
             f"from sweeps at/after cutoff",
@@ -1022,7 +1072,26 @@ def main():
     # Colour the points
     rgb = np.zeros((len(combined_xyz), 3), dtype=np.uint8)
 
-    if calib is not None and poses is not None and not args.single_frame_colour:
+    if args.mono:
+        # Monochromatic: skip the (slow) multi-view photo projection entirely.
+        # Shade each point by its LiDAR intensity/reflectivity so structure and
+        # materials still read; fall back to flat grey if the sensor omits it.
+        progress(88, "Monochromatic — shading by LiDAR intensity…")
+        if all(iv is not None for iv in all_intensity) and all_intensity:
+            inten = np.concatenate(all_intensity)  # aligned with combined_xyz
+            lo, hi = np.percentile(inten, (2, 98))
+            if hi > lo:
+                g = np.clip((inten - lo) / (hi - lo), 0.0, 1.0)
+            else:
+                g = np.full(len(inten), 0.7)
+            # gentle gamma so mid-reflectivity surfaces aren't too dark
+            g = g ** 0.7
+            rgb = np.repeat((g * 255).astype(np.uint8)[:, None], 3, axis=1)
+            print(f"  monochromatic: shaded {len(rgb):,} points by intensity", flush=True)
+        else:
+            rgb[:] = 180
+            print("  monochromatic: no intensity field — uniform grey", flush=True)
+    elif calib is not None and poses is not None and not args.single_frame_colour:
         # Preferred: project every world point into *all* camera frames so points
         # the camera only saw later in the walk-through still get coloured.
         progress(45, "Multi-view colour projection…")

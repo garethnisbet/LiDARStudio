@@ -40,6 +40,62 @@ async function api(path, body) {
   return data;
 }
 
+// Folder chooser: try the server's native (tkinter) picker first, and fall back
+// to an in-browser directory navigator when the server has no display/tkinter.
+// Resolves with the chosen absolute path, or null if the user cancelled.
+async function browseFolder(title, initial) {
+  try {
+    const d = await api('/api/browse', { title, initial: initial || '' });
+    if (d.path) return d.path;
+    if (d.cancelled) return null;      // native dialog opened, user cancelled
+    // else: no tkinter — fall through to the in-browser navigator
+  } catch { /* server error — fall through */ }
+  return pickFolderInBrowser(initial);
+}
+
+// In-browser directory navigator (fallback picker). Lists subdirectories via
+// /api/browse/dir and resolves with the chosen path, or null if cancelled.
+function pickFolderInBrowser(initial) {
+  return new Promise((resolve) => {
+    let cur = initial || '', parent = null;
+    const crumb = el('div', { class: 'ls-nav-crumb' });
+    const list = el('div', { class: 'ls-nav-list' });
+    const upBtn = el('button', { class: 'act ls-nav-btn' }, '⬆ Up');
+    const selBtn = el('button', { class: 'act ls-nav-btn' }, 'Select this folder');
+    const cancelBtn = el('button', { class: 'act ls-nav-btn ls-nav-cancel' }, 'Cancel');
+    const overlay = el('div', { class: 'ls-nav-overlay' },
+      el('div', { class: 'ls-nav-box' },
+        el('div', { class: 'ls-nav-head' }, crumb),
+        list,
+        el('div', { class: 'ls-nav-foot' }, upBtn, selBtn, cancelBtn)));
+    const done = (v) => { overlay.remove(); resolve(v); };
+    async function go(path) {
+      list.replaceChildren(el('div', { class: 'muted' }, 'Loading…'));
+      try {
+        const d = await api('/api/browse/dir', path ? { path } : {});
+        cur = d.path; parent = d.parent;
+        crumb.textContent = d.path;
+        upBtn.disabled = !d.parent;
+        list.replaceChildren(...(d.items.length
+          ? d.items.map((it) => {
+              const row = el('div', { class: 'ls-nav-item' }, '📁 ' + it.name);
+              row.addEventListener('click', () => go(it.path));
+              return row;
+            })
+          : [el('div', { class: 'muted', style: 'padding:6px' }, '(no subfolders)')]));
+      } catch (e) {
+        list.replaceChildren(el('div', { class: 'muted', style: 'padding:6px' }, 'Error: ' + e.message));
+      }
+    }
+    upBtn.addEventListener('click', () => { if (parent) go(parent); });
+    selBtn.addEventListener('click', () => done(cur));
+    cancelBtn.addEventListener('click', () => done(null));
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) done(null); });
+    document.body.appendChild(overlay);
+    go(cur);   // empty → server defaults to the home directory
+  });
+}
+
 // Fetch a server-side .ply by absolute path and hand it to the viewer's PLY
 // loader (which auto-detects splat vs point cloud vs mesh).
 async function loadPlyFromServer(path, name, transforms = null) {
@@ -238,6 +294,7 @@ export function initLidarPanel() {
   #lidar-panel h4{margin:10px 0 6px;font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:#8aa}
   #lidar-panel input,#lidar-panel select{width:100%;box-sizing:border-box;background:#0f1620;color:#dfe;
     border:1px solid #324a5e;border-radius:5px;padding:6px;margin:3px 0;font:12px monospace}
+  #lidar-panel input[type=checkbox]{width:auto;flex:0 0 auto;margin:0;padding:0;cursor:pointer}
   #lidar-panel button.act{width:100%;background:#2a6df0;color:#fff;border:0;border-radius:6px;
     padding:8px;margin-top:6px;font-weight:600;cursor:pointer}
   #lidar-panel button.act:disabled{opacity:.5;cursor:default}
@@ -278,11 +335,46 @@ export function initLidarPanel() {
     gap:8px;font-weight:700;color:#9cf;font-size:11px;letter-spacing:.04em;
     text-transform:uppercase;margin-bottom:8px}
   #ls-info-panel .ls-info-x{cursor:pointer;color:#7d8aa0;font-size:15px;line-height:1;padding:0 2px}
-  #ls-info-panel .ls-info-x:hover{color:#cdd6e3}`;
+  #ls-info-panel .ls-info-x:hover{color:#cdd6e3}
+  #lidar-panel button.browse{width:auto;flex:0 0 auto;margin:3px 0;padding:6px 10px;font-size:13px;line-height:1}
+  .ls-nav-overlay{position:fixed;inset:0;z-index:4000;background:rgba(4,8,14,.6);
+    display:flex;align-items:center;justify-content:center}
+  .ls-nav-box{width:min(560px,92vw);max-height:80vh;display:flex;flex-direction:column;
+    background:#0f1620;border:1px solid #37506e;border-radius:10px;
+    box-shadow:0 10px 40px rgba(0,0,0,.6);color:#cdd6e3;font:13px system-ui;overflow:hidden}
+  .ls-nav-head{padding:10px 14px;border-bottom:1px solid #2a3344;background:#121a26}
+  .ls-nav-crumb{font:11px monospace;color:#9cf;word-break:break-all}
+  .ls-nav-list{flex:1 1 auto;overflow:auto;padding:4px}
+  .ls-nav-item{padding:7px 10px;border-radius:5px;cursor:pointer;white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis}
+  .ls-nav-item:hover{background:#1b2636}
+  .ls-nav-foot{display:flex;gap:8px;padding:10px 14px;border-top:1px solid #2a3344;background:#121a26}
+  button.ls-nav-btn{flex:1 1 auto;width:auto;margin:0;background:#2a6df0;color:#fff;border:0;
+    border-radius:6px;padding:8px;font-weight:600;cursor:pointer}
+  button.ls-nav-btn:disabled{opacity:.5;cursor:default}
+  button.ls-nav-cancel{background:#3a4a63}`;
   document.head.append(el('style', {}, css));
 
   // ── Library (existing outputs) ──
   const projectInput = el('input', { id: 'ls-project', value: DEFAULT_PROJECT });
+  // The two working paths (library + scan folder) persist on their own — auto-
+  // saved on every change and restored on load — independent of the explicit
+  // Save/Load Workflow buttons.
+  const PATHS_KEY = 'lidarStudio.paths';
+  const persistPaths = () => {
+    try {
+      localStorage.setItem(PATHS_KEY, JSON.stringify(
+        { project: projectInput.value, scan: scanInput.value }));
+    } catch { /* quota/private mode */ }
+  };
+  const browseInto = async (input, title, after) => {
+    const p = await browseFolder(title, input.value.trim());
+    if (p) { input.value = p; persistPaths(); if (after) after(); }
+  };
+  const projBrowse = el('button', { class: 'act browse', title: 'Browse for library folder' }, '📁');
+  projBrowse.addEventListener('click', () =>
+    browseInto(projectInput, 'Select Library / Project Folder', refresh));
+  projectInput.addEventListener('change', persistPaths);
   const outList = el('div', { id: 'ls-outputs' });
   const refresh = async () => {
     outList.replaceChildren(el('div', { class: 'muted' }, 'Loading…'));
@@ -323,6 +415,15 @@ export function initLidarPanel() {
 
   // ── Generate ──
   const scanInput = el('input', { id: 'ls-scan', placeholder: '/path/to/scan_folder' });
+  const scanBrowse = el('button', { class: 'act browse', title: 'Browse for scan folder' }, '📁');
+  scanBrowse.addEventListener('click', () => browseInto(scanInput, 'Select Scan Folder'));
+  scanInput.addEventListener('change', persistPaths);
+  // Restore the persisted library + scan paths (overriding the defaults).
+  try {
+    const sp = JSON.parse(localStorage.getItem(PATHS_KEY) || '{}');
+    if (sp.project) projectInput.value = sp.project;
+    if (sp.scan) scanInput.value = sp.scan;
+  } catch { /* ignore */ }
   const typeSel = el('select', {}, ...['splat', 'pointcloud', 'mesh'].map(t => el('option', { value: t }, t)));
   const voxelInput = el('input', { type: 'number', step: '0.005', min: '0.005', value: '0.01' });
   // voxel is used only by the point-cloud job (splats are always GPU-trained).
@@ -331,6 +432,20 @@ export function initLidarPanel() {
       + 'and slower. 0.01 m is dense; 0.05 m is a light preview cloud.', 'Voxel'),
     voxelInput);
   const pVoxel = el('div', { class: 'row' }, lblVoxel);
+  const monoCheck = el('input', { type: 'checkbox' });
+  const lblMono = el('label', { class: 'muted', style: 'flex:1;display:flex;align-items:center;gap:6px' },
+    monoCheck, 'monochromatic',
+    infoIcon('Skip the slow multi-view photo colouring and shade points by LiDAR '
+      + 'intensity (grey if unavailable). Much faster and needs no images — good for '
+      + 'a quick geometry preview.', 'Monochromatic'));
+  const pMono = el('div', { class: 'row' }, lblMono);
+  const handleCheck = el('input', { type: 'checkbox', checked: true });
+  const lblHandle = el('label', { class: 'muted', style: 'flex:1;display:flex;align-items:center;gap:6px' },
+    handleCheck, 'remove handle',
+    infoIcon('Drop the scanner\'s own handle/mount — a fixed cluster in the sensor '
+      + 'frame that otherwise smears into a "snake" along the path. On by default; '
+      + 'uncheck to keep it.', 'Remove handle'));
+  const pHandle = el('div', { class: 'row' }, lblHandle);
 
   // ── Trained-splat quality controls ──────────────────────────────────────
   // One master 'quality' slider drives a set of individual controls (which
@@ -407,6 +522,8 @@ export function initLidarPanel() {
     pSeed.style.display = (type === 'splat' || type === 'mesh') ? 'flex' : 'none';
     pTrained.style.display = type === 'splat' ? 'block' : 'none';
     pVoxel.style.display = type === 'pointcloud' ? 'flex' : 'none';
+    pMono.style.display = type === 'pointcloud' ? 'flex' : 'none';
+    pHandle.style.display = type === 'pointcloud' ? 'flex' : 'none';
   };
   typeSel.addEventListener('change', showGen);
   showGen();
@@ -577,7 +694,8 @@ export function initLidarPanel() {
       // smooth); a chosen seed pins which cloud it reconstructs from.
       ? { depth: 10, smooth: 15, density_quantile: 0.03,
           ...(seedSel.value ? { pointcloud: seedSel.value } : {}) }
-      : { voxel_size: parseFloat(voxelInput.value) };
+      : { voxel_size: parseFloat(voxelInput.value), mono: monoCheck.checked,
+          keep_self_view: !handleCheck.checked };
     try {
       const { job_id } = await api('/api/process/start',
         { type, project_path: projectInput.value.trim(), scan_path: scan, options });
@@ -1146,17 +1264,20 @@ export function initLidarPanel() {
     el('div', { class: 'row' }, saveWfBtn, loadWfBtn),
     wfStat,
     el('h4', {}, 'Library'),
-    projectInput,
+    el('div', { class: 'row' }, projectInput, projBrowse),
     el('button', { class: 'act', onclick: refresh }, 'Refresh outputs'),
     outList,
     el('h4', {}, 'Generate'),
-    el('div', { class: 'muted' }, 'Scan folder (raw bags):'), scanInput,
+    el('div', { class: 'muted' }, 'Scan folder (raw bags):'),
+    el('div', { class: 'row' }, scanInput, scanBrowse),
     el('div', { class: 'row', style: 'align-items:center' }, typeSel,
       infoIcon('Output kind. splat = photoreal GPU-trained Gaussians (uses the quality '
         + 'slider below); pointcloud = raw coloured LiDAR points.', 'Output type')),
     pSeed,
     pTrained,
     pVoxel,
+    pMono,
+    pHandle,
     genBtn, stopBtn, barLabel, barWrap, logWrap,
     el('h4', {}, 'Scan photos'),
     pPhotos,
