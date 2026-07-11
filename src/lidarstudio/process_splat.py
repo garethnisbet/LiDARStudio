@@ -681,6 +681,7 @@ def train_splat(
     pose_reg: float = 1e-3,
     patch_size: int = 0,
     densify_strategy: str = "mcmc",
+    aniso_cap: float = 20.0,
 ):
     import cv2
     import numpy as np
@@ -812,9 +813,16 @@ def train_splat(
         pose_opt_optimizer = torch.optim.Adam([pose_delta], lr=pose_opt_lr, eps=1e-15)
 
     means_lr = optimizers["means"].param_groups[0]["lr"]
-    scale_clamp = float(np.log(0.1))  # ≤0.1 unit (~0.3-0.5 m world): keeps
-    # gaussians surface-sized — fewer tiles
-    # each (less VRAM) and less radial blur.
+    # ≤0.04 unit (~12-15 cm world): keeps gaussians surface-sized — fewer tiles
+    # each (less VRAM) and less radial blur. The old 0.1 (~0.3-0.5 m) was too
+    # loose at downscale-1: under the opacity-reg champion (median opacity ~0.03),
+    # faint gaussians compensate by inflating to the clamp, so fp50 crept 8→33 cm
+    # between step 7000-9000 and 3.5M half-metre blobs blew gsplat's packed
+    # tile-intersection buffer — peak VRAM tracked footprint 5→22 G and OOM'd a
+    # 24 GB card ~step 11400 (fp50≈fp99≈33 cm = every gaussian pinned at the old
+    # ceiling). Capping at 0.04 bounds the footprint (hence the intersection
+    # buffer) so a full-res ds1 run completes; see the fp50/99 debug print below.
+    scale_clamp = float(np.log(0.04))
     # Floor the smallest axis in WORLD metres (min_scale / norm in normalised
     # units). The old fixed floor of 3e-3 normalised ≈ 1 cm world silently pinned
     # 95% of gaussians' thin axis — no reg could flatten them, and flat-reg could
@@ -829,8 +837,11 @@ def train_splat(
     # mid-run. The flat-surfel target is 3DMakerpro's ~0.11 min/max ratio (≈9:1),
     # so
     # 20:1 leaves generous headroom for genuinely thin structure while keeping
-    # per-gaussian footprints (and VRAM) bounded for the whole run.
-    max_aniso_log = float(np.log(20.0))  # cap s_max/s_min at 20:1
+    # per-gaussian footprints (and VRAM) bounded for the whole run. Exposed as
+    # --aniso-cap: raise it (e.g. 50-100:1) for scenes with cables/thin structure
+    # now that the absolute-scale clamp above independently bounds footprint, so a
+    # thin needle can no longer project to a giant, VRAM-blowing splat.
+    max_aniso_log = float(np.log(aniso_cap))  # cap s_max/s_min at aniso_cap:1
     sh_increase_every = max(1, round(1000 * iters / 30_000))
 
     # Undistorted frames render as pinhole; legacy fisheye frames carry "radial".
@@ -972,7 +983,14 @@ def train_splat(
         loss = (1 - ssim_lambda) * l1 + ssim_lambda * (1 - windowed_ssim(pred, gt))
         # MCMC regularisers: push toward many small, faint Gaussians. exp(scale) is
         # bounded by the per-step clamp below, so it can't overflow to NaN.
-        loss = loss + opacity_reg * torch.sigmoid(params["opacities"]).abs().mean()
+        # Opacity-reg is CUT once MCMC relocation stops (refine_stop_iter = 0.8·iters):
+        # past that point nothing opposes it (no relocation replenishing opacity), so
+        # it decays the median into a translucent, dead-tailed distribution over the
+        # final steps — the 30k "fog" regression (median 0.18 at 10k → 0.03/32% dead
+        # at 30k). Cutting it there holds the mid-run profile (median ~0.18, dead a
+        # few %, matching the 3DMakerpro reference ~0.17/2%) through a long run.
+        op_reg = opacity_reg if step < int(iters * 0.8) else 0.0
+        loss = loss + op_reg * torch.sigmoid(params["opacities"]).abs().mean()
         loss = (
             loss
             + scale_reg
@@ -1280,7 +1298,16 @@ def main():
         type=float,
         default=0.001,
         help="floor for a gaussian's smallest axis, in WORLD metres "
-        "(anisotropy is separately capped at 20:1)",
+        "(anisotropy is separately capped by --aniso-cap)",
+    )
+    p.add_argument(
+        "--aniso-cap",
+        type=float,
+        default=20.0,
+        help="cap on each gaussian's s_max/s_min ratio. 20:1 is the champion "
+        "(bounds footprint/VRAM); raise toward 50-100:1 to let cables and other "
+        "thin structures form needle gaussians (safe now that scale is also "
+        "absolute-clamped).",
     )
     p.add_argument(
         "--no-appearance",
@@ -1499,6 +1526,7 @@ def main():
             pose_reg=args.pose_reg,
             patch_size=args.patch_size,
             densify_strategy=args.densify_strategy,
+            aniso_cap=args.aniso_cap,
         )
     except RuntimeError as exc:
         # Turn a CUDA OOM traceback into one actionable line (the server surfaces

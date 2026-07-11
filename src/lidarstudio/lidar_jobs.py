@@ -920,6 +920,9 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
         str(float(options.get("undistort_scale", 1.0))),
         "--drop-blurry",
         str(float(options.get("drop_blurry", 0.15))),
+        # Anisotropy cap (s_max/s_min). 20:1 champion; raise for thin structures.
+        "--aniso-cap",
+        str(float(options.get("aniso_cap", 20.0))),
         # In-training pose-opt defaults ON but diverges on these SfM/odometry
         # poses (the campaign retired it); keep it off for app runs.
         "--no-pose-opt",
@@ -1468,9 +1471,54 @@ async def edit_save_as_handler(request):
             )
             _write_pose_sidecar(str(out_path), None)  # baked → no sidecar
         else:
+            from lidarstudio import edit_ops
+
             shutil.copy2(src, out_path)
             _write_pose_sidecar(str(out_path), data.get("pose"))
-        return web.json_response({"output": str(out_path), "baked": matrix is not None})
+            # Copy mode is frame-preserving (byte copy), so the source cloud's
+            # trajectory sidecar still applies — carry it so a Save-As'd cloud
+            # stays GPU-trainable, just like an edit-save does. (Bake mode above
+            # changes the frame and deliberately does NOT carry it.) No-ops if
+            # the source has no sidecar.
+            edit_ops._copy_traj(str(src), str(out_path))
+        trainable = edit_ops._find_traj(out_path) is not None if matrix is None else False
+        return web.json_response(
+            {"output": str(out_path), "baked": matrix is not None, "trainable": trainable}
+        )
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+async def edit_import_handler(request):
+    """POST /api/edit/import?dir=<libdir>&name=<basename> — persist a
+    browser-imported cloud/splat PLY to disk so the server-side edit ops can
+    run on it. The request body is the raw .ply bytes.
+
+    Files opened via the picker / drag-drop live only as a browser buffer, so
+    delete/crop/etc. (which operate on a real file) have nothing to point at.
+    The first edit uploads the bytes here, into the Library folder alongside
+    project outputs, so an imported object becomes a normal editable,
+    re-loadable artifact — identical to a Library-loaded file from then on.
+    Returns {output}.
+    """
+    body = await request.read()
+    if not body:
+        return web.json_response({"error": "empty body"}, status=400)
+    # Sanitise to a bare .ply basename — never trust the client with a path.
+    raw = (request.query.get("name") or "imported").strip()
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", Path(raw).name) or "imported"
+    if not base.lower().endswith(".ply"):
+        base += ".ply"
+    d = (request.query.get("dir") or "").strip()
+    out_dir = Path(d) if d else Path.home()
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / base
+        # Never clobber an existing Library file with the same name.
+        if out_path.exists():
+            out_path = Path(_unique_output(out_path, "imported"))
+        out_path.write_bytes(body)
+        return web.json_response({"output": str(out_path)})
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
 
@@ -1482,6 +1530,7 @@ async def edit_save_as_handler(request):
 
 def register_routes(app: web.Application) -> None:
     app.router.add_post("/api/edit/apply", edit_apply_handler)
+    app.router.add_post("/api/edit/import", edit_import_handler)
     app.router.add_post("/api/edit/recolour", edit_recolour_handler)
     app.router.add_post("/api/edit/save_as", edit_save_as_handler)
     app.router.add_post("/api/browse", browse_handler)

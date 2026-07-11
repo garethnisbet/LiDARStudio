@@ -134,7 +134,12 @@ async def root_asset_handler(request):
 
 def create_app(allow_remote_fs=False):
     app = web.Application(
-        middlewares=[local_fs_api_guard_mw, cross_origin_isolation_mw]
+        middlewares=[local_fs_api_guard_mw, cross_origin_isolation_mw],
+        # Uploading a browser-imported cloud/splat for server-side editing
+        # (POST /api/edit/import) sends the whole .ply as the request body;
+        # trained splats run to 1-1.5 GB, so lift aiohttp's 1 MB default. This
+        # is a localhost single-user app, so a generous cap is fine.
+        client_max_size=8 * 1024**3,
     )
     app["allow_remote_fs"] = allow_remote_fs
 

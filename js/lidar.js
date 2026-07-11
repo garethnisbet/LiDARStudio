@@ -116,6 +116,50 @@ async function loadPlyFromServer(path, name, transforms = null) {
   return entry;
 }
 
+// Return a server-side file path for an object, uploading it first if needed.
+// Library/generated objects already have one (loadPlyFromServer registers it);
+// files opened via the picker/drag-drop only exist as a browser buffer, so the
+// server edit ops have nothing to run on. The first edit uploads those bytes
+// into the Library folder (dir) and caches the returned path, after which the
+// imported object behaves exactly like a Library-loaded one. Returns the path;
+// throws Error with a specific, user-visible reason on failure.
+async function ensureObjPath(entry, dir) {
+  if (!entry) throw new Error('no object selected');
+  if (objPaths[entry.name]) return objPaths[entry.name];
+  let buf = entry._buffer;
+  let len = buf ? (buf.byteLength ?? buf.length ?? 0) : 0;
+  // The splat viewer can detach the original ArrayBuffer when it hands it to a
+  // worker, leaving _buffer zero-length. The import kept a blob URL holding a
+  // copy of the original bytes — recover them from there.
+  if (!len && entry._blobUrl) {
+    try {
+      buf = await (await fetch(entry._blobUrl)).arrayBuffer();
+      len = buf.byteLength;
+    } catch { /* fall through to the error below */ }
+  }
+  if (!len) throw new Error('no data bytes to upload — reload the file');
+  // Land the file in the project's type subfolder (splats/ or pointclouds/),
+  // the same layout generate uses and the Library lists — not the project root.
+  const sub = entry.isSplat ? 'splats' : entry.isPointCloud ? 'pointclouds' : 'exports';
+  const target = dir ? dir.replace(/\/+$/, '') + '/' + sub : '';
+  const q = new URLSearchParams({ dir: target, name: entry.name + '.ply' });
+  let resp;
+  try {
+    resp = await fetch(`/api/edit/import?${q.toString()}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: buf,
+    });
+  } catch (e) { throw new Error('upload request failed: ' + e.message); }
+  if (resp.status === 404) throw new Error('server missing /api/edit/import — restart the server');
+  if (!resp.ok) throw new Error(`upload failed (HTTP ${resp.status})`);
+  let j;
+  try { j = await resp.json(); } catch { throw new Error('bad server response to upload'); }
+  if (j.error || !j.output) throw new Error('server: ' + (j.error || 'no output path'));
+  objPaths[entry.name] = j.output;
+  return j.output;
+}
+
 // Fetch the <ply>.pose.json sidecar written by an edit, if present.
 async function fetchPose(path) {
   try {
@@ -450,22 +494,28 @@ export function initLidarPanel() {
   // ── Trained-splat quality controls ──────────────────────────────────────
   // One master 'quality' slider drives a set of individual controls (which
   // stay editable for fine-tuning). Presets follow the splat-quality campaign
-  // arc: draft (fast preview) → max (the ds1 / 6M / 30k champion recipe).
+  // arc: draft (fast preview) → max (the ds1 / 3M / 30k / sharpen-1.3 champion).
   // The shape/opacity recipe constants live as process_splat.py defaults; only
   // the resolution / count / sharpness knobs scale with quality here.
+  // Caps stop at 3M: at downscale-1 that is the largest count that fits the
+  // 24 GB campaign card (6M/ds1 never completed — see the scale-clamp note in
+  // process_splat.py). 'max' is the validated champion recipe; it is the default.
   const QUALITY = [
     { name: 'draft',    iterations: 3000,  downscale: 4, cap: 1, dropBlurry: 0,    undistortScale: 1.0 },
     { name: 'balanced', iterations: 7000,  downscale: 2, cap: 3, dropBlurry: 0.15, undistortScale: 1.0 },
-    { name: 'high',     iterations: 15000, downscale: 1, cap: 6, dropBlurry: 0.15, undistortScale: 1.0 },
-    { name: 'max',      iterations: 30000, downscale: 1, cap: 6, dropBlurry: 0.15, undistortScale: 1.3 },
+    { name: 'high',     iterations: 15000, downscale: 1, cap: 3, dropBlurry: 0.15, undistortScale: 1.0 },
+    { name: 'max',      iterations: 30000, downscale: 1, cap: 3, dropBlurry: 0.15, undistortScale: 1.3 },
   ];
-  const qSlider = el('input', { type: 'range', min: '1', max: '4', step: '1', value: '3', style: 'flex:1' });
-  const qName = el('span', { class: 'muted', style: 'min-width:64px;text-align:right' }, 'high');
-  const iterInput = el('input', { type: 'number', step: '1000', min: '500', value: '15000' });
+  const qSlider = el('input', { type: 'range', min: '1', max: '4', step: '1', value: '4', style: 'flex:1' });
+  const qName = el('span', { class: 'muted', style: 'min-width:64px;text-align:right' }, 'max');
+  const iterInput = el('input', { type: 'number', step: '1000', min: '500', value: '30000' });
   const downInput = el('input', { type: 'number', step: '1', min: '1', max: '8', value: '1' });
-  const capInput = el('input', { type: 'number', step: '0.5', min: '0.5', value: '6' });      // millions
+  const capInput = el('input', { type: 'number', step: '0.5', min: '0.5', value: '3' });      // millions
   const dropInput = el('input', { type: 'number', step: '0.05', min: '0', max: '0.9', value: '0.15' });
-  const usInput = el('input', { type: 'number', step: '0.1', min: '1', max: '2', value: '1.0' });
+  const usInput = el('input', { type: 'number', step: '0.1', min: '1', max: '2', value: '1.3' });
+  // Anisotropy cap: independent expert override (NOT driven by the quality
+  // preset). 20:1 is the champion; raise for cables/thin structure.
+  const anisoInput = el('input', { type: 'number', step: '5', min: '2', max: '200', value: '20' });
   const sfmInput = el('input', { placeholder: 'SfM poses .npz (optional, biggest quality lever)' });
   // Repopulate the individual controls from a quality preset (1-based index).
   const applyQuality = (idx) => {
@@ -481,8 +531,9 @@ export function initLidarPanel() {
     el('div', { class: 'row', style: 'align-items:center' },
       el('span', { class: 'muted', style: 'min-width:52px' }, 'quality'), qSlider, qName,
       infoIcon('Master preset, from draft (fast preview) to max — the campaign champion: '
-        + 'full resolution, 6M splats, 30k iterations (~3–4 h). Moving the slider sets the '
-        + 'individual controls below, which you can still fine-tune by hand.', 'Quality')),
+        + 'full resolution, 3M splats, 30k iterations, sharpen 1.3 (~3–4 h; the largest '
+        + 'count that fits a 24 GB card at full res). Defaults to max. Moving the slider '
+        + 'sets the individual controls below, which you can still fine-tune by hand.', 'Quality')),
     el('div', { class: 'row' },
       qLbl('iterations', iterInput,
         'How many training steps run. More = sharper and better-converged but slower '
@@ -493,7 +544,8 @@ export function initLidarPanel() {
     el('div', { class: 'row' },
       qLbl('max splats (M)', capInput,
         'Cap on how many Gaussians (in millions) the trainer may grow to. More = finer '
-        + 'detail but larger files and more GPU memory. Reference scans use ~3–6M.'),
+        + 'detail but larger files and more GPU memory. ~3M is the most that fits a 24 GB '
+        + 'card at full resolution (downscale 1); go higher only on a bigger GPU.'),
       qLbl('drop blurry', dropInput,
         'Fraction of the blurriest source photos to discard before training (ranked by '
         + 'Laplacian sharpness). 0.15 drops the shakiest ~15%; 0 keeps every frame. '
@@ -502,7 +554,12 @@ export function initLidarPanel() {
       qLbl('sharpen ×', usInput,
         "Undistorted-canvas size vs the source photo. Above 1 preserves the fisheye "
         + "centre's native detail that a 1:1 wide-angle pinhole under-samples. 1.3 sharpens "
-        + 'the centre at ~1.7× training cost.')),
+        + 'the centre at ~1.7× training cost.'),
+      qLbl('aniso cap', anisoInput,
+        'Max stretch (long-axis : short-axis) of a single Gaussian. 20:1 is the champion — '
+        + 'it bounds each splat’s footprint (and VRAM). Raise toward 50–100 for scenes with '
+        + 'cables / thin structures so they can form needle-shaped splats; the absolute-scale '
+        + 'clamp still keeps needles from blowing up GPU memory. Not changed by the quality slider.')),
     el('div', { class: 'row', style: 'align-items:center' },
       el('label', { class: 'muted', style: 'flex:1' }, 'SfM poses', sfmInput),
       infoIcon('Optional .npz of camera poses from Structure-from-Motion (COLMAP/GLOMAP, '
@@ -687,6 +744,7 @@ export function initLidarPanel() {
           max_init_points: Math.round(Math.min(3, capM) * 1e6),
           drop_blurry: parseFloat(dropInput.value) || 0,
           undistort_scale: parseFloat(usInput.value) || 1.0,
+          aniso_cap: parseFloat(anisoInput.value) || 20,
           ...(sfmInput.value.trim() ? { sfm_poses: sfmInput.value.trim() } : {}),
           ...(seedSel.value ? { pointcloud: seedSel.value } : {}) }
       : type === 'mesh'
@@ -889,8 +947,9 @@ export function initLidarPanel() {
     if (!entry || !State.importedSTLs.includes(entry)) {
       editStat.textContent = 'Re-place the visibility box on an object first.'; return;
     }
-    const srcPath = objPaths[entry.name];
-    if (!srcPath) { editStat.textContent = 'Delete needs a file: load it from the Library.'; return; }
+    let srcPath;
+    try { srcPath = await ensureObjPath(entry, projectInput.value); }
+    catch (e) { editStat.textContent = 'Delete: ' + e.message; return; }
     const li = document.querySelectorAll('.stl-item')[State.importedSTLs.indexOf(entry)] || null;
     visBox.updateWorldMatrix(true, false);
     // Map file coords → box-local using the same frame the clip uses, so the
@@ -1174,8 +1233,9 @@ export function initLidarPanel() {
     const entry = State.selectedSTL;
     if (!entry || (!entry.isPointCloud && !entry.isSplat)) {
       eraseStat.textContent = 'Select the cloud/splat to erase from (in the list).'; return; }
-    const srcPath = objPaths[entry.name];
-    if (!srcPath) { eraseStat.textContent = 'Erase needs a loaded file (Library/generate).'; return; }
+    let srcPath;
+    try { srcPath = await ensureObjPath(entry, projectInput.value); }
+    catch (e) { eraseStat.textContent = 'Erase: ' + e.message; return; }
     const prims = State.importedSTLs.filter(s => s.primType && s.mesh.visible);
     if (!prims.length) { eraseStat.textContent = 'Add a Cube/Sphere/Cylinder to use as an eraser.'; return; }
     const cloudWorld = cloudWorldMatrix(entry);
@@ -1300,7 +1360,7 @@ export function initLidarPanel() {
       type: typeSel.value, voxel: voxelInput.value,
       quality: qSlider.value, iterations: iterInput.value, downscale: downInput.value,
       cap: capInput.value, dropBlurry: dropInput.value, undistortScale: usInput.value,
-      sfm: sfmInput.value,
+      anisoCap: anisoInput.value, sfm: sfmInput.value,
       editOp: editOp.value, factor: facInput.value,
       sorNb: sorNb.value, sorStd: sorStd.value,
       cropInvert: invCb.checked, regionLimit: regionCb.checked,
@@ -1316,7 +1376,7 @@ export function initLidarPanel() {
     // the user may have hand-tuned individual controls before saving).
     setVal(qSlider, 'quality'); setVal(iterInput, 'iterations'); setVal(downInput, 'downscale');
     setVal(capInput, 'cap'); setVal(dropInput, 'dropBlurry'); setVal(usInput, 'undistortScale');
-    setVal(sfmInput, 'sfm');
+    setVal(anisoInput, 'anisoCap'); setVal(sfmInput, 'sfm');
     if (s.quality != null) qName.textContent = (QUALITY[parseInt(s.quality) - 1] || {}).name || '';
     setVal(editOp, 'editOp'); setVal(facInput, 'factor');
     setVal(sorNb, 'sorNb'); setVal(sorStd, 'sorStd');
