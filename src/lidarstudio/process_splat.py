@@ -236,6 +236,7 @@ def build_camera_frames(
     mask_canon_pts=None,
     memmap_frames: bool = False,
     frame_cache_dir=None,
+    fisheye_intrinsics=None,
 ):
     """
     Return a list of {image HxWx3 uint8 RGB, K 3x3, viewmat 4x4 (world→cam)}.
@@ -272,6 +273,28 @@ def build_camera_frames(
     K0 = calib["K"].astype(np.float64)
     D = calib["D"].astype(np.float64)
     T = calib["T"].astype(np.float64)  # lidar → camera (4×4)
+
+    if fisheye_intrinsics is not None:
+        # Override the factory calibration with bundle-adjusted intrinsics
+        # (fx,fy,cx,cy,k1,k2,k3,k4 — COLMAP OPENCV_FISHEYE convention, same
+        # portrait-rotated frame as calib.json). When training against SfM
+        # poses this is essential for consistency: the poses were optimised
+        # assuming the REFINED lens model, so undistorting the images with the
+        # factory model bakes a systematic sub-pixel-to-~2px radial warp into
+        # every frame that pose optimisation cannot absorb — multi-view
+        # supervision then disagrees with itself and the fit blurs.
+        fi = np.asarray(fisheye_intrinsics, dtype=np.float64)
+        Kr = np.array(
+            [[fi[0], 0.0, fi[2]], [0.0, fi[1], fi[3]], [0.0, 0.0, 1.0]]
+        )
+        print(
+            "  refined intrinsics override: "
+            f"Δfx={fi[0] - K0[0, 0]:+.2f}px Δfy={fi[1] - K0[1, 1]:+.2f}px "
+            f"Δcx={fi[2] - K0[0, 2]:+.2f} Δcy={fi[3] - K0[1, 2]:+.2f} "
+            f"k={fi[4:].tolist()} (was {D.reshape(-1).tolist()})",
+            flush=True,
+        )
+        K0, D = Kr, fi[4:].copy()
 
     traj = np.load(traj_path)
     traj_ts = traj["ts"].astype(np.int64)
@@ -1387,6 +1410,14 @@ def main():
         "every covered frame and drops uncovered frames",
     )
     p.add_argument(
+        "--fisheye-intrinsics",
+        default=None,
+        help="fx,fy,cx,cy,k1,k2,k3,k4 — override the factory fisheye "
+        "calibration with bundle-adjusted intrinsics (COLMAP OPENCV_FISHEYE "
+        "params, portrait frame). Use with --sfm-poses so the undistortion "
+        "matches the lens model the poses were optimised under",
+    )
+    p.add_argument(
         "--mask-box",
         default=None,
         help="x1,y1,z1,x2,y2,z2 world-space box around a dynamic object "
@@ -1492,6 +1523,11 @@ def main():
         mask_canon_pts=mask_canon,
         memmap_frames=args.memmap_frames,
         frame_cache_dir=args.frame_cache_dir,
+        fisheye_intrinsics=(
+            [float(v) for v in args.fisheye_intrinsics.split(",")]
+            if args.fisheye_intrinsics
+            else None
+        ),
     )
     print(
         f"  {len(frames)} posed frames @ {frames[0]['image'].shape[1]}×"
