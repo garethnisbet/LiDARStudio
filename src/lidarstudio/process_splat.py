@@ -1195,10 +1195,21 @@ def train_splat(
         # at 30k). Cutting it there holds the mid-run profile (median ~0.18, dead a
         # few %, matching the 3DMakerpro reference ~0.17/2%) through a long run.
         op_reg = opacity_reg if step < int(iters * 0.8) else 0.0
-        loss = loss + op_reg * torch.sigmoid(params["opacities"]).abs().mean()
+        # Patch training dilutes the photometric gradient each gaussian receives
+        # by the crop fraction (a 1600² crop of a 3900×5279 frame renders ~12%
+        # of its pixels), while these global regularisers still hit every
+        # gaussian every step. The champion reg values were tuned at full-frame
+        # balance; unscaled, the regs win the tug-of-war over a long patched
+        # run and decay the whole field into transparent mush (median opacity
+        # 0.001 / 1 mm splats — the 30k/ds1/1600px app run, 2026-07-13).
+        # Scaling the regs by the same fraction restores the tuned
+        # reg-to-signal ratio at any patch size; factor is 1.0 unpatched.
+        reg_frac = (ch * cw) / (H * W)
+        loss = loss + op_reg * reg_frac * torch.sigmoid(params["opacities"]).abs().mean()
         loss = (
             loss
             + scale_reg
+            * reg_frac
             * torch.exp(params["scales"].clamp(max=scale_clamp)).abs().mean()
         )
         if flat_reg:
@@ -1211,6 +1222,7 @@ def train_splat(
             loss = (
                 loss
                 + flat_reg
+                * reg_frac
                 * torch.exp(
                     s.min(dim=1).values - s.max(dim=1).values.detach()
                 ).mean()
