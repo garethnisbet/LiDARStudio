@@ -925,6 +925,20 @@ def train_splat(
     )
     optimizers = make_optimizers(params, lr_scale=1.0)
 
+    # Patch training dilutes each gaussian's photometric-correction rate by the
+    # crop fraction (a 1600² crop of a ds1 frame renders ~12% of its pixels),
+    # but MCMC's churn — relocation every refine_every steps, position noise
+    # every step — was tuned at full-frame cadence. Unscaled, dead-splat churn
+    # outpaces recovery and the field decays into fog even with the loss regs
+    # crop-scaled (19.06 dB / opacity 0.03 after the reg_frac fix alone,
+    # 2026-07-13). Stretch the relocation cadence by the crop fraction here;
+    # the per-step noise is scaled by the same fraction at the call site.
+    # Both are exact no-ops when not patching.
+    _H0, _W0 = frames[0]["image"].shape[:2]
+    patch_frac = (
+        min(1.0, (patch_size * patch_size) / float(_H0 * _W0)) if patch_size else 1.0
+    )
+
     strategy = None
     strategy_state = None
     if densify and densify_strategy == "default":
@@ -957,7 +971,11 @@ def train_splat(
             noise_lr=1e4,
             refine_start_iter=max(100, iters // 50),
             refine_stop_iter=int(iters * 0.8),
-            refine_every=100,
+            # 100 at full frame; stretched under patch training so relocations
+            # per photometric correction match the full-frame tuning (each
+            # teleport drains opacity from a live donor, and a relocated
+            # gaussian only re-anchors when a crop covers it).
+            refine_every=max(100, round(100 / patch_frac)),
             min_opacity=min_opacity,
             verbose=False,
         )
@@ -1272,8 +1290,18 @@ def train_splat(
                     params, optimizers, strategy_state, step, info, packed=True
                 )
             else:
+                # lr scales MCMC's per-step position noise (scaler = lr ×
+                # noise_lr). The noise targets near-dead gaussians
+                # (op_sigmoid(1-α) ≈ 1 below α~0.01) and runs UNGATED past
+                # refine_stop — under patch training a jiggled gaussian is
+                # only photometrically re-anchored when a crop covers it, so
+                # unscaled noise ratchets the near-dead population into fog
+                # (the post-24k opacity slide, 0.05 → 0.03). Scale by this
+                # step's actual crop fraction (reg_frac, 1.0 unpatched; also
+                # tracks the OOM auto-shrunk patch).
                 strategy.step_post_backward(
-                    params, optimizers, strategy_state, step, info, lr=means_lr
+                    params, optimizers, strategy_state, step, info,
+                    lr=means_lr * reg_frac,
                 )
         return loss
 
