@@ -23,6 +23,7 @@ import {
   exportSceneState, importSceneState, restoreSTLsFromState,
   loadSTLFile, loadOBJFile, loadPLYFile, loadGLBFile, loadSplatFile,
   updateSplatClip,
+  setPointSize, setPointShape,
   addPrimitive,
   selectSTL, deselectSTL, setSTLTransformMode, syncSTLNumericInputs,
 } from './stl.js';
@@ -285,6 +286,18 @@ document.getElementById('floorSize').addEventListener('input', (e) => {
   setFloorSize(r);
 });
 
+// Point size slider (mm in the UI; PointsMaterial.size is world metres)
+document.getElementById('pointSize').addEventListener('input', (e) => {
+  const mm = parseFloat(e.target.value);
+  document.getElementById('pointSizeVal').textContent = `${mm} mm`;
+  setPointSize(mm / 1000);
+});
+
+// Point shape selector (round / square / soft)
+document.getElementById('pointShape').addEventListener('change', (e) => {
+  setPointShape(e.target.value);
+});
+
 // ============================================================
 // Click-to-select imported meshes
 // ------------------------------------------------------------
@@ -540,6 +553,20 @@ async function restoreScene(data) {
     setFloorSize(data.floorSize);
     document.getElementById('floorSize').value = data.floorSize;
     document.getElementById('floorSizeVal').textContent = `${data.floorSize} m`;
+  }
+
+  // Restore point size
+  if (data.pointSize != null) {
+    setPointSize(data.pointSize);
+    const mm = Math.round(data.pointSize * 10000) / 10;
+    document.getElementById('pointSize').value = mm;
+    document.getElementById('pointSizeVal').textContent = `${mm} mm`;
+  }
+
+  // Restore point shape
+  if (data.pointShape) {
+    setPointShape(data.pointShape);
+    document.getElementById('pointShape').value = data.pointShape;
   }
 
   // Restore camera

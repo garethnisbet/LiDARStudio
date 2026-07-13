@@ -30,6 +30,19 @@
     <input type="range" id="floorSize" min="0.5" max="4" value="2" step="0.25" style="flex:1;">
     <span id="floorSizeVal" style="font-size:11px; color:#8cf; min-width:32px;">2 m</span>
   </div>
+  <div style="display:flex; align-items:center; gap:6px; margin-top:4px;">
+    <label style="font-size:11px; color:#889; white-space:nowrap;">Point size:</label>
+    <input type="range" id="pointSize" min="0.5" max="20" value="3" step="0.5" style="flex:1;">
+    <span id="pointSizeVal" style="font-size:11px; color:#8cf; min-width:32px;">3 mm</span>
+  </div>
+  <div style="display:flex; align-items:center; gap:6px; margin-top:4px;">
+    <label style="font-size:11px; color:#889; white-space:nowrap;">Point shape:</label>
+    <select id="pointShape" style="flex:1;">
+      <option value="round" selected>Round</option>
+      <option value="square">Square</option>
+      <option value="soft">Soft</option>
+    </select>
+  </div>
   <button id="stlBtn">Import Mesh (STL / OBJ / PLY / GLB / Splat)</button>
   <input type="file" id="stlFile" accept=".stl,.obj,.mtl,.ply,.glb,.gltf,.splat,.ksplat,.spz" multiple style="display:none">
   <div style="display:flex; gap:4px; margin-top:4px;">

@@ -38,6 +38,13 @@
   }
   button:hover { background: #445; }
   button.active { background: #448; border-color: #66f; color: #fff; }
+  #panel select {
+    padding: 4px 6px; background: #334; color: #aac;
+    border: 1px solid #446; border-radius: 4px; cursor: pointer;
+    font-size: 12px; outline: none;
+  }
+  #panel select:hover { background: #445; }
+  #panel select option { background: #223; color: #aac; }
   .slider-row label span { cursor: text; }
   .editable-val {
     cursor: pointer; padding: 0 4px; border-radius: 2px;

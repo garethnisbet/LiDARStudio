@@ -83,13 +83,13 @@ function _buildSTLPayload(entry, bufferFn, includeSplatBuffers) {
 
 export function buildScenePayload() {
   const stls = State.importedSTLs.map(entry => _buildSTLPayload(entry, _arrayBufferToBase64, false));
-  return { version: 1, stls, camera: _buildCameraPayload(), floorSize: State.floorSize };
+  return { version: 1, stls, camera: _buildCameraPayload(), floorSize: State.floorSize, pointSize: _pointSize, pointShape: _pointShapeName };
 }
 
 // DB variant — stores raw ArrayBuffers (no base64), used by IndexedDB auto-save.
 export function buildScenePayloadForDB() {
   const stls = State.importedSTLs.map(entry => _buildSTLPayload(entry, buf => buf, true));
-  return { version: 1, stls, camera: _buildCameraPayload(), floorSize: State.floorSize };
+  return { version: 1, stls, camera: _buildCameraPayload(), floorSize: State.floorSize, pointSize: _pointSize, pointShape: _pointShapeName };
 }
 
 // Metadata-only DB payload — omits the heavy mesh/point-cloud/splat buffers,
@@ -97,7 +97,7 @@ export function buildScenePayloadForDB() {
 // Cheap enough to clone into IndexedDB on every auto-save tick.
 export function buildSceneMetadataForDB() {
   const stls = State.importedSTLs.map(entry => _buildSTLPayload(entry, null, false));
-  return { version: 1, stls, camera: _buildCameraPayload(), floorSize: State.floorSize };
+  return { version: 1, stls, camera: _buildCameraPayload(), floorSize: State.floorSize, pointSize: _pointSize, pointShape: _pointShapeName };
 }
 
 // The heavy buffers only, keyed by stl id. Re-written only when the buffer set
@@ -395,11 +395,42 @@ export function _isPLYGaussianSplat(buffer) {
   return header.includes('f_dc_0') || header.includes('rot_0') || header.includes('scale_0');
 }
 
+// Point-cloud render size (world metres), shared by every cloud and driven by
+// the panel's "Point size" slider. PointsMaterial.size is a live uniform, so
+// updating the materials in place re-renders without touching geometry.
+let _pointSize = 0.003;
+
+export function setPointSize(size) {
+  _pointSize = size;
+  for (const e of State.importedSTLs) {
+    if (e.isPointCloud && e.mesh?.material) e.mesh.material.size = size;
+  }
+  State.requestRender();
+}
+
+export function getPointSize() { return _pointSize; }
+
+// Point sprite shape, shared by every cloud material as a live uniform
+// (0 = square, 1 = round, 2 = soft round with alpha falloff) so switching
+// never recompiles shaders.
+const POINT_SHAPES = { square: 0, round: 1, soft: 2 };
+let _pointShapeName = 'round';
+const _pointShapeU = { value: POINT_SHAPES[_pointShapeName] };
+
+export function setPointShape(name) {
+  if (!(name in POINT_SHAPES)) return;
+  _pointShapeName = name;
+  _pointShapeU.value = POINT_SHAPES[name];
+  State.requestRender();
+}
+
+export function getPointShape() { return _pointShapeName; }
+
 export function _addPointsToScene(geometry, buffer, name, color, stlId, transforms) {
   const hasVertexColors = geometry.hasAttribute('color');
   const matColor = hasVertexColors ? 0xffffff : color;
   const material = new THREE.PointsMaterial({
-    color: matColor, size: 0.003, sizeAttenuation: true,
+    color: matColor, size: _pointSize, sizeAttenuation: true,
     vertexColors: hasVertexColors,
     transparent: true, opacity: 0.9,
   });
@@ -635,11 +666,24 @@ export function setVisibilityClip(opts = {}) {
 
 // Inject the box test into a freshly-compiled PointsMaterial. Shares the
 // module uniform objects so setVisibilityClip() drives every cloud at once.
+// Also shapes the points: gl_Points rasterise as screen-aligned squares, so
+// round/soft modes discard fragments outside the sprite's inscribed circle
+// (soft additionally fades alpha toward the rim).
 function _applyClipToPointsMaterial(material) {
   material.onBeforeCompile = (shader) => {
     shader.uniforms.uClipEnabled = _clipUniforms.uClipEnabled;
     shader.uniforms.uClipInv     = _clipUniforms.uClipInv;
     shader.uniforms.uClipMode    = _clipUniforms.uClipMode;
+    shader.uniforms.uPointShape  = _pointShapeU;
+    shader.fragmentShader = 'uniform float uPointShape;\n'
+      + shader.fragmentShader.replace(
+          '#include <clipping_planes_fragment>',
+          '#include <clipping_planes_fragment>\n'
+          + 'if (uPointShape > 0.5) {\n'
+          + '  float _pd = length(gl_PointCoord - 0.5);\n'
+          + '  if (_pd > 0.5) discard;\n'
+          + '  if (uPointShape > 1.5) diffuseColor.a *= smoothstep(0.5, 0.15, _pd);\n'
+          + '}\n');
     shader.vertexShader =
       'uniform bool uClipEnabled;\nuniform mat4 uClipInv;\nuniform float uClipMode;\nattribute float aErased;\n'
       + shader.vertexShader.replace(
