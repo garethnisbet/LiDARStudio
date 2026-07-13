@@ -475,6 +475,157 @@ def build_camera_frames(
     return frames
 
 
+# ── Depth priors (Depth Anything V2, anchored to LiDAR) ──────────────
+
+
+def _anchor_depth(d_mono, K, viewmat, pts_w, max_med_err=0.15):
+    """Affine-anchor a monocular depth map to metric LiDAR, per frame.
+
+    Mono-depth is only defined up to an affine transform in INVERSE depth
+    (even 'metric' variants carry a scene-dependent bias), so fit
+    1/z_lidar ≈ a·(1/d_mono) + b against the cloud projected into this frame.
+    Occluded projections (a point behind a nearer surface lands on the image
+    with a too-large z) are outliers by construction, so two rounds of
+    trimming the worst 25% residuals removes them — no z-buffer needed on a
+    static scene where inliers dominate.
+
+    Returns (depth_metres float32 HxW with 0 = invalid, median_abs_err_m) or
+    (None, err) when the frame can't be trusted (too few LiDAR samples in
+    view, degenerate fit, or median error above ``max_med_err`` — e.g. glass).
+    """
+    import numpy as np
+
+    H, W = d_mono.shape
+    R, t = viewmat[:3, :3], viewmat[:3, 3]
+    cam = pts_w @ R.T + t
+    z = cam[:, 2]
+    front = z > 0.1
+    cam, z = cam[front], z[front]
+    u = cam[:, 0] / z * K[0, 0] + K[0, 2]
+    v = cam[:, 1] / z * K[1, 1] + K[1, 2]
+    ok = (u >= 0) & (u < W - 1) & (v >= 0) & (v < H - 1)
+    if ok.sum() < 500:
+        return None, float("inf")
+    dm = d_mono[v[ok].astype(np.int64), u[ok].astype(np.int64)]
+    zl = z[ok]
+    good = dm > 1e-3
+    if good.sum() < 500:
+        return None, float("inf")
+    x, y = 1.0 / dm[good], 1.0 / zl[good]
+    a = b = 0.0
+    for r_i in range(3):
+        A = np.stack([x, np.ones_like(x)], axis=1)
+        (a, b), *_ = np.linalg.lstsq(A, y, rcond=None)
+        resid = np.abs(a * x + b - y)
+        if r_i < 2:
+            keep = resid <= np.quantile(resid, 0.75)
+            x, y = x[keep], y[keep]
+    if a <= 0:  # inverted/degenerate fit — mono depth disagrees on ordering
+        return None, float("inf")
+    inv_fit = a * x + b
+    pos = inv_fit > 1e-3
+    if not pos.any():
+        return None, float("inf")
+    med_err = float(np.median(np.abs(1.0 / inv_fit[pos] - 1.0 / y[pos])))
+    if med_err > max_med_err:
+        return None, med_err
+    out = np.zeros((H, W), dtype=np.float32)
+    m = d_mono > 1e-3
+    inv = a / d_mono[m] + b
+    val = inv > 1.0 / 50.0  # cap anchored depth at 50 m
+    dd = np.zeros(int(m.sum()), dtype=np.float32)
+    dd[val] = 1.0 / inv[val]
+    out[m] = dd
+    return out, med_err
+
+
+def precompute_depth(frames, pts, model_id, cache_dir=None):
+    """Run Depth Anything V2 over every kept frame, anchor each map to the
+    LiDAR cloud (see ``_anchor_depth``), and attach the result as
+    ``f["depth"]`` — a float16 disk-memmap view in world METRES (0 = invalid).
+
+    Runs BEFORE training so the depth model's VRAM (~1.5 GB for ViT-L) is
+    freed again by the time gaussians are allocated: the training loop pays
+    zero VRAM for the prior. Must also run before train_splat composes the
+    norm→world matrix into the viewmats — anchoring needs them world-frame.
+    """
+    import numpy as np
+    import torch
+
+    try:
+        from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+    except ImportError:
+        print(
+            "ERROR: --depth-loss needs the 'transformers' package in the splat "
+            "interpreter (pip install transformers).",
+            flush=True,
+        )
+        sys.exit(1)
+    from PIL import Image
+
+    device = "cuda"
+    print(f"  depth prior: loading {model_id}…", flush=True)
+    proc = AutoImageProcessor.from_pretrained(model_id)
+    model = (
+        AutoModelForDepthEstimation.from_pretrained(model_id, dtype=torch.float16)
+        .to(device)
+        .eval()
+    )
+
+    # One shared cloud subsample: plenty of anchor samples per frame, and the
+    # per-frame projection stays a cheap 400k×3 matmul.
+    rng = np.random.default_rng(0)
+    sub = pts[rng.choice(len(pts), min(len(pts), 400_000), replace=False)]
+
+    H, W = frames[0]["image"].shape[:2]
+    need = len(frames) * H * W * 2
+    root = _frame_cache_root(cache_dir, need_bytes=need)
+    ddir = tempfile.mkdtemp(prefix="lidarstudio_depth_", dir=root)
+    atexit.register(shutil.rmtree, ddir, ignore_errors=True)
+    dpath = os.path.join(ddir, "depth.f16")
+    mm = np.memmap(dpath, dtype=np.float16, mode="w+", shape=(len(frames), H, W))
+    print(
+        f"  depth prior: cache at {ddir} ({need / 1e9:.1f} GB for "
+        f"{len(frames)} frames)",
+        flush=True,
+    )
+    voided = 0
+    errs = []
+    for i, f in enumerate(frames):
+        img = Image.fromarray(np.asarray(f["image"]))
+        with torch.no_grad():
+            inp = proc(images=img, return_tensors="pt")
+            pv = inp["pixel_values"].to(device=device, dtype=torch.float16)
+            pred = model(pixel_values=pv).predicted_depth  # (1, h, w)
+            d = torch.nn.functional.interpolate(
+                pred[:, None].float(), size=(H, W), mode="bilinear", align_corners=False
+            )[0, 0].cpu().numpy()
+        anchored, med_err = _anchor_depth(d, f["K"], f["viewmat"], sub)
+        if anchored is None:
+            mm[i] = 0.0
+            voided += 1
+        else:
+            mm[i] = anchored.astype(np.float16)
+            errs.append(med_err)
+        if i % 25 == 0:
+            progress(
+                5 + int(5 * (i + 1) / len(frames)),
+                f"Depth priors {i + 1}/{len(frames)}…",
+            )
+    del model, proc
+    torch.cuda.empty_cache()
+    mm.flush()
+    ro = np.memmap(dpath, dtype=np.float16, mode="r", shape=(len(frames), H, W))
+    for i, f in enumerate(frames):
+        f["depth"] = ro[i]
+    print(
+        f"  depth prior: {len(frames) - voided}/{len(frames)} frames anchored "
+        f"(median fit err {np.median(errs) * 100:.1f} cm)"
+        + (f"; {voided} voided (bad LiDAR fit)" if voided else ""),
+        flush=True,
+    )
+
+
 # ── Gaussian model + loss (adapted from raven/train_splat.py) ─────────
 
 
@@ -697,6 +848,7 @@ def train_splat(
     min_opacity: float = 0.005,
     flat_reg: float = 0.0,
     min_scale: float = 0.001,
+    max_scale: float = 0.12,
     appearance_reg: float = 0.05,
     pose_opt: bool = True,
     pose_opt_lr: float = 1e-2,
@@ -705,6 +857,7 @@ def train_splat(
     patch_size: int = 0,
     densify_strategy: str = "mcmc",
     aniso_cap: float = 20.0,
+    depth_loss: float = 0.0,
 ):
     import cv2
     import numpy as np
@@ -836,16 +989,19 @@ def train_splat(
         pose_opt_optimizer = torch.optim.Adam([pose_delta], lr=pose_opt_lr, eps=1e-15)
 
     means_lr = optimizers["means"].param_groups[0]["lr"]
-    # ≤0.04 unit (~12-15 cm world): keeps gaussians surface-sized — fewer tiles
-    # each (less VRAM) and less radial blur. The old 0.1 (~0.3-0.5 m) was too
-    # loose at downscale-1: under the opacity-reg champion (median opacity ~0.03),
-    # faint gaussians compensate by inflating to the clamp, so fp50 crept 8→33 cm
-    # between step 7000-9000 and 3.5M half-metre blobs blew gsplat's packed
-    # tile-intersection buffer — peak VRAM tracked footprint 5→22 G and OOM'd a
-    # 24 GB card ~step 11400 (fp50≈fp99≈33 cm = every gaussian pinned at the old
-    # ceiling). Capping at 0.04 bounds the footprint (hence the intersection
-    # buffer) so a full-res ds1 run completes; see the fp50/99 debug print below.
-    scale_clamp = float(np.log(0.04))
+    # Cap the largest axis in WORLD metres (max_scale / norm in normalised
+    # units): keeps gaussians surface-sized — fewer tiles each (less VRAM) and
+    # less radial blur. Under the opacity-reg champion (median opacity ~0.03),
+    # faint gaussians compensate by inflating to the clamp, so fp50 creeps up
+    # until every gaussian pins at the ceiling and 3.5M oversized blobs blow
+    # gsplat's packed tile-intersection buffer — peak VRAM tracks footprint and
+    # OOMs a 24 GB card mid-run. The old fixed 0.04 NORMALISED-unit clamp only
+    # bounded that on the scene it was tuned on (norm≈3 → ~12 cm world): a
+    # spread-out scene with norm≈6 let splats grow to ~25 cm (fp99 pinned at
+    # 24.7 cm, peak 22 G, OOM past the 512 px patch floor). Camera-to-surface
+    # distance doesn't grow with scene extent, so the pixel footprint — and the
+    # intersection buffer — tracks WORLD size; clamp in metres like scale_floor.
+    scale_clamp = float(np.log(max_scale / norm))
     # Floor the smallest axis in WORLD metres (min_scale / norm in normalised
     # units). The old fixed floor of 3e-3 normalised ≈ 1 cm world silently pinned
     # 95% of gaussians' thin axis — no reg could flatten them, and flat-reg could
@@ -908,6 +1064,10 @@ def train_splat(
             height=ch,
             sh_degree=sh_deg,
             packed=True,
+            # ED = one extra alpha-normalised expected-depth channel; since the
+            # norm→world scale S is composed into the viewmats, it comes out in
+            # world METRES — directly comparable to the anchored depth priors.
+            render_mode="RGB+ED" if depth_loss else "RGB",
             **cam,
         )  # packed = sparse intersections → far less VRAM
 
@@ -980,12 +1140,14 @@ def train_splat(
         renders, alphas, info = render(params, f, sh_deg, viewmat, y0, x0, ch, cw)
         if strategy is not None:
             strategy.step_pre_backward(params, optimizers, strategy_state, step, info)
-        pred = renders[0]
+        out = renders[0]
+        pred = out[..., :3]  # RGB+ED mode appends a depth channel
         if appearance:  # soak up this frame's exposure/WB
             assert app_gain is not None and app_bias is not None
             pred = pred * app_gain[fi] + app_bias[fi]
         pred = pred.clamp(0, 1)
         gt = frame_gt(f, y0, x0, ch, cw)
+        m_t = None
         if f.get("mask_png") is not None:
             # Dynamic-object mask: inside the masked region the GT is replaced
             # by the (detached) render, so both L1 and SSIM gradients vanish
@@ -1004,6 +1166,26 @@ def train_splat(
             gt = gt * m_t + pred.detach() * (1.0 - m_t)
         l1 = (pred - gt).abs().mean()
         loss = (1 - ssim_lambda) * l1 + ssim_lambda * (1 - windowed_ssim(pred, gt))
+        if depth_loss and f.get("depth") is not None:
+            # Inverse-depth L1 against the LiDAR-anchored mono-depth prior:
+            # scale-robust, and it naturally up-weights the NEAR field (a 2 cm
+            # error at 0.5 m costs ~25× more than at 3 m) — aimed at the
+            # near-field multi-view-averaging softness that photometric loss
+            # alone can't resolve. Gated to pixels the splat actually covers
+            # (alpha), with a valid prior (0 = voided/invalid), outside any
+            # dynamic-object mask. Frames whose anchor fit failed are all-zero
+            # → the term vanishes there.
+            d_gt = torch.from_numpy(
+                np.ascontiguousarray(f["depth"][y0 : y0 + ch, x0 : x0 + cw])
+            ).to(device).float()
+            d_ok = (alphas[0, ..., 0] > 0.5) & (d_gt > 0.1)
+            if m_t is not None:
+                d_ok &= m_t[..., 0] > 0.5
+            if d_ok.any():
+                d_pred = out[..., 3].clamp_min(0.1)
+                loss = loss + depth_loss * (
+                    (1.0 / d_pred - 1.0 / d_gt.clamp_min(0.1))[d_ok].abs().mean()
+                )
         # MCMC regularisers: push toward many small, faint Gaussians. exp(scale) is
         # bounded by the per-step clamp below, so it can't overflow to NaN.
         # Opacity-reg is CUT once MCMC relocation stops (refine_stop_iter = 0.8·iters):
@@ -1191,7 +1373,7 @@ def train_splat(
             y0, x0, ch, cw = pick_crop(H, W, centre=True)
             vm = frame_viewmat(fi, f, iters)  # with the learned pose delta
             out, _, _ = render(params, f, sh_degree, vm, y0, x0, ch, cw)
-            pred = out[0]
+            pred = out[0][..., :3]  # drop the ED channel in depth-loss runs
             if appearance:
                 assert app_gain is not None and app_bias is not None
                 pred = pred * app_gain[fi] + app_bias[fi]
@@ -1322,6 +1504,31 @@ def main():
         default=0.001,
         help="floor for a gaussian's smallest axis, in WORLD metres "
         "(anisotropy is separately capped by --aniso-cap)",
+    )
+    p.add_argument(
+        "--depth-loss",
+        type=float,
+        default=0.0,
+        help="weight of an inverse-depth L1 loss against a Depth Anything V2 "
+        "prior anchored to the LiDAR cloud (0 = off). Targets near-field "
+        "geometry the photometric loss blurs; start at 0.05. Needs the "
+        "'transformers' package; first use downloads the model checkpoint "
+        "(~1.3 GB for ViT-L) to the HuggingFace cache.",
+    )
+    p.add_argument(
+        "--depth-model",
+        default="depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf",
+        help="HuggingFace model id for the --depth-loss prior; the "
+        "-Small-/-Base- variants trade accuracy for speed/VRAM.",
+    )
+    p.add_argument(
+        "--max-scale",
+        type=float,
+        default=0.12,
+        help="cap for a gaussian's largest axis, in WORLD metres. Bounds each "
+        "gaussian's pixel footprint and hence gsplat's tile-intersection "
+        "buffer (the mid-run OOM driver); 0.12 matches the proven champion "
+        "clamp (~12 cm).",
     )
     p.add_argument(
         "--aniso-cap",
@@ -1534,6 +1741,11 @@ def main():
         f"{frames[0]['image'].shape[0]} (downscale {args.downscale})",
         flush=True,
     )
+    if args.depth_loss > 0:
+        # Must run here: anchoring projects the cloud with the WORLD-frame
+        # viewmats, which train_splat rewrites into normalised space.
+        progress(5, "Computing depth priors…")
+        precompute_depth(frames, pts, args.depth_model, args.frame_cache_dir)
     progress(10, f"Training {args.iterations}-iter splat on GPU…")
     try:
         train_splat(
@@ -1555,6 +1767,7 @@ def main():
             min_opacity=args.min_opacity,
             flat_reg=args.flat_reg,
             min_scale=args.min_scale,
+            max_scale=args.max_scale,
             appearance=args.appearance,
             pose_opt=args.pose_opt,
             pose_opt_lr=args.pose_opt_lr,
@@ -1563,6 +1776,7 @@ def main():
             patch_size=args.patch_size,
             densify_strategy=args.densify_strategy,
             aniso_cap=args.aniso_cap,
+            depth_loss=args.depth_loss,
         )
     except RuntimeError as exc:
         # Turn a CUDA OOM traceback into one actionable line (the server surfaces
