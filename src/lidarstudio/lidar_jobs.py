@@ -840,6 +840,39 @@ def _splat_python() -> str:
     return sys.executable
 
 
+@functools.lru_cache(maxsize=1)
+def _sfm_python():
+    """A Python interpreter with the SfM stack (pycolmap + bag/align deps),
+    used by process_sfm.py to auto-generate SfM poses. Same split-interpreter
+    pattern as _splat_python. Returns None when no candidate qualifies —
+    callers then tell the user how to proceed instead of crashing mid-job.
+    Override with $LIDARSTUDIO_SFM_PYTHON.
+    """
+    seen = set()
+    for cand in (
+        os.environ.get("LIDARSTUDIO_SFM_PYTHON"),
+        sys.executable,
+        shutil.which("python3"),
+        "/usr/bin/python3",
+    ):
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        try:
+            r = subprocess.run(
+                [cand, "-c", "import pycolmap, rosbags, scipy, cv2"],
+                capture_output=True,
+                timeout=120,
+            )
+            if r.returncode == 0:
+                if cand != sys.executable:
+                    logging.info("SfM pose generation will use %s (has pycolmap)", cand)
+                return cand
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return None
+
+
 async def _job_splat(project_path, scan_path, options, queue, job=None):
     job = job if job is not None else {}
     proj = Path(project_path)
@@ -882,6 +915,15 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
         )
         return
 
+    # Full-resolution training REQUIRES SfM poses. Odometry poses carry ~0.7°
+    # of error — a >10px misregistration at downscale-1 focal lengths — so the
+    # photometric loss can never converge: the model limps at opacity ~0.03
+    # until MCMC relocation stops (0.8·iters) and then collapses to invisible
+    # 1mm gaussians (observed 2026-07-12: 30k/ds1 run, 13.2 dB, dead splat
+    # after 4 h). When the field is empty we resolve them below (after the
+    # seed cloud is known, since alignment needs its trajectory sidecar):
+    # reuse the project's generated npz, or run process_sfm.py to build one.
+
     # GPU-trained splat: explicit seed cloud if chosen, else the latest
     # trainable coloured cloud in the project.
     from lidarstudio import edit_ops
@@ -896,6 +938,187 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
         trainable = [p for p in pc_files if edit_ops._find_traj(p)]
         if trainable:
             pc_files = trainable
+
+    # Monochromatic seed (the fast --mono generator, or an import without photo
+    # colour): a grey seed trains a grey splat, so colour it from the scan
+    # photos first — same occlusion-aware projection the generator uses — and
+    # train on the coloured copy. Detection is by content (r==g==b everywhere),
+    # since mono clouds share the generated-cloud naming.
+    if pc_files:
+        seed_cloud = pc_files[-1]
+        loop = asyncio.get_event_loop()
+        try:
+            mono = await loop.run_in_executor(
+                None, edit_ops.is_monochrome, str(seed_cloud)
+            )
+        except Exception:
+            mono = False  # unreadable seed → let training surface the real error
+        if mono:
+            if edit_ops._find_traj(seed_cloud) is None:
+                await queue.put(
+                    {
+                        "event": "error",
+                        "message": (
+                            f"{seed_cloud.name} is monochromatic and has no "
+                            "trajectory sidecar (.traj.npz), so it can't be "
+                            "coloured from the scan photos. Pick a generated "
+                            "cloud, or regenerate it from the scan."
+                        ),
+                    }
+                )
+                return
+            recoloured = seed_cloud.with_name(seed_cloud.stem + "_recoloured.ply")
+            if (
+                recoloured.exists()
+                and recoloured.stat().st_mtime >= seed_cloud.stat().st_mtime
+            ):
+                await queue.put(
+                    {
+                        "event": "log",
+                        "message": (
+                            f"Monochromatic seed — reusing existing coloured "
+                            f"copy {recoloured.name}"
+                        ),
+                    }
+                )
+            else:
+                await queue.put(
+                    {
+                        "event": "progress",
+                        "percent": 3,
+                        "message": "Colouring monochromatic seed from scan photos…",
+                    }
+                )
+                await queue.put(
+                    {
+                        "event": "log",
+                        "message": (
+                            f"{seed_cloud.name} has no photo colour — projecting "
+                            "the scan's photos onto it before training (can take "
+                            "a few minutes)…"
+                        ),
+                    }
+                )
+                try:
+                    result = await loop.run_in_executor(
+                        None,
+                        edit_ops.recolour,
+                        str(seed_cloud),
+                        str(recoloured),
+                        str(scan),
+                    )
+                except Exception as exc:
+                    await queue.put(
+                        {
+                            "event": "error",
+                            "message": f"Colouring the mono seed failed: {exc}",
+                        }
+                    )
+                    return
+                await queue.put(
+                    {
+                        "event": "log",
+                        "message": (
+                            f"Coloured {result['coloured']:,}/{result['total']:,} "
+                            f"points → {recoloured.name}"
+                        ),
+                    }
+                )
+            pc_files[-1] = recoloured
+
+    # Resolve SfM poses when the field was left empty: a previously generated
+    # project file is reused at any downscale (better poses never hurt); at
+    # downscale 1, where they are REQUIRED, a missing file is generated now
+    # via process_sfm.py (COLMAP/GLOMAP + LiDAR alignment — CPU-heavy, on the
+    # order of an hour or two, but a one-off per scan).
+    if not sfm_poses:
+        canonical = proj / "sfm" / f"sfm_viewmats_{ts}.npz"
+        if canonical.exists():
+            sfm_poses = str(canonical)
+            await queue.put(
+                {
+                    "event": "log",
+                    "message": f"Using the project's generated SfM poses: {canonical.name}",
+                }
+            )
+        elif int(options.get("downscale", 1)) < 2:
+            traj = edit_ops._find_traj(pc_files[-1]) if pc_files else None
+            if traj is None:
+                await queue.put(
+                    {
+                        "event": "error",
+                        "message": (
+                            "Downscale 1 needs SfM poses, and they can't be "
+                            "auto-generated: the seed cloud has no trajectory "
+                            "sidecar (.traj.npz) to align them to. Pick a "
+                            "generated cloud, or use downscale 2+."
+                        ),
+                    }
+                )
+                return
+            sfm_py = await asyncio.to_thread(_sfm_python)
+            if sfm_py is None:
+                await queue.put(
+                    {
+                        "event": "error",
+                        "message": (
+                            "Downscale 1 needs SfM poses, and no Python with "
+                            "pycolmap was found to generate them (pip install "
+                            "pycolmap, or set $LIDARSTUDIO_SFM_PYTHON). Either "
+                            "install it, set an SfM poses .npz in the quality "
+                            "panel, or use downscale 2+."
+                        ),
+                    }
+                )
+                return
+            await queue.put(
+                {
+                    "event": "progress",
+                    "percent": 1,
+                    "message": (
+                        "No SfM poses for this scan — generating them first "
+                        "(COLMAP + LiDAR alignment, CPU-bound, can take "
+                        "an hour or two; reused by every later run)…"
+                    ),
+                }
+            )
+            sfm_cmd = [
+                sfm_py,
+                str(ROOT / "process_sfm.py"),
+                "--scan",
+                str(scan),
+                "--traj",
+                str(traj),
+                "--output",
+                str(canonical),
+                "--workspace",
+                str(proj / "sfm" / f"work_{ts}"),
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *sfm_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            job["proc"] = proc
+            if job.get("cancelled"):
+                proc.terminate()
+            rc, err = await _stream_proc(proc, queue)
+            job["proc"] = None
+            if job.get("cancelled"):
+                await queue.put(
+                    {"event": "cancelled", "message": "Splat generation stopped."}
+                )
+                return
+            if rc != 0 or not canonical.exists():
+                await queue.put(
+                    {
+                        "event": "error",
+                        "message": err
+                        or f"SfM pose generation failed (exit code {rc})",
+                    }
+                )
+                return
+            sfm_poses = str(canonical)
 
     cmd = [
         _splat_python(),
@@ -923,6 +1146,17 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
         # Anisotropy cap (s_max/s_min). 20:1 champion; raise for thin structures.
         "--aniso-cap",
         str(float(options.get("aniso_cap", 20.0))),
+        # Largest-axis cap in WORLD metres. Bounds per-gaussian pixel footprint
+        # (hence gsplat's tile-intersection VRAM) independent of scene extent —
+        # the old normalised-unit clamp let spread-out scenes grow 25 cm splats
+        # and OOM a 24 GB card mid-run.
+        "--max-scale",
+        str(float(options.get("max_scale", 0.12))),
+        # Depth-prior loss (Depth Anything V2 anchored to the LiDAR cloud),
+        # aimed at near-field softness. Experimental: off by default until an
+        # A/B run proves it; enable per-run via options.depth_loss ≈ 0.05.
+        "--depth-loss",
+        str(float(options.get("depth_loss", 0.0))),
         # In-training pose-opt defaults ON but diverges on these SfM/odometry
         # poses (the campaign retired it); keep it off for app runs.
         "--no-pose-opt",
@@ -937,6 +1171,27 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
     ]
     if sfm_poses:
         cmd += ["--sfm-poses", sfm_poses]
+        # process_sfm.py stores the bundle-adjusted OPENCV_FISHEYE intrinsics
+        # alongside the poses; undistorting with the same lens model the poses
+        # were optimised under avoids baking a ~2px radial warp into training.
+        try:
+            import numpy as np
+
+            with np.load(sfm_poses) as d:
+                fisheye = d["fisheye_params"] if "fisheye_params" in d.files else None
+        except Exception:
+            fisheye = None  # hand-supplied npz without the extra key — fine
+        if fisheye is not None and len(fisheye) == 8:
+            cmd += [
+                "--fisheye-intrinsics",
+                ",".join(f"{float(v):.10g}" for v in fisheye),
+            ]
+            await queue.put(
+                {
+                    "event": "log",
+                    "message": "Using SfM-refined fisheye intrinsics from the pose file.",
+                }
+            )
     if pc_files:
         cmd += ["--pointcloud", str(pc_files[-1])]
         await queue.put(

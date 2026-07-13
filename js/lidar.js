@@ -516,7 +516,7 @@ export function initLidarPanel() {
   // Anisotropy cap: independent expert override (NOT driven by the quality
   // preset). 20:1 is the champion; raise for cables/thin structure.
   const anisoInput = el('input', { type: 'number', step: '5', min: '2', max: '200', value: '20' });
-  const sfmInput = el('input', { placeholder: 'SfM poses .npz (optional, biggest quality lever)' });
+  const sfmInput = el('input', { placeholder: 'auto — generated when needed; or path to a .npz' });
   // Repopulate the individual controls from a quality preset (1-based index).
   const applyQuality = (idx) => {
     const q = QUALITY[Math.min(3, Math.max(0, idx - 1))];
@@ -562,10 +562,14 @@ export function initLidarPanel() {
         + 'clamp still keeps needles from blowing up GPU memory. Not changed by the quality slider.')),
     el('div', { class: 'row', style: 'align-items:center' },
       el('label', { class: 'muted', style: 'flex:1' }, 'SfM poses', sfmInput),
-      infoIcon('Optional .npz of camera poses from Structure-from-Motion (COLMAP/GLOMAP, '
-        + 'aligned to the LiDAR frame). The single biggest quality lever (~+4 dB, '
-        + 'walls-to-parity) — it corrects per-frame camera drift. Leave empty to use the '
-        + 'LiDAR-odometry poses.', 'SfM poses')));
+      infoIcon('Camera poses from Structure-from-Motion (COLMAP/GLOMAP, aligned to the '
+        + 'LiDAR frame). The single biggest quality lever (~+4 dB, walls-to-parity) — it '
+        + 'corrects per-frame camera drift. Leave empty for automatic handling: an '
+        + 'already-generated project pose file is reused, and a full-resolution '
+        + '(downscale 1) run generates one first if missing — a CPU-only step of an hour '
+        + 'or two, done once per scan and stored in the project’s sfm/ folder. '
+        + 'Downscale 2+ without a pose file uses the LiDAR-odometry poses. A path entered '
+        + 'here overrides all of that.', 'SfM poses')));
   // Seed cloud: 'auto' uses the latest project cloud; any other entry pins the
   // splat to that exact cloud — e.g. an edited one.
   const seedSel = el('select', {}, el('option', { value: '' }, 'seed cloud: auto'));

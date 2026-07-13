@@ -151,6 +151,27 @@ def apply_edit(in_path, out_path, op, params):
     }
 
 
+def is_monochrome(path, sample=200_000):
+    """True when a CLOUD carries no photo colour — greyscale (r==g==b for every
+    point: the ``--mono`` generator's intensity shading, or its uniform-grey
+    fallback) or no colour properties at all. Splats (f_dc_*) are never mono
+    here: recolouring a splat seed is a separate, explicit edit."""
+    import numpy as np
+    from plyfile import PlyData
+
+    v = PlyData.read(str(path))["vertex"].data
+    names = set(v.dtype.names or ())
+    if "f_dc_0" in names:
+        return False
+    if not {"red", "green", "blue"} <= names:
+        return True
+    idx = np.linspace(0, len(v) - 1, min(sample, len(v))).astype(np.int64)
+    return bool(
+        np.array_equal(v["red"][idx], v["green"][idx])
+        and np.array_equal(v["green"][idx], v["blue"][idx])
+    )
+
+
 def _find_traj(path):
     """Locate the trajectory sidecar for a cloud/splat, resolving chained and
     numbered ``_edited`` / ``_recoloured`` names back to the base cloud (e.g.
