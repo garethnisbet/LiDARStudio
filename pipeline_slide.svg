@@ -1,0 +1,210 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" width="1920" height="1080" font-family="'Segoe UI','SF Pro Text','Helvetica Neue','DejaVu Sans',Arial,sans-serif">
+  <defs>
+    <marker id="ah" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="9" refY="5" orient="auto">
+      <path d="M1 1 L10 5 L1 9 Z" fill="#5E7396"/>
+    </marker>
+    <pattern id="dots" width="34" height="34" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="1" fill="#17233A"/>
+    </pattern>
+  </defs>
+
+  <!-- ground -->
+  <rect width="1920" height="1080" fill="#0A101D"/>
+  <rect width="1920" height="1080" fill="url(#dots)"/>
+
+  <!-- lidar pulse arcs, top-right -->
+  <g fill="none" stroke="#3B7C8C">
+    <path d="M1850 0 A70 70 0 0 1 1920 70" stroke-opacity=".5" stroke-width="1.5"/>
+    <path d="M1800 0 A120 120 0 0 1 1920 120" stroke-opacity=".35" stroke-width="1.5"/>
+    <path d="M1750 0 A170 170 0 0 1 1920 170" stroke-opacity=".22" stroke-width="1.5"/>
+  </g>
+  <g fill="#4CC3D9">
+    <circle cx="1857" cy="42" r="2.2" fill-opacity=".8"/>
+    <circle cx="1835" cy="85" r="2.2" fill-opacity=".55"/>
+    <circle cx="1885" cy="166" r="2.2" fill-opacity=".4"/>
+  </g>
+
+  <!-- header -->
+  <text x="64" y="54" font-size="13" letter-spacing="3" fill="#4CC3D9" font-weight="600">LIDARSTUDIO · PROCESSING PIPELINE</text>
+  <text x="64" y="99" font-size="38" font-weight="650" fill="#E9EEF7">From handheld scan to editable Gaussian splat</text>
+  <text x="64" y="133" font-size="17" fill="#93A2BD">Four processing stages, their internal sequence, and the libraries that run them</text>
+
+  <!-- legend -->
+  <g font-family="'Cascadia Code','JetBrains Mono','DejaVu Sans Mono',Menlo,Consolas,monospace" font-size="12">
+    <rect x="1495" y="52" width="128" height="26" rx="13" fill="#241C0E" stroke="#6E5426"/>
+    <text x="1559" y="69" text-anchor="middle" fill="#E2AC61">data artifact</text>
+    <rect x="1637" y="52" width="86" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/>
+    <text x="1680" y="69" text-anchor="middle" fill="#A9BBD6">library</text>
+  </g>
+
+  <!-- ================= connectors (under cards) ================= -->
+  <g fill="none" stroke="#45597E" stroke-width="2">
+    <!-- spine -->
+    <path d="M460 390 H522" marker-end="url(#ah)"/>
+    <path d="M930 390 H992" marker-end="url(#ah)"/>
+    <path d="M1400 390 H1462" marker-end="url(#ah)"/>
+    <!-- capture -> sfm (fisheye frames) -->
+    <path d="M180 590 V810 H737" marker-end="url(#ah)"/>
+    <!-- pointcloud -> sfm (trajectory anchor) -->
+    <path d="M838 590 V662" marker-end="url(#ah)"/>
+    <!-- sfm -> splat (poses) -->
+    <path d="M1100 670 V598" marker-end="url(#ah)"/>
+    <!-- pointcloud -> mesh (dense cloud), lower lane -->
+    <path d="M600 590 V1000 H1656 V913" marker-end="url(#ah)"/>
+    <!-- mesh -> viewer -->
+    <path d="M1800 680 V598" marker-end="url(#ah)"/>
+  </g>
+  <g font-family="'Cascadia Code','JetBrains Mono','DejaVu Sans Mono',Menlo,Consolas,monospace" font-size="12.5" fill="#E2AC61">
+    <text x="850" y="634">trajectory (.traj.npz)</text>
+    <text x="1112" y="638">sfm_viewmats.npz · K·D</text>
+    <text x="1788" y="642" text-anchor="end">mesh .ply</text>
+  </g>
+  <!-- lane chips -->
+  <g font-family="'Cascadia Code','JetBrains Mono','DejaVu Sans Mono',Menlo,Consolas,monospace" font-size="12.5">
+    <rect x="388" y="797" width="144" height="26" rx="13" fill="#241C0E" stroke="#6E5426"/>
+    <text x="460" y="814" text-anchor="middle" fill="#E2AC61">922 fisheye frames</text>
+    <rect x="1265" y="987" width="130" height="26" rx="13" fill="#241C0E" stroke="#6E5426"/>
+    <text x="1330" y="1004" text-anchor="middle" fill="#E2AC61">dense cloud .ply</text>
+  </g>
+
+  <!-- ================= stage 01 · capture ================= -->
+  <g transform="translate(60,190)">
+    <rect width="400" height="400" rx="14" fill="#101828" stroke="#223350"/>
+    <text x="24" y="42" font-size="13.5" letter-spacing="1.5" font-weight="600" fill="#4CC3D9">01 · CAPTURE</text>
+    <text x="376" y="42" text-anchor="end" font-size="12" fill="#5A6A86" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">JMK7 · ROS 1</text>
+    <text x="24" y="78" font-size="23" font-weight="650" fill="#E9EEF7">JMK7 handheld scan</text>
+    <line x1="24" y1="94" x2="376" y2="94" stroke="#1E2C47"/>
+    <g font-size="14.5" fill="#C9D4E6">
+      <text x="26" y="130" font-size="12" fill="#55688C" font-family="monospace">1</text><text x="52" y="130">LiDAR sweeps — /vanjee_722z · 10 Hz</text>
+      <text x="26" y="164" font-size="12" fill="#55688C" font-family="monospace">2</text><text x="52" y="164">IMU gyro — /vanjee_imu_packets · 200 Hz</text>
+      <text x="26" y="198" font-size="12" fill="#55688C" font-family="monospace">3</text><text x="52" y="198">Fisheye photos — /camera_front · 3.3 Hz</text>
+      <text x="26" y="232" font-size="12" fill="#55688C" font-family="monospace">4</text><text x="52" y="232">Factory calib — fisheye K·D + extrinsic</text>
+    </g>
+    <polygon points="24,307 31,311.5 24,316" fill="#E2AC61"/>
+    <text x="40" y="316" font-size="13" fill="#E2AC61" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">LIDAR_*.bag · IMAGE_*.bag · calib.json</text>
+    <g font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace" font-size="11.5">
+      <rect x="24" y="340" width="186" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/>
+      <text x="117" y="357" text-anchor="middle" fill="#A9BBD6">ROS 1 · read via rosbags</text>
+    </g>
+  </g>
+
+  <!-- ================= stage 02 · point cloud ================= -->
+  <g transform="translate(530,190)">
+    <rect width="400" height="400" rx="14" fill="#101828" stroke="#223350"/>
+    <text x="24" y="42" font-size="13.5" letter-spacing="1.5" font-weight="600" fill="#4CC3D9">02 · POINT CLOUD</text>
+    <text x="376" y="42" text-anchor="end" font-size="12" fill="#5A6A86" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">process_pointcloud.py</text>
+    <text x="24" y="78" font-size="23" font-weight="650" fill="#E9EEF7">Odometry &amp; colouring</text>
+    <line x1="24" y1="94" x2="376" y2="94" stroke="#1E2C47"/>
+    <g font-size="14.5" fill="#C9D4E6">
+      <text x="26" y="130" font-size="12" fill="#55688C" font-family="monospace">1</text><text x="52" y="130">Read sweeps + IMU from bags</text>
+      <text x="26" y="164" font-size="12" fill="#55688C" font-family="monospace">2</text><text x="52" y="164">Gyro integrate → level + deskew</text>
+      <text x="26" y="198" font-size="12" fill="#55688C" font-family="monospace">3</text><text x="52" y="198">KISS-ICP odometry → trajectory</text>
+      <text x="26" y="232" font-size="12" fill="#55688C" font-family="monospace">4</text><text x="52" y="232">Fisheye reprojection → point colour</text>
+      <text x="26" y="266" font-size="12" fill="#55688C" font-family="monospace">5</text><text x="52" y="266">Voxel-merge dense cloud</text>
+    </g>
+    <polygon points="24,307 31,311.5 24,316" fill="#E2AC61"/>
+    <text x="40" y="316" font-size="13" fill="#E2AC61" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">dense .ply + .traj.npz sidecar</text>
+    <g font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace" font-size="11.5" fill="#A9BBD6">
+      <rect x="24" y="340" width="67" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="57" y="357" text-anchor="middle">rosbags</text>
+      <rect x="99" y="340" width="74" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="136" y="357" text-anchor="middle">kiss-icp</text>
+      <rect x="181" y="340" width="60" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="211" y="357" text-anchor="middle">OpenCV</text>
+      <rect x="249" y="340" width="60" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="279" y="357" text-anchor="middle">Open3D</text>
+      <rect x="317" y="340" width="53" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="343" y="357" text-anchor="middle">SciPy</text>
+    </g>
+  </g>
+
+  <!-- ================= stage 04 · splat training ================= -->
+  <g transform="translate(1000,190)">
+    <rect width="400" height="400" rx="14" fill="#101828" stroke="#223350"/>
+    <text x="24" y="42" font-size="13.5" letter-spacing="1.5" font-weight="600" fill="#4CC3D9">04 · SPLAT TRAINING</text>
+    <text x="376" y="42" text-anchor="end" font-size="12" fill="#5A6A86" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">process_splat.py</text>
+    <text x="24" y="78" font-size="23" font-weight="650" fill="#E9EEF7">3D Gaussian optimisation</text>
+    <line x1="24" y1="94" x2="376" y2="94" stroke="#1E2C47"/>
+    <g font-size="14.5" fill="#C9D4E6">
+      <text x="26" y="130" font-size="12" fill="#55688C" font-family="monospace">1</text><text x="52" y="130">Undistort fisheye → pinhole (refined)</text>
+      <text x="26" y="164" font-size="12" fill="#55688C" font-family="monospace">2</text><text x="52" y="164">Blur filter · uint8 memmap cache</text>
+      <text x="26" y="198" font-size="12" fill="#55688C" font-family="monospace">3</text><text x="52" y="198">Seed from dense cloud — PCA surfels</text>
+      <text x="26" y="232" font-size="12" fill="#55688C" font-family="monospace">4</text><text x="52" y="232">MCMC densify · L1 + SSIM · appearance</text>
+      <text x="26" y="266" font-size="12" fill="#55688C" font-family="monospace">5</text><text x="52" y="266">Opacity &amp; shape regs · aniso cap 20:1</text>
+    </g>
+    <polygon points="24,307 31,311.5 24,316" fill="#E2AC61"/>
+    <text x="40" y="316" font-size="13" fill="#E2AC61" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">splat .ply — 3.46 M gaussians, SH 3</text>
+    <g font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace" font-size="11.5" fill="#A9BBD6">
+      <rect x="24" y="340" width="67" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="57" y="357" text-anchor="middle">PyTorch</text>
+      <rect x="99" y="340" width="95" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="146" y="357" text-anchor="middle">gsplat+CUDA</text>
+      <rect x="202" y="340" width="60" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="232" y="357" text-anchor="middle">OpenCV</text>
+      <rect x="270" y="340" width="67" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="303" y="357" text-anchor="middle">plyfile</text>
+    </g>
+  </g>
+
+  <!-- ================= output · view & edit ================= -->
+  <g transform="translate(1470,190)">
+    <rect width="400" height="400" rx="14" fill="#101828" stroke="#223350"/>
+    <text x="24" y="42" font-size="13.5" letter-spacing="1.5" font-weight="600" fill="#4CC3D9">OUTPUT · VIEW &amp; EDIT</text>
+    <text x="376" y="42" text-anchor="end" font-size="12" fill="#5A6A86" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">server.py · js/</text>
+    <text x="24" y="78" font-size="23" font-weight="650" fill="#E9EEF7">Browser viewer &amp; editor</text>
+    <line x1="24" y1="94" x2="376" y2="94" stroke="#1E2C47"/>
+    <g font-size="14.5" fill="#C9D4E6">
+      <text x="26" y="130" font-size="12" fill="#55688C" font-family="monospace">1</text><text x="52" y="130">aiohttp server — jobs · projects</text>
+      <text x="26" y="164" font-size="12" fill="#55688C" font-family="monospace">2</text><text x="52" y="164">Three.js WebGL viewer · WebXR</text>
+      <text x="26" y="198" font-size="12" fill="#55688C" font-family="monospace">3</text><text x="52" y="198">Crop · erase · decimate · denoise</text>
+      <text x="26" y="232" font-size="12" fill="#55688C" font-family="monospace">4</text><text x="52" y="232">Save As → seeds a new training run</text>
+    </g>
+    <polygon points="24,307 31,311.5 24,316" fill="#E2AC61"/>
+    <text x="40" y="316" font-size="13" fill="#E2AC61" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">edited .ply — round-trips to 04</text>
+    <g font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace" font-size="11.5" fill="#A9BBD6">
+      <rect x="24" y="340" width="67" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="57" y="357" text-anchor="middle">aiohttp</text>
+      <rect x="99" y="340" width="74" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="136" y="357" text-anchor="middle">Three.js</text>
+      <rect x="181" y="340" width="53" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="207" y="357" text-anchor="middle">WebGL</text>
+    </g>
+  </g>
+
+  <!-- ================= stage 03 · sfm poses (lower lane) ================= -->
+  <g transform="translate(745,670)">
+    <rect width="440" height="320" rx="14" fill="#101828" stroke="#223350"/>
+    <text x="24" y="40" font-size="13.5" letter-spacing="1.5" font-weight="600" fill="#4CC3D9">03 · SFM POSES</text>
+    <text x="416" y="40" text-anchor="end" font-size="12" fill="#5A6A86" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">colmap_run.py · align_sfm.py</text>
+    <text x="24" y="76" font-size="23" font-weight="650" fill="#E9EEF7">COLMAP · GLOMAP refinement</text>
+    <line x1="24" y1="92" x2="416" y2="92" stroke="#1E2C47"/>
+    <g font-size="14.5" fill="#C9D4E6">
+      <text x="26" y="124" font-size="12" fill="#55688C" font-family="monospace">1</text><text x="52" y="124">Rotate 922 frames to portrait</text>
+      <text x="26" y="155" font-size="12" fill="#55688C" font-family="monospace">2</text><text x="52" y="155">SIFT + sequential &amp; loop matching</text>
+      <text x="26" y="186" font-size="12" fill="#55688C" font-family="monospace">3</text><text x="52" y="186">GLOMAP mapping → 922/922 poses</text>
+      <text x="26" y="217" font-size="12" fill="#55688C" font-family="monospace">4</text><text x="52" y="217">Refine fisheye intrinsics fx · k1–k4</text>
+      <text x="26" y="248" font-size="12" fill="#55688C" font-family="monospace">5</text><text x="52" y="248">Umeyama sim(3) → LiDAR world frame</text>
+    </g>
+    <polygon points="24,269 31,273.5 24,278" fill="#E2AC61"/>
+    <text x="40" y="278" font-size="13" fill="#E2AC61" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">sfm_viewmats.npz · refined K·D</text>
+    <g font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace" font-size="11.5" fill="#A9BBD6">
+      <rect x="24" y="286" width="74" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="61" y="303" text-anchor="middle">pycolmap</text>
+      <rect x="106" y="286" width="60" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="136" y="303" text-anchor="middle">GLOMAP</text>
+      <rect x="174" y="286" width="60" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="204" y="303" text-anchor="middle">OpenCV</text>
+      <rect x="242" y="286" width="53" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="268" y="303" text-anchor="middle">SciPy</text>
+    </g>
+  </g>
+
+  <!-- ================= alt output · mesh ================= -->
+  <g transform="translate(1490,680)">
+    <rect width="380" height="235" rx="14" fill="#101828" stroke="#223350"/>
+    <text x="24" y="38" font-size="13.5" letter-spacing="1.5" font-weight="600" fill="#4CC3D9">ALT · MESH</text>
+    <text x="356" y="38" text-anchor="end" font-size="12" fill="#5A6A86" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">process_mesh.py</text>
+    <text x="24" y="72" font-size="23" font-weight="650" fill="#E9EEF7">Screened-Poisson surface</text>
+    <line x1="24" y1="88" x2="356" y2="88" stroke="#1E2C47"/>
+    <g font-size="14.5" fill="#C9D4E6">
+      <text x="26" y="120" font-size="12" fill="#55688C" font-family="monospace">1</text><text x="52" y="120">Estimate normals on dense cloud</text>
+      <text x="26" y="152" font-size="12" fill="#55688C" font-family="monospace">2</text><text x="52" y="152">Screened Poisson → coloured mesh</text>
+    </g>
+    <polygon points="24,175 31,179.5 24,184" fill="#E2AC61"/>
+    <text x="40" y="184" font-size="13" fill="#E2AC61" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">mesh .ply</text>
+    <g font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace" font-size="11.5" fill="#A9BBD6">
+      <rect x="24" y="194" width="60" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="54" y="211" text-anchor="middle">Open3D</text>
+    </g>
+  </g>
+
+  <!-- footer -->
+  <line x1="64" y1="1024" x2="1856" y2="1024" stroke="#1B2A44"/>
+  <g font-size="13" fill="#5A6A86">
+    <text x="64" y="1054">Reference scan 20260527212832 — 283 s handheld · 2,834 LiDAR sweeps · 922 fisheye photos · NumPy throughout</text>
+    <text x="1856" y="1054" text-anchor="end">Trained on RTX 3090 24 GB · CUDA 12.1</text>
+  </g>
+</svg>
