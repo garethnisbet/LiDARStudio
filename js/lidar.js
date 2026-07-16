@@ -498,15 +498,18 @@ export function initLidarPanel() {
   // The shape/opacity recipe constants live as process_splat.py defaults; only
   // the resolution / count / sharpness knobs scale with quality here.
   // Caps stop at 3M: at downscale-1 that is the largest count that fits the
-  // 24 GB campaign card (6M/ds1 never completed — see the scale-clamp note in
-  // process_splat.py). 'max' is the validated champion recipe; it is the default.
+  // 24 GB campaign card (a 6M A/B scored WORSE — capacity is not the lever).
+  // 'max' is the validated champion recipe; it is the default. 'ultra' = max +
+  // the LiDAR-anchored depth prior: slightly crisper fine detail, but the
+  // prior computation alone runs for hours before training starts.
   const QUALITY = [
     { name: 'draft',    iterations: 3000,  downscale: 4, cap: 1, dropBlurry: 0,    undistortScale: 1.0 },
     { name: 'balanced', iterations: 7000,  downscale: 2, cap: 3, dropBlurry: 0.15, undistortScale: 1.0 },
     { name: 'high',     iterations: 15000, downscale: 1, cap: 3, dropBlurry: 0.15, undistortScale: 1.0 },
     { name: 'max',      iterations: 30000, downscale: 1, cap: 3, dropBlurry: 0.15, undistortScale: 1.3 },
+    { name: 'ultra',    iterations: 30000, downscale: 1, cap: 3, dropBlurry: 0.15, undistortScale: 1.3, depthLoss: 0.05 },
   ];
-  const qSlider = el('input', { type: 'range', min: '1', max: '4', step: '1', value: '4', style: 'flex:1' });
+  const qSlider = el('input', { type: 'range', min: '1', max: '5', step: '1', value: '4', style: 'flex:1' });
   const qName = el('span', { class: 'muted', style: 'min-width:64px;text-align:right' }, 'max');
   const iterInput = el('input', { type: 'number', step: '1000', min: '500', value: '30000' });
   const downInput = el('input', { type: 'number', step: '1', min: '1', max: '8', value: '1' });
@@ -520,13 +523,17 @@ export function initLidarPanel() {
   // preset). 0 = full-frame rendering (max photometric throughput; falls back
   // to auto-shrunk patches only if a step OOMs).
   const patchInput = el('input', { type: 'number', step: '100', min: '0', max: '8192', value: '0' });
+  // Depth-prior weight (--depth-loss). Preset-driven: 0 everywhere except
+  // 'ultra' (0.05); editable by hand for other weights.
+  const depthInput = el('input', { type: 'number', step: '0.01', min: '0', max: '1', value: '0' });
   const sfmInput = el('input', { placeholder: 'auto — generated when needed; or path to a .npz' });
   // Repopulate the individual controls from a quality preset (1-based index).
   const applyQuality = (idx) => {
-    const q = QUALITY[Math.min(3, Math.max(0, idx - 1))];
+    const q = QUALITY[Math.min(QUALITY.length - 1, Math.max(0, idx - 1))];
     qName.textContent = q.name;
     iterInput.value = q.iterations; downInput.value = q.downscale;
     capInput.value = q.cap; dropInput.value = q.dropBlurry; usInput.value = q.undistortScale;
+    depthInput.value = q.depthLoss || 0;
   };
   qSlider.addEventListener('input', () => applyQuality(parseInt(qSlider.value)));
   const qLbl = (t, inp, info) =>
@@ -535,8 +542,11 @@ export function initLidarPanel() {
     el('div', { class: 'row', style: 'align-items:center' },
       el('span', { class: 'muted', style: 'min-width:52px' }, 'quality'), qSlider, qName,
       infoIcon('Master preset, from draft (fast preview) to max — the campaign champion: '
-        + 'full resolution, 3M splats, 30k iterations, sharpen 1.3 (~3–4 h; the largest '
-        + 'count that fits a 24 GB card at full res). Defaults to max. Moving the slider '
+        + 'full resolution, 3M splats, 30k iterations, sharpen 1.3 (~3 h; the largest '
+        + 'count that fits a 24 GB card at full res). Defaults to max. ultra = max plus a '
+        + 'LiDAR-anchored depth prior for slightly crisper fine detail — but expect roughly '
+        + '3× the total runtime: computing the priors alone takes hours (~6 h for a '
+        + '780-frame scan on an RTX 3090) before training even starts. Moving the slider '
         + 'sets the individual controls below, which you can still fine-tune by hand.', 'Quality')),
     el('div', { class: 'row' },
       qLbl('iterations', iterInput,
@@ -570,7 +580,16 @@ export function initLidarPanel() {
         + 'bounding GPU memory — but each step then only teaches the splats under the crop, '
         + 'so a 30k-step run at full resolution does ~10× less photometric work and comes out '
         + 'soft. 0 renders full frames (sharpest; auto-falls back to patches only if a step '
-        + 'runs out of GPU memory). Not changed by the quality slider.')),
+        + 'runs out of GPU memory). Not changed by the quality slider.'),
+      qLbl('depth prior', depthInput,
+        'Weight of a monocular depth prior (Depth Anything V2, anchored to the LiDAR '
+        + 'cloud) pulling rendered depth toward the prediction — slightly crisper fine '
+        + 'detail. 0 = off; the ultra preset sets 0.05. WARNING: expect a much longer '
+        + 'run — the priors are computed per frame before training starts (~6 h for a '
+        + '780-frame full-res scan on an RTX 3090, plus a ~30 GB temporary cache on the '
+        + 'frame-cache disk); training itself adds the usual ~3 h after that. Needs the '
+        + "'transformers' package in the training interpreter; the first use downloads "
+        + 'the ~1.3 GB model.')),
     el('div', { class: 'row', style: 'align-items:center' },
       el('label', { class: 'muted', style: 'flex:1' }, 'SfM poses', sfmInput),
       infoIcon('Camera poses from Structure-from-Motion (COLMAP/GLOMAP, aligned to the '
@@ -762,6 +781,7 @@ export function initLidarPanel() {
           aniso_cap: parseFloat(anisoInput.value) || 20,
           // NB: 0 is a real value (full-frame), so don't use `||` here.
           patch_size: Number.isNaN(parseInt(patchInput.value)) ? 0 : parseInt(patchInput.value),
+          depth_loss: parseFloat(depthInput.value) || 0,
           ...(sfmInput.value.trim() ? { sfm_poses: sfmInput.value.trim() } : {}),
           ...(seedSel.value ? { pointcloud: seedSel.value } : {}) }
       : type === 'mesh'
@@ -1377,7 +1397,8 @@ export function initLidarPanel() {
       type: typeSel.value, voxel: voxelInput.value,
       quality: qSlider.value, iterations: iterInput.value, downscale: downInput.value,
       cap: capInput.value, dropBlurry: dropInput.value, undistortScale: usInput.value,
-      anisoCap: anisoInput.value, patchSize: patchInput.value, sfm: sfmInput.value,
+      anisoCap: anisoInput.value, patchSize: patchInput.value, depthLoss: depthInput.value,
+      sfm: sfmInput.value,
       editOp: editOp.value, factor: facInput.value,
       sorNb: sorNb.value, sorStd: sorStd.value,
       cropInvert: invCb.checked, regionLimit: regionCb.checked,
@@ -1393,7 +1414,8 @@ export function initLidarPanel() {
     // the user may have hand-tuned individual controls before saving).
     setVal(qSlider, 'quality'); setVal(iterInput, 'iterations'); setVal(downInput, 'downscale');
     setVal(capInput, 'cap'); setVal(dropInput, 'dropBlurry'); setVal(usInput, 'undistortScale');
-    setVal(anisoInput, 'anisoCap'); setVal(patchInput, 'patchSize'); setVal(sfmInput, 'sfm');
+    setVal(anisoInput, 'anisoCap'); setVal(patchInput, 'patchSize');
+    setVal(depthInput, 'depthLoss'); setVal(sfmInput, 'sfm');
     if (s.quality != null) qName.textContent = (QUALITY[parseInt(s.quality) - 1] || {}).name || '';
     setVal(editOp, 'editOp'); setVal(facInput, 'factor');
     setVal(sorNb, 'sorNb'); setVal(sorStd, 'sorStd');
