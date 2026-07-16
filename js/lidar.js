@@ -516,6 +516,10 @@ export function initLidarPanel() {
   // Anisotropy cap: independent expert override (NOT driven by the quality
   // preset). 20:1 is the champion; raise for cables/thin structure.
   const anisoInput = el('input', { type: 'number', step: '5', min: '2', max: '200', value: '20' });
+  // Render-patch size: independent expert override (NOT driven by the quality
+  // preset). 0 = full-frame rendering (max photometric throughput; falls back
+  // to auto-shrunk patches only if a step OOMs).
+  const patchInput = el('input', { type: 'number', step: '100', min: '0', max: '8192', value: '0' });
   const sfmInput = el('input', { placeholder: 'auto — generated when needed; or path to a .npz' });
   // Repopulate the individual controls from a quality preset (1-based index).
   const applyQuality = (idx) => {
@@ -560,6 +564,13 @@ export function initLidarPanel() {
         + 'it bounds each splat’s footprint (and VRAM). Raise toward 50–100 for scenes with '
         + 'cables / thin structures so they can form needle-shaped splats; the absolute-scale '
         + 'clamp still keeps needles from blowing up GPU memory. Not changed by the quality slider.')),
+    el('div', { class: 'row' },
+      qLbl('patch px', patchInput,
+        'Training-render window in pixels. Frames larger than this train on random crops, '
+        + 'bounding GPU memory — but each step then only teaches the splats under the crop, '
+        + 'so a 30k-step run at full resolution does ~10× less photometric work and comes out '
+        + 'soft. 0 renders full frames (sharpest; auto-falls back to patches only if a step '
+        + 'runs out of GPU memory). Not changed by the quality slider.')),
     el('div', { class: 'row', style: 'align-items:center' },
       el('label', { class: 'muted', style: 'flex:1' }, 'SfM poses', sfmInput),
       infoIcon('Camera poses from Structure-from-Motion (COLMAP/GLOMAP, aligned to the '
@@ -749,6 +760,8 @@ export function initLidarPanel() {
           drop_blurry: parseFloat(dropInput.value) || 0,
           undistort_scale: parseFloat(usInput.value) || 1.0,
           aniso_cap: parseFloat(anisoInput.value) || 20,
+          // NB: 0 is a real value (full-frame), so don't use `||` here.
+          patch_size: Number.isNaN(parseInt(patchInput.value)) ? 0 : parseInt(patchInput.value),
           ...(sfmInput.value.trim() ? { sfm_poses: sfmInput.value.trim() } : {}),
           ...(seedSel.value ? { pointcloud: seedSel.value } : {}) }
       : type === 'mesh'
@@ -1364,7 +1377,7 @@ export function initLidarPanel() {
       type: typeSel.value, voxel: voxelInput.value,
       quality: qSlider.value, iterations: iterInput.value, downscale: downInput.value,
       cap: capInput.value, dropBlurry: dropInput.value, undistortScale: usInput.value,
-      anisoCap: anisoInput.value, sfm: sfmInput.value,
+      anisoCap: anisoInput.value, patchSize: patchInput.value, sfm: sfmInput.value,
       editOp: editOp.value, factor: facInput.value,
       sorNb: sorNb.value, sorStd: sorStd.value,
       cropInvert: invCb.checked, regionLimit: regionCb.checked,
@@ -1380,7 +1393,7 @@ export function initLidarPanel() {
     // the user may have hand-tuned individual controls before saving).
     setVal(qSlider, 'quality'); setVal(iterInput, 'iterations'); setVal(downInput, 'downscale');
     setVal(capInput, 'cap'); setVal(dropInput, 'dropBlurry'); setVal(usInput, 'undistortScale');
-    setVal(anisoInput, 'anisoCap'); setVal(sfmInput, 'sfm');
+    setVal(anisoInput, 'anisoCap'); setVal(patchInput, 'patchSize'); setVal(sfmInput, 'sfm');
     if (s.quality != null) qName.textContent = (QUALITY[parseInt(s.quality) - 1] || {}).name || '';
     setVal(editOp, 'editOp'); setVal(facInput, 'factor');
     setVal(sorNb, 'sorNb'); setVal(sorStd, 'sorStd');

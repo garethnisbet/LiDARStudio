@@ -1160,11 +1160,14 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
         # In-training pose-opt defaults ON but diverges on these SfM/odometry
         # poses (the campaign retired it); keep it off for app runs.
         "--no-pose-opt",
-        # Patch training: render random crops so GPU memory is bounded by the
-        # patch, not the (downscale-1) frame size — lets high-quality runs fit
-        # without OOM. Frames smaller than this render whole (no-op).
+        # Patch training (0 = full-frame, the default): random crops bound GPU
+        # memory by the patch instead of the frame, but each step then teaches
+        # only the splats under the crop — ~3-4 dB softer at identical wall
+        # time on the JMK7 scene. Full-frame is safe since the world-metric
+        # --max-scale clamp bounds VRAM (9.1/24 GB at ds1/3.5M), and the
+        # trainer auto-falls back to patches if a step OOMs.
         "--patch-size",
-        str(int(options.get("patch_size", 1600))),
+        str(int(options.get("patch_size", 0))),
         # On-disk frame cache: the undistorted uint8 frames can exceed host RAM
         # at downscale-1 / high undistort-scale; memmap them so RSS stays flat.
         "--memmap-frames",

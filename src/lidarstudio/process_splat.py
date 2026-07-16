@@ -858,6 +858,8 @@ def train_splat(
     densify_strategy: str = "mcmc",
     aniso_cap: float = 20.0,
     depth_loss: float = 0.0,
+    means_lr_decay: float = 0.01,
+    antialiased: bool = True,
 ):
     import cv2
     import numpy as np
@@ -1082,6 +1084,11 @@ def train_splat(
             height=ch,
             sh_degree=sh_deg,
             packed=True,
+            # Mip-Splatting's 3D smoothing filter: without it, sub-pixel splats
+            # alias and the optimiser keeps them fat to avoid the penalty —
+            # fine detail can never be represented by small gaussians. Pinhole
+            # only (untested against the UT fisheye path).
+            rasterize_mode="antialiased" if (antialiased and pinhole) else "classic",
             # ED = one extra alpha-normalised expected-depth channel; since the
             # norm→world scale S is composed into the viewmats, it comes out in
             # world METRES — directly comparable to the anchored depth priors.
@@ -1264,6 +1271,12 @@ def train_splat(
             print(f"  step {step}: non-finite loss, skipped", flush=True)
             return None
         loss.backward()
+        # Anneal the position LR to means_lr_decay× its initial value over the
+        # run (reference-3DGS schedule). At a constant means LR the gaussians
+        # never stop jittering, so late training converges to a motion-blurred
+        # multi-view average instead of settling into fine detail.
+        cur_means_lr = means_lr * (means_lr_decay ** (step / max(1, iters - 1)))
+        optimizers["means"].param_groups[0]["lr"] = cur_means_lr
         for opt in optimizers.values():
             opt.step()
             opt.zero_grad(set_to_none=True)
@@ -1298,10 +1311,12 @@ def train_splat(
                 # unscaled noise ratchets the near-dead population into fog
                 # (the post-24k opacity slide, 0.05 → 0.03). Scale by this
                 # step's actual crop fraction (reg_frac, 1.0 unpatched; also
-                # tracks the OOM auto-shrunk patch).
+                # tracks the OOM auto-shrunk patch). Uses the annealed position
+                # LR so the noise dies down with it, as in gsplat's reference
+                # MCMC trainer.
                 strategy.step_post_backward(
                     params, optimizers, strategy_state, step, info,
-                    lr=means_lr * reg_frac,
+                    lr=cur_means_lr * reg_frac,
                 )
         return loss
 
@@ -1554,6 +1569,22 @@ def main():
         "geometry the photometric loss blurs; start at 0.05. Needs the "
         "'transformers' package; first use downloads the model checkpoint "
         "(~1.3 GB for ViT-L) to the HuggingFace cache.",
+    )
+    p.add_argument(
+        "--means-lr-decay",
+        type=float,
+        default=0.01,
+        help="final position LR as a fraction of its initial value, annealed "
+        "exponentially over the run (reference-3DGS schedule; MCMC relocation "
+        "noise anneals with it). 1.0 = constant LR (the pre-2026-07-15 "
+        "behaviour).",
+    )
+    p.add_argument(
+        "--no-antialiased",
+        dest="antialiased",
+        action="store_false",
+        help="disable Mip-Splatting antialiased rasterisation and train in "
+        "classic mode (antialiased applies to undistorted/pinhole runs only).",
     )
     p.add_argument(
         "--depth-model",
@@ -1817,6 +1848,8 @@ def main():
             densify_strategy=args.densify_strategy,
             aniso_cap=args.aniso_cap,
             depth_loss=args.depth_loss,
+            means_lr_decay=args.means_lr_decay,
+            antialiased=args.antialiased,
         )
     except RuntimeError as exc:
         # Turn a CUDA OOM traceback into one actionable line (the server surfaces
