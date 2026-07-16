@@ -29,13 +29,11 @@ The **LiDAR Workflow** panel (top of the right-hand control panel) drives the wh
 
 ### Generate
 
-Turn a raw scan folder (LiDAR + IMU + image `.bag` files) into a cloud or splat:
+Turn a raw scan folder (LiDAR + IMU + image `.bag` files) into a cloud, splat, or mesh:
 
 - **Point cloud** — KISS-ICP registration + multi-view photo colouring, voxel-downsampled.
-- **Splat** — three modes:
-  - **surfel** — fast, derives surface-aligned gaussians directly from the coloured cloud.
-  - **trained** — GPU-trained 3D Gaussian Splatting (needs CUDA + the scan trajectory).
-  - **bootstrap** — CPU fallback, one gaussian per point. Adjustable **blob size (m)** controls the gaussian radius (smaller = finer, less blobby).
+- **Splat** — GPU-trained 3D Gaussian Splatting (needs CUDA + torch/gsplat), seeded from the coloured cloud. A draft→max **quality** slider drives resolution / iterations / gaussian cap; expert overrides (anisotropy cap, render-patch size, SfM poses) sit below it. Full-resolution runs auto-generate SfM camera poses (COLMAP/GLOMAP, sim(3)-aligned to the LiDAR trajectory). Training renders **full frames** with an **annealed position LR** and **antialiased (Mip-Splatting) rasterisation** — on the reference scan this recipe reaches 26.7 dB train-view PSNR, at parity with commercial reconstructions of the same scanner class.
+- **Mesh** — screened-Poisson surface reconstruction from the dense cloud, photo-coloured (best for rooms and flat surfaces; thin structures stay the splat's job).
 
 Progress streams live into the panel; the result loads straight into the scene and appears in the Library.
 
@@ -99,7 +97,9 @@ The scene around the LiDAR tools is a general-purpose 3D editor:
 | `server.py` | aiohttp server: static assets (allowlisted), LiDAR API mounting, loopback guard |
 | `lidar_jobs.py` | `/api/*` handlers: projects, scan validation, job orchestration + SSE progress, file proxy |
 | `process_pointcloud.py` | bag reading, IMU deskew, KISS-ICP registration, photo colouring (run as subprocess per job) |
-| `process_splat.py` | surfel / trained (CUDA) / bootstrap splat generation |
+| `process_splat.py` | GPU 3DGS training (gsplat/CUDA): full-frame rendering, MCMC densification, annealed position LR, antialiased rasterisation |
+| `process_sfm.py` | COLMAP/GLOMAP camera poses from the scan photos, sim(3)-aligned to the LiDAR trajectory (auto-run for full-res splats) |
+| `process_mesh.py` | screened-Poisson mesh from the dense cloud, photo-coloured |
 | `edit_ops.py`, `cloud_ops.py`, `splat_io.py` | decimate, SOR, crop, recolour, transform bake, PLY I/O, pose sidecars |
 
 The browser calls the backend over REST + Server-Sent Events; there is no other coupling, so the viewer also works as a plain static page (without generation/editing).
@@ -113,7 +113,9 @@ src/lidarstudio/
   server.py              aiohttp server (static + LiDAR API)
   lidar_jobs.py          LiDAR workflow API handlers
   process_pointcloud.py  bag → coloured, registered point cloud
-  process_splat.py       cloud → gaussian splat (surfel / trained / bootstrap)
+  process_splat.py       cloud → GPU-trained gaussian splat (gsplat/CUDA)
+  process_sfm.py         scan photos → SfM camera poses (COLMAP/GLOMAP)
+  process_mesh.py        dense cloud → photo-coloured Poisson mesh
   edit_ops.py            edit operations (decimate, SOR, crop, recolour, bake)
   cloud_ops.py           point-cloud helpers (open3d)
   splat_io.py            splat PLY read/write

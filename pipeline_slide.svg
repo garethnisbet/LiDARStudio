@@ -122,13 +122,13 @@
     <line x1="24" y1="94" x2="376" y2="94" stroke="#1E2C47"/>
     <g font-size="14.5" fill="#C9D4E6">
       <text x="26" y="130" font-size="12" fill="#55688C" font-family="monospace">1</text><text x="52" y="130">Undistort fisheye → pinhole (refined)</text>
-      <text x="26" y="164" font-size="12" fill="#55688C" font-family="monospace">2</text><text x="52" y="164">Blur filter · uint8 memmap cache</text>
+      <text x="26" y="164" font-size="12" fill="#55688C" font-family="monospace">2</text><text x="52" y="164">Blur filter · memmap · full-frame renders</text>
       <text x="26" y="198" font-size="12" fill="#55688C" font-family="monospace">3</text><text x="52" y="198">Seed from dense cloud — PCA surfels</text>
-      <text x="26" y="232" font-size="12" fill="#55688C" font-family="monospace">4</text><text x="52" y="232">MCMC densify · L1 + SSIM · appearance</text>
-      <text x="26" y="266" font-size="12" fill="#55688C" font-family="monospace">5</text><text x="52" y="266">Opacity &amp; shape regs · aniso cap 20:1</text>
+      <text x="26" y="232" font-size="12" fill="#55688C" font-family="monospace">4</text><text x="52" y="232">MCMC densify · L1 + SSIM · antialiased</text>
+      <text x="26" y="266" font-size="12" fill="#55688C" font-family="monospace">5</text><text x="52" y="266">Position-LR anneal · opacity/shape regs</text>
     </g>
     <polygon points="24,307 31,311.5 24,316" fill="#E2AC61"/>
-    <text x="40" y="316" font-size="13" fill="#E2AC61" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">splat .ply — 3.46 M gaussians, SH 3</text>
+    <text x="40" y="316" font-size="13" fill="#E2AC61" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">splat .ply — 3.5 M gaussians · 26.7 dB</text>
     <g font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace" font-size="11.5" fill="#A9BBD6">
       <rect x="24" y="340" width="67" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="57" y="357" text-anchor="middle">PyTorch</text>
       <rect x="99" y="340" width="95" height="26" rx="13" fill="#15223A" stroke="#2B3D5F"/><text x="146" y="357" text-anchor="middle">gsplat+CUDA</text>
@@ -163,7 +163,7 @@
   <g transform="translate(745,670)">
     <rect width="440" height="320" rx="14" fill="#101828" stroke="#223350"/>
     <text x="24" y="40" font-size="13.5" letter-spacing="1.5" font-weight="600" fill="#4CC3D9">03 · SFM POSES</text>
-    <text x="416" y="40" text-anchor="end" font-size="12" fill="#5A6A86" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">colmap_run.py · align_sfm.py</text>
+    <text x="416" y="40" text-anchor="end" font-size="12" fill="#5A6A86" font-family="'Cascadia Code','DejaVu Sans Mono',Menlo,monospace">process_sfm.py</text>
     <text x="24" y="76" font-size="23" font-weight="650" fill="#E9EEF7">COLMAP · GLOMAP refinement</text>
     <line x1="24" y1="92" x2="416" y2="92" stroke="#1E2C47"/>
     <g font-size="14.5" fill="#C9D4E6">
