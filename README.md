@@ -21,6 +21,8 @@ Generation needs the pipeline extra (`uv sync --extra pipeline` — open3d, kiss
 
 Open `http://localhost:8080` and use the **LiDAR Workflow** panel.
 
+> **Low on home-directory space?** `source scratch-env.sh` before installing to redirect the uv/npm/pip caches, the downloaded Python, and the `.venv` onto scratch (`/scratch/$USER` by default, or set `SCRATCH` yourself) — nothing but a few dotfiles then touches `$HOME`. Source it in every shell where you use the project. Note that scratch is usually auto-purged, so re-run `uv sync` if the venv disappears, and keep generated clouds/splats somewhere persistent. If `node_modules/` is also a problem, clone the repo onto scratch too.
+
 > **Network exposure:** the server binds `127.0.0.1` by default. Pass `--host 0.0.0.0` to serve the viewer to other devices (e.g. a VR headset) — the LiDAR `/api/*` endpoints, which browse and read/write the local filesystem, stay loopback-only even then unless you also pass `--allow-remote-fs`. Static serving is allowlisted (`js/`, `node_modules/`, and specific root-level asset types); the Python source, `.git`, and dotfiles are never served.
 
 ## LiDAR Workflow
