@@ -16,8 +16,9 @@ export let orthoCamera  = null;
 export let activeCamera = null;
 export let orthoOn      = false;
 
-// Splat foreground clip (0 = off, 1 = clip everything up to ~2x orbit
-// distance). Applied in both perspective and orthographic views.
+// Foreground view clip for splats AND point clouds (0 = off, 1 = clip
+// everything up to ~2x orbit distance). Applied in both perspective and
+// orthographic views.
 export let splatClipFraction = 0;
 
 // Controls

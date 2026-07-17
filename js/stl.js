@@ -650,6 +650,10 @@ const _clipUniforms = {
 let _clipEnabled = false, _clipMode = 1.0;
 const _clipInv = new THREE.Matrix4();
 const _clipSplatMat = new THREE.Matrix4();
+// Foreground (view) clip distance in world metres, shared by every point-cloud
+// material; splats carry their own per-material uniform. Both are pushed from
+// updateSplatClip() each frame.
+const _fgClipU = { value: 0.0 };
 
 // Update the active clip box. opts: { enabled, mode:'inside'|'outside',
 // matrix:number[16] } — matrix is the unit-cube box's world matrix (column
@@ -675,6 +679,7 @@ function _applyClipToPointsMaterial(material) {
     shader.uniforms.uClipInv     = _clipUniforms.uClipInv;
     shader.uniforms.uClipMode    = _clipUniforms.uClipMode;
     shader.uniforms.uPointShape  = _pointShapeU;
+    shader.uniforms.uFgClipDist  = _fgClipU;
     shader.fragmentShader = 'uniform float uPointShape;\n'
       + shader.fragmentShader.replace(
           '#include <clipping_planes_fragment>',
@@ -685,7 +690,7 @@ function _applyClipToPointsMaterial(material) {
           + '  if (uPointShape > 1.5) diffuseColor.a *= smoothstep(0.5, 0.15, _pd);\n'
           + '}\n');
     shader.vertexShader =
-      'uniform bool uClipEnabled;\nuniform mat4 uClipInv;\nuniform float uClipMode;\nattribute float aErased;\n'
+      'uniform bool uClipEnabled;\nuniform mat4 uClipInv;\nuniform float uClipMode;\nuniform float uFgClipDist;\nattribute float aErased;\n'
       + shader.vertexShader.replace(
           '#include <project_vertex>',
           '#include <project_vertex>\n'
@@ -694,7 +699,9 @@ function _applyClipToPointsMaterial(material) {
           + '  vec3 _l = (uClipInv * modelMatrix * vec4(transformed, 1.0)).xyz;\n'
           + '  bool _in = all(lessThanEqual(abs(_l), vec3(0.5)));\n'
           + '  if ((uClipMode > 0.5) ? !_in : _in) gl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n'
-          + '}');
+          + '}\n'
+          // view clip: same eye-space depth cutaway the splat shader gets
+          + 'if (uFgClipDist > 0.0 && -mvPosition.z < uFgClipDist) gl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n');
   };
 }
 
@@ -789,20 +796,23 @@ function _patchSplatAppearanceMaterial(material) {
 // (the front half).
 export function updateSplatClip() {
   const splats = State.importedSTLs.filter(s => s.isSplat);
+  const clouds = State.importedSTLs.filter(s => s.isPointCloud);
 
-  // The clip slider is only relevant while a splat is loaded. Both adding
-  // and removing a splat request a render, so toggling visibility here
-  // (before the early-out) keeps it in sync for every code path.
+  // The clip slider is only relevant while a splat or point cloud is loaded.
+  // Both adding and removing one request a render, so toggling visibility
+  // here (before the early-out) keeps it in sync for every code path.
   const row = document.getElementById('splatClipRow');
-  if (row) row.style.display = splats.length > 0 ? 'flex' : 'none';
-
-  if (splats.length === 0) return;
+  if (row) row.style.display = (splats.length || clouds.length) ? 'flex' : 'none';
 
   let dist = 0;
   if (State.splatClipFraction > 0) {
     const radius = State.activeCamera.position.distanceTo(State.orbitControls.target);
     dist = State.splatClipFraction * 2 * radius;
   }
+  // Point-cloud materials share this uniform, so one write drives every cloud.
+  _fgClipU.value = dist;
+
+  if (splats.length === 0) return;
 
   for (const s of splats) {
     const mesh = s._splatViewer && s._splatViewer.splatMesh;
