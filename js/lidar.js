@@ -350,6 +350,7 @@ export function initLidarPanel() {
     font-weight:700;cursor:pointer;font-size:11px}
   #lidar-panel .item button.del{background:#a33;color:#fff}
   #lidar-panel .item button:disabled{opacity:.5;cursor:default}
+  #lidar-panel .item input.rename{flex:1 1 auto;min-width:0;width:auto;margin:0;padding:3px 6px}
   #lidar-panel .muted{color:#7d8aa0;font-size:11px}
   #ls-bar-label{display:none;justify-content:space-between;align-items:baseline;gap:8px;
     margin-top:8px;font-size:11px;color:#aeb9cc}
@@ -436,10 +437,42 @@ export function initLidarPanel() {
         el('option', { value: '' }, 'seed cloud: auto'),
         ...(data.pointclouds || []).map(f => el('option', { value: f.path }, `seed: ${f.name}`)));
       seedSel.value = [...seedSel.options].some(o => o.value === seedCur) ? seedCur : '';
-      outList.replaceChildren(...(items.length ? items.map(f =>
-        el('div', { class: 'item' },
-          el('span', { title: f.name }, `${f.kind === 'splat' ? '🟣' : f.kind === 'mesh' ? '🔷' : '⚪'} ${f.name} `,
-            el('span', { class: 'muted' }, `${f.size_mb}MB`)),
+      outList.replaceChildren(...(items.length ? items.map(f => {
+        const nameSpan = el('span', { title: `${f.name} — double-click to rename` },
+          `${f.kind === 'splat' ? '🟣' : f.kind === 'mesh' ? '🔷' : '⚪'} ${f.name} `,
+          el('span', { class: 'muted' }, `${f.size_mb}MB`));
+        // Double-click the name to rename the file (and its sidecars) in place.
+        nameSpan.addEventListener('dblclick', () => {
+          const inp = el('input', { class: 'rename', value: f.name });
+          nameSpan.replaceWith(inp);
+          inp.focus();
+          inp.setSelectionRange(0, f.name.replace(/\.ply$/i, '').length);
+          let done = false;
+          const cancel = () => { done = true; inp.replaceWith(nameSpan); };
+          const commit = async () => {
+            if (done) return;
+            const next = inp.value.trim();
+            if (!next || next === f.name) return cancel();
+            done = true; inp.disabled = true;
+            try {
+              const r = await api('/api/project/rename', { path: f.path, name: next });
+              // Keep any loaded object's server path pointing at the new file
+              // so later edits/crops still find it.
+              for (const [k, v] of Object.entries(objPaths)) if (v === f.path) objPaths[k] = r.path;
+              refresh();
+            } catch (err) {
+              alert('Rename failed: ' + err.message);
+              inp.replaceWith(nameSpan);
+            }
+          };
+          inp.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); inp.blur(); }
+            else if (e.key === 'Escape') cancel();
+          });
+          inp.addEventListener('blur', commit);
+        });
+        return el('div', { class: 'item' },
+          nameSpan,
           el('button', { onclick: async (e) => {
             e.target.disabled = true; e.target.textContent = '…';
             try { await loadPlyFromServer(f.path, f.name); e.target.textContent = '✓'; }
@@ -450,8 +483,8 @@ export function initLidarPanel() {
             e.target.disabled = true; e.target.textContent = '…';
             try { await api('/api/project/delete', { path: f.path }); refresh(); }
             catch (err) { e.target.textContent = 'err'; e.target.disabled = false; console.error(err); }
-          } }, '🗑'))
-      ) : [el('div', { class: 'muted' }, 'No outputs in this project.')]));
+          } }, '🗑'));
+      }) : [el('div', { class: 'muted' }, 'No outputs in this project.')]));
     } catch (err) {
       outList.replaceChildren(el('div', { class: 'muted' }, 'Error: ' + err.message));
     }

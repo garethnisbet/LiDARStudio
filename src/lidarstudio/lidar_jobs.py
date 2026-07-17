@@ -1372,6 +1372,50 @@ async def project_delete_handler(request):
     return web.json_response({"deleted": removed})
 
 
+async def project_rename_handler(request):
+    """POST /api/project/rename — rename an output ``.ply`` and its sidecars.
+
+    Body: {path, name}. Same folder restriction as delete; the new name must be
+    a bare filename (``.ply`` is appended if missing) and stays in the same
+    folder. The viewer pose + trajectory sidecars move with the file.
+    """
+    data = await request.json()
+    path = (data.get("path") or "").strip()
+    name = (data.get("name") or "").strip()
+    if not path or not name:
+        return web.json_response({"error": "path and name required"}, status=400)
+    p = Path(path)
+    if p.suffix.lower() != ".ply" or p.parent.name not in (
+        "pointclouds",
+        "splats",
+        "meshes",
+    ):
+        return web.json_response(
+            {"error": "only output .ply files can be renamed"}, status=403
+        )
+    if not p.exists():
+        return web.json_response({"error": "file not found"}, status=404)
+    if Path(name).name != name:
+        return web.json_response({"error": "name must be a bare filename"}, status=400)
+    if not name.lower().endswith(".ply"):
+        name += ".ply"
+    if name.lower() == ".ply":
+        return web.json_response({"error": "name must not be empty"}, status=400)
+    target = p.with_name(name)
+    if target == p:
+        return web.json_response({"path": str(p), "name": p.name})
+    if target.exists():
+        return web.json_response({"error": f"{name} already exists"}, status=409)
+    try:
+        for suffix in ("", ".pose.json", ".traj.npz"):
+            src = Path(str(p) + suffix)
+            if src.exists():
+                src.rename(Path(str(target) + suffix))
+    except OSError as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+    return web.json_response({"path": str(target), "name": target.name})
+
+
 async def edit_apply_handler(request):
     """POST /api/edit/apply — run one edit op on a cloud/splat PLY.
 
@@ -1802,6 +1846,7 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/process/events/{job_id}", process_events_handler)
     app.router.add_post("/api/project/outputs", project_outputs_handler)
     app.router.add_post("/api/project/delete", project_delete_handler)
+    app.router.add_post("/api/project/rename", project_rename_handler)
     app.router.add_get("/api/scan/file", scan_file_handler)
     app.router.add_post("/api/scan/photos", scan_photos_handler)
     app.router.add_get("/api/scan/photo", scan_photo_handler)
