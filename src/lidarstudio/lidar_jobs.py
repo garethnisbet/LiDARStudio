@@ -1791,6 +1791,43 @@ async def edit_save_as_handler(request):
         return web.json_response({"error": str(exc)}, status=500)
 
 
+async def splat_export_cloud_handler(request):
+    """POST /api/splat/export_cloud — save a splat's gaussian centres as a
+    refined coloured point cloud.
+
+    Body: {path, [min_opacity]}. The cloud lands in the project's
+    ``pointclouds/`` folder (when the splat lives in ``splats/``) under
+    ``<splat-stem>_points.ply`` — listed in the Library and offered as an
+    explicit seed, but deliberately NOT matching the ``pointcloud_*`` glob the
+    auto-seed pickers use, so it never silently replaces the generated cloud.
+    """
+    data = await request.json()
+    path = (data.get("path") or "").strip()
+    if not path:
+        return web.json_response({"error": "path required"}, status=400)
+    src = Path(path)
+    if not src.exists():
+        return web.json_response({"error": "file not found"}, status=404)
+    out_dir = (
+        src.parent.parent / "pointclouds" if src.parent.name == "splats" else src.parent
+    )
+    out = _unique_output(out_dir / src.name, "points")
+    try:
+        from lidarstudio import edit_ops
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            edit_ops.splat_to_cloud,
+            str(src),
+            out,
+            float(data.get("min_opacity", 0.05)),
+        )
+        return web.json_response(result)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
 async def edit_import_handler(request):
     """POST /api/edit/import?dir=<libdir>&name=<basename> — persist a
     browser-imported cloud/splat PLY to disk so the server-side edit ops can
@@ -1835,6 +1872,7 @@ def register_routes(app: web.Application) -> None:
     app.router.add_post("/api/edit/import", edit_import_handler)
     app.router.add_post("/api/edit/recolour", edit_recolour_handler)
     app.router.add_post("/api/edit/save_as", edit_save_as_handler)
+    app.router.add_post("/api/splat/export_cloud", splat_export_cloud_handler)
     app.router.add_post("/api/browse", browse_handler)
     app.router.add_post("/api/browse/dir", browse_dir_handler)
     app.router.add_post("/api/project/create", project_create_handler)

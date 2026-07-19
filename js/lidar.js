@@ -471,19 +471,30 @@ export function initLidarPanel() {
           });
           inp.addEventListener('blur', commit);
         });
-        return el('div', { class: 'item' },
+        const kids = [
           nameSpan,
           el('button', { onclick: async (e) => {
             e.target.disabled = true; e.target.textContent = '…';
             try { await loadPlyFromServer(f.path, f.name); e.target.textContent = '✓'; }
             catch (err) { e.target.textContent = 'err'; console.error(err); }
-          } }, 'Load'),
+          } }, 'Load')];
+        // Splats only: export the trained gaussian centres as a refined point
+        // cloud — training moves them onto true surfaces and prunes noise, so
+        // it's a cleaner cloud than the LiDAR seed (good for meshing).
+        if (f.kind === 'splat') kids.push(
+          el('button', { class: 'act', title: 'Export the trained gaussian centres as a refined point cloud (into pointclouds/)', onclick: async (e) => {
+            e.target.disabled = true; e.target.textContent = '…';
+            try { await api('/api/splat/export_cloud', { path: f.path }); refresh(); }
+            catch (err) { e.target.textContent = 'err'; e.target.disabled = false; console.error(err); }
+          } }, '⚪↓'));
+        kids.push(
           el('button', { class: 'del', title: 'Delete file (and its sidecars)', onclick: async (e) => {
             if (!confirm(`Delete ${f.name}?\nThis permanently removes the file and its .pose/.traj sidecars.`)) return;
             e.target.disabled = true; e.target.textContent = '…';
             try { await api('/api/project/delete', { path: f.path }); refresh(); }
             catch (err) { e.target.textContent = 'err'; e.target.disabled = false; console.error(err); }
           } }, '🗑'));
+        return el('div', { class: 'item' }, ...kids);
       }) : [el('div', { class: 'muted' }, 'No outputs in this project.')]));
     } catch (err) {
       outList.replaceChildren(el('div', { class: 'muted' }, 'Error: ' + err.message));
@@ -942,6 +953,9 @@ export function initLidarPanel() {
   // box deselects the cloud (the box has its own gizmo), so the delete can't
   // rely on State.selectedSTL.
   let visTargetEntry = null;
+  // Pose snapshotted when the box is cleared, so re-placing it brings it
+  // back at the same position/rotation/size instead of re-fitting.
+  let visLastPose = null;
   const visStat = el('div', { class: 'muted' }, 'Reveal internal structure without deleting anything.');
   function ensureVisGizmo() {
     if (visGizmo) return visGizmo;
@@ -963,6 +977,11 @@ export function initLidarPanel() {
     const wasActive = activeBox === visBox;
     if (visGizmo && visGizmo.object) visGizmo.detach();
     if (visBox) {
+      visLastPose = {
+        position: visBox.position.clone(),
+        quaternion: visBox.quaternion.clone(),
+        scale: visBox.scale.clone(),
+      };
       State.scene.remove(visBox);
       visBox.traverse(o => { o.geometry?.dispose?.(); o.material?.dispose?.(); });
       visBox = null;
@@ -974,19 +993,28 @@ export function initLidarPanel() {
   function placeVisBox() {
     const e = State.selectedSTL;
     const b = e && e.mesh ? new THREE.Box3().setFromObject(e.mesh) : null;
-    if (!b || b.isEmpty()) { visStat.textContent = 'Select a loaded object first.'; return; }
+    // Re-placing while a box is active re-fits it to the object bounds;
+    // placing after a Clear restores the cleared box's pose instead.
+    const restore = !visBox && visLastPose;
+    if (!restore && (!b || b.isEmpty())) { visStat.textContent = 'Select a loaded object first.'; return; }
     removeVisBox(false);
-    visTargetEntry = e;   // remember the object this box edits
-    const c = b.getCenter(new THREE.Vector3()), s = b.getSize(new THREE.Vector3());
+    if (e) visTargetEntry = e;   // remember the object this box edits
     const geo = new THREE.BoxGeometry(1, 1, 1);
     visBox = new THREE.Mesh(geo, new THREE.MeshBasicMaterial(
       { color: 0x33aaff, transparent: true, opacity: 0.10, depthWrite: false }));
     visBox.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo),
       new THREE.LineBasicMaterial({ color: 0x33aaff })));
     visBox.userData.edgeColor = 0x33aaff;
-    visBox.position.copy(c);
-    // Start at half the object's size so there's something to reveal.
-    visBox.scale.set(Math.max(s.x * 0.5, 0.05), Math.max(s.y * 0.5, 0.05), Math.max(s.z * 0.5, 0.05));
+    if (restore) {
+      visBox.position.copy(visLastPose.position);
+      visBox.quaternion.copy(visLastPose.quaternion);
+      visBox.scale.copy(visLastPose.scale);
+    } else {
+      const c = b.getCenter(new THREE.Vector3()), s = b.getSize(new THREE.Vector3());
+      visBox.position.copy(c);
+      // Start at half the object's size so there's something to reveal.
+      visBox.scale.set(Math.max(s.x * 0.5, 0.05), Math.max(s.y * 0.5, 0.05), Math.max(s.z * 0.5, 0.05));
+    }
     State.scene.add(visBox);
     ensureVisGizmo().attach(visBox);
     setActiveBox(visBox);

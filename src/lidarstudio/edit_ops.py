@@ -151,6 +151,63 @@ def apply_edit(in_path, out_path, op, params):
     }
 
 
+def splat_to_cloud(in_path, out_path, min_opacity=0.05):
+    """Export a trained splat's gaussian centres as a plain coloured point cloud.
+
+    Training refines the seed cloud photometrically (means migrate onto true
+    surfaces, noise gaussians are pruned, thin structures are densified), so the
+    centres make a cleaner cloud than the LiDAR seed. Colour comes from the SH
+    DC term; gaussians whose opacity fell below ``min_opacity`` (transparent →
+    unsupported by any photo) are dropped. The splat is exported in the seed
+    cloud's world frame, so the seed's trajectory sidecar is carried when it can
+    be found, keeping the result trainable/meshable.
+    """
+    if not splat_io.is_splat_ply(in_path):
+        raise ValueError(f"{Path(in_path).name} is not a gaussian-splat PLY")
+    data, _fields = splat_io.load_splat(in_path)
+    pts = splat_io.xyz(data)
+    rgb = np.clip(splat_io.display_colours(data) * 255.0 + 0.5, 0, 255).astype(
+        np.uint8
+    )
+    keep = np.ones(len(pts), bool)
+    if min_opacity > 0 and "opacity" in (data.dtype.names or ()):
+        alpha = 1.0 / (1.0 + np.exp(-data["opacity"].astype(np.float64)))
+        keep = alpha >= float(min_opacity)
+
+    from lidarstudio import process_pointcloud as ppc
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    ppc.write_ply(Path(out_path), pts[keep], rgb[keep])
+
+    traj = _find_traj(in_path) or _seed_traj_for_splat(in_path)
+    if traj is not None:
+        shutil.copy2(traj, str(out_path) + ".traj.npz")
+
+    return {
+        "kind": "cloud",
+        "total": int(len(pts)),
+        "kept": int(keep.sum()),
+        "removed": int(len(pts) - keep.sum()),
+        "trainable": traj is not None,
+        "output": str(out_path),
+    }
+
+
+def _seed_traj_for_splat(path):
+    """Trajectory sidecar of the generated cloud a project splat was trained
+    from. Splats carry no sidecar of their own, but they train (and export) in
+    the seed cloud's world frame, so the same-timestamp
+    ``pointclouds/pointcloud_<ts>.ply.traj.npz`` applies verbatim. Matched by
+    the leading timestamp digits, so renamed/edited splats (e.g.
+    ``splat_<ts>_aa_lrdecay_edited3``) still resolve."""
+    p = Path(path)
+    m = re.match(r"splat_(\d+)", p.stem)
+    if p.parent.name != "splats" or not m:
+        return None
+    cand = p.parent.parent / "pointclouds" / f"pointcloud_{m.group(1)}.ply.traj.npz"
+    return cand if cand.exists() else None
+
+
 def is_monochrome(path, sample=200_000):
     """True when a CLOUD carries no photo colour — greyscale (r==g==b for every
     point: the ``--mono`` generator's intensity shading, or its uniform-grey
