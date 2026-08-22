@@ -88,6 +88,13 @@ SUBJECT_CLASSES = (
 MASK_SCORE = 0.5  # instance-segmentation confidence floor
 MASK_VOTE_FRAMES = 12  # frames sampled to choose the subject class
 
+# How far the single-axis turntable model may miss the solved poses before the
+# capture is called "not a turntable". A jittered synthetic turntable fits to
+# 0.5% of radius / 0.3 deg; a walk-around run with --turntable measured 46% and
+# 13.6 deg, so anything in between is comfortably separated.
+MAX_TT_POS_RESIDUAL = 0.05  # fraction of the turn radius
+MAX_TT_ROT_RESIDUAL = 3.0  # degrees
+
 
 def progress(pct: int, msg: str):
     print(f"PROGRESS:{pct}:{msg}", flush=True)
@@ -909,7 +916,26 @@ def report_turntable(viewmats, snap: bool):
         f"model residual {100 * fit['rms_pos']:.1f}% of radius, "
         f"{fit['rms_rot']:.2f} deg"
     )
-    if fit["monotonic"] < 0.9:
+    if fit["rms_pos"] > MAX_TT_POS_RESIDUAL or fit["rms_rot"] > MAX_TT_ROT_RESIDUAL:
+        # Checked FIRST because it subsumes the others: poses that are not a
+        # single-axis rotation at all will also look non-monotonic, and
+        # blaming a fold would send the user to fix a turntable they never
+        # used. A real turntable fits tightly even with a noisy solve —
+        # measured 0.5% of radius and 0.3 deg on a jittered synthetic one,
+        # against 46% and 13.6 deg for a walk-around run with --turntable.
+        print(
+            f"WARNING: these poses do not fit a turntable at all — the "
+            f"single-axis model misses them by {100 * fit['rms_pos']:.0f}% of "
+            f"the turn radius and {fit['rms_rot']:.1f} deg. A turntable "
+            "capture is one FIXED camera and a rotating subject, so the "
+            "solved cameras must lie on one circle. If you carried the camera "
+            "around the subject instead, drop --turntable: that is a "
+            "walk-around, and it is judged by coverage instead. If it really "
+            "was a turntable, the camera moved during the capture (use a "
+            "tripod) or the solve failed outright.",
+            flush=True,
+        )
+    elif fit["monotonic"] < 0.9:
         print(
             f"WARNING: only {100 * fit['monotonic']:.0f}% of frames keep "
             "turning the same way, so the solve has the subject rotating back "

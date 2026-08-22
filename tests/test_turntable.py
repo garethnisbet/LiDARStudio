@@ -119,3 +119,42 @@ def test_snapping_removes_wobble_the_solve_invented():
 def test_a_partial_turn_reports_the_angle_it_actually_covered():
     vms, _ = _turntable(span_deg=140)
     assert process_sfm.fit_turntable(vms)["span"] == pytest.approx(140, abs=0.5)
+
+
+def test_a_walk_around_run_with_turntable_is_told_so(capsys):
+    """The failure this guards against is a MISDIAGNOSIS. Poses that are not a
+    single-axis rotation at all also look non-monotonic, so without this check
+    the fold warning fires and sends the user to fix a turntable they never
+    used. Measured on the real walk-around capture: 46% of radius, 13.6 deg."""
+    n = 60
+    ang = np.radians(np.linspace(0, 300, n))
+    centres = np.stack([6 * np.cos(ang), np.linspace(-2, 2, n), 6 * np.sin(ang)], 1)
+    vms = []
+    for i, c in enumerate(centres):
+        f = -c / np.linalg.norm(c)
+        r = np.cross([0, 1.0, 0], f)
+        r /= np.linalg.norm(r)
+        R = np.stack([r, np.cross(f, r), f])
+        vm = np.eye(4)
+        vm[:3, :3], vm[:3, 3] = R, -R @ c
+        vms.append(vm)
+    process_sfm.report_turntable(np.array(vms), snap=False)
+    out = capsys.readouterr().out
+    assert "do not fit a turntable at all" in out
+    assert "drop --turntable" in out
+    assert "FOLDED" not in out, "must not blame a fold when it is not a turntable"
+
+
+def test_a_genuine_turntable_draws_no_complaint(capsys):
+    vms, _ = _turntable(span_deg=320)
+    process_sfm.report_turntable(vms, snap=False)
+    out = capsys.readouterr().out
+    assert "WARNING" not in out
+
+
+def test_a_short_but_genuine_turn_warns_only_about_coverage(capsys):
+    vms, _ = _turntable(span_deg=140)
+    process_sfm.report_turntable(vms, snap=False)
+    out = capsys.readouterr().out
+    assert "only turned 140 deg" in out
+    assert "do not fit a turntable" not in out
