@@ -102,3 +102,97 @@ def test_the_other_mapper_is_the_fallback(monkeypatch, tmp_path):
     rec = process_sfm.run_mapping(tmp_path / "db", tmp_path / "im", tmp_path / "sp", "t")
     assert calls == ["incremental", "glomap"]
     assert rec is FakeRec
+
+
+def test_a_phone_capture_asks_for_incremental(tmp_path, monkeypatch):
+    """The two branches must NOT share a default. Incremental won on an
+    ambiguous phone capture; GLOMAP is what the LiDAR champion npz was
+    validated with, and is ~2x faster to map. A single default would silently
+    change one of them."""
+    import asyncio
+
+    import numpy as np
+
+    launched = []
+
+    async def fake_exec(*cmd, **kw):
+        launched.append(cmd)
+        raise RuntimeError("stop: the command line is already built")
+
+    monkeypatch.setattr(lidar_jobs.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(lidar_jobs, "_sfm_python", lambda *a, **k: "/usr/bin/python3")
+    monkeypatch.setattr(lidar_jobs, "_splat_python", lambda *a, **k: "/usr/bin/python3")
+
+    # --- phone capture: images/ + manifest.csv, no stored reconstruction
+    scan = tmp_path / "scans" / "photos"
+    (scan / "images").mkdir(parents=True)
+    (scan / "manifest.csv").write_text("name,key_ns\n0000.jpg,0\n")
+
+    async def run(project, scan_path, options):
+        queue = asyncio.Queue()
+        try:
+            await lidar_jobs._job_splat(str(project), str(scan_path), options, queue)
+        except RuntimeError:
+            pass
+
+    asyncio.run(run(tmp_path, scan, {}))
+    cmd = next(c for c in launched if "process_sfm.py" in str(c))
+    assert cmd[cmd.index("--mapper") + 1] == "incremental"
+
+    # --- an explicit option still wins on either branch
+    launched.clear()
+    asyncio.run(run(tmp_path, scan, {"mapper": "glomap"}))
+    cmd = next(c for c in launched if "process_sfm.py" in str(c))
+    assert cmd[cmd.index("--mapper") + 1] == "glomap"
+
+
+def test_a_lidar_scan_asks_for_glomap(tmp_path, monkeypatch):
+    """The LiDAR branch is PINNED, not left to process_sfm's default. The
+    champion npz was produced under GLOMAP, incremental's win was measured on
+    a capture nothing like a room walkthrough, and GLOMAP maps ~2x faster —
+    so inheriting the phone default here would be an unmeasured change to the
+    one path that is already validated."""
+    import asyncio
+
+    import numpy as np
+
+    launched = []
+
+    async def fake_exec(*cmd, **kw):
+        launched.append(cmd)
+        raise RuntimeError("stop: the command line is already built")
+
+    monkeypatch.setattr(lidar_jobs.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(lidar_jobs, "_sfm_python", lambda *a, **k: "/usr/bin/python3")
+    monkeypatch.setattr(lidar_jobs, "_splat_python", lambda *a, **k: "/usr/bin/python3")
+
+    ts = "20260527212832"
+    scan = tmp_path / "scans" / ts
+    scan.mkdir(parents=True)
+    (scan / f"LIDAR_{ts}.bag").write_bytes(b"")
+    (scan / f"IMAGE_{ts}.bag").write_bytes(b"")
+
+    # A seed cloud WITH its trajectory sidecar: without one the branch bails
+    # out early with "no .traj.npz" instead of reaching the command line.
+    pc = tmp_path / "pointclouds"
+    pc.mkdir()
+    (pc / f"pointcloud_{ts}.ply").write_bytes(b"ply\n")
+    np.savez(pc / f"pointcloud_{ts}.ply.traj.npz", ts=np.zeros(1), poses=np.eye(4)[None])
+
+    async def go():
+        queue = asyncio.Queue()
+        try:
+            await lidar_jobs._job_splat(str(tmp_path), str(scan), {}, queue)
+        except RuntimeError:
+            pass
+        out = []
+        while not queue.empty():
+            out.append(queue.get_nowait())
+        return out
+
+    events = asyncio.run(go())
+    sfm = [c for c in launched if "process_sfm.py" in str(c)]
+    assert sfm, f"LiDAR SfM never launched: {[e.get('message') for e in events]}"
+    cmd = sfm[0]
+    assert cmd[cmd.index("--mapper") + 1] == "glomap"
+    assert "--traj" in cmd, "the LiDAR branch must still align to the trajectory"

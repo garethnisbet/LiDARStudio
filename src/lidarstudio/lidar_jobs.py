@@ -1604,6 +1604,13 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
                 str(proj / "sfm" / f"work_{ts}"),
                 "--matching",
                 str(options.get("matching", "auto")),
+                # Incremental here, GLOMAP on the LiDAR branch below — the two
+                # capture types fail differently, so they get different
+                # mappers. A phone capture of one object is where global
+                # averaging picks the wrong consensus (60 deg of solved spread
+                # against incremental's 90 from the same matches).
+                "--mapper",
+                str(options.get("mapper", "incremental")),
             ]
             # Subject masking is an image_set-only lever: it exists for an
             # object shot on a floor or a desk, where the flat background is
@@ -1729,6 +1736,16 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
                 str(canonical),
                 "--workspace",
                 str(proj / "sfm" / f"work_{ts}"),
+                # Pinned, not left to the default. process_sfm defaults to
+                # incremental because it beat GLOMAP 90 deg to 60 on an
+                # AMBIGUOUS scene — a symmetric object against a textureless
+                # background. A LiDAR walkthrough is the opposite of that, it
+                # is what the champion npz was validated with under GLOMAP,
+                # and GLOMAP is also ~2x faster to map (165 frames in 54 s vs
+                # incremental's 102 s for 150), a gap that widens over a
+                # 900-frame scan. Changing this path needs its own evidence.
+                "--mapper",
+                str(options.get("mapper", "glomap")),
             ]
             proc = await asyncio.create_subprocess_exec(
                 *sfm_cmd,

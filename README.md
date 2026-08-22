@@ -132,7 +132,10 @@ radius/elevation/tilt wobble a solve invents but a real turntable does not have)
 default because global rotation averaging commits to one consensus over all pairs
 at once, and on an ambiguous scene the wrong consensus wins outright — measured on
 one capture as 60° of solved viewpoint spread versus incremental's 90° from an
-identical match database.
+identical match database. **LiDAR scans are pinned to GLOMAP** instead: a room
+walkthrough is not an ambiguous scene, it is what the reference reconstruction was
+validated with, and GLOMAP maps about twice as fast (165 frames in 54 s against
+incremental's 102 s for 150) — a gap that widens over a 900-frame scan.
 
 What a phone capture does *not* give you, because there is no LiDAR: the result is
 **unitless and unlevelled** — it loads at an arbitrary size and orientation, so
