@@ -11,6 +11,7 @@ Open http://localhost:8090/ in your browser.
 
 import asyncio
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -139,6 +140,125 @@ def _tk_browse_folder(title: str = "Select Folder", initial: str = "") -> str | 
 # ── Scan folder inspection ─────────────────────────────────────────────────────
 
 
+# Phone-capture file types recognised when a folder holds no LiDAR bags.
+_STILL_EXT = (".jpg", ".jpeg", ".png", ".heic", ".heif")
+_VIDEO_EXT = (".mp4", ".mov", ".m4v", ".avi", ".mkv")
+# Hard floor: below this there is no multi-view geometry at all, so the folder
+# is not a capture. _GOOD_IMAGES is the count a capture *should* have; between
+# the two the set loads and reconstructs, flagged "sparse" so the UI can warn.
+_MIN_IMAGES = 4
+_GOOD_IMAGES = 20
+
+
+# Probed video containers, keyed by file identity (path + mtime + size).
+_video_probe: dict = {}
+
+
+def _video_info(path: Path) -> dict | None:
+    """Native frame rate, frame count and duration of a capture video.
+
+    The ingest sampler takes every ``round(native_fps / fps)``-th frame, so
+    without these numbers a frame-rate control is guesswork — this is what lets
+    the UI say how many frames a given rate will actually produce.
+
+    Opening a container costs milliseconds, but ``_scan_contents`` runs on every
+    validate and every job start, so results are cached by file identity;
+    replacing or re-encoding the video invalidates the entry.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    if key in _video_probe:
+        return _video_probe[key]
+
+    info = None
+    try:
+        import cv2
+
+        cap = cv2.VideoCapture(str(path))
+        try:
+            if cap.isOpened():
+                fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                if fps > 0 and frames > 0:
+                    info = {
+                        "native_fps": round(fps, 3),
+                        "frames": frames,
+                        "duration_s": round(frames / fps, 2),
+                    }
+        finally:
+            cap.release()
+    except Exception:
+        info = None  # an unreadable container is ingest's problem to report
+    _video_probe[key] = info
+    return info
+
+
+def _image_set_contents(scan_path: Path) -> dict | None:
+    """Describe a phone capture in ``scan_path``, or None if it isn't one.
+
+    Recognises three shapes: an already-ingested set (images/ + manifest.csv,
+    the normalized form process_ingest.py writes), loose photos at the top
+    level or one directory down (images/, DCIM/, or a lone subfolder — how a
+    camera-roll export arrives), and a single video file.
+
+    'thumbnail/' is excluded from the image count: it is a LiDAR-scan artifact,
+    and counting it would let a bag-less LiDAR folder masquerade as a capture.
+    """
+    try:
+        if (scan_path / "manifest.csv").is_file() and (scan_path / "images").is_dir():
+            n = sum(
+                1 for f in (scan_path / "images").iterdir()
+                if f.suffix.lower() in _STILL_EXT
+            )
+            info = {"count": n, "dir": str(scan_path / "images"), "ingested": True,
+                    "video": None, "formats": [".jpg"],
+                    "sparse": n < _GOOD_IMAGES}
+            meta = scan_path / "ingest.json"
+            if meta.is_file():
+                try:
+                    info["ingest"] = json.loads(meta.read_text())
+                except (OSError, ValueError):
+                    pass
+            return info
+
+        def stills(d: Path):
+            return [f for f in d.iterdir()
+                    if f.is_file() and f.suffix.lower() in _STILL_EXT]
+
+        found = stills(scan_path)
+        src_dir = scan_path
+        if len(found) < _MIN_IMAGES:
+            subs = [d for d in sorted(scan_path.iterdir())
+                    if d.is_dir() and d.name != "thumbnail"]
+            named = [d for d in subs if d.name.lower() in ("images", "dcim", "photos")]
+            for d in named or (subs if len(subs) == 1 else []):
+                cand = stills(d)
+                if len(cand) >= _MIN_IMAGES:
+                    found, src_dir = cand, d
+                    break
+        if len(found) >= _MIN_IMAGES:
+            return {
+                "count": len(found),
+                "dir": str(src_dir),
+                "ingested": False,
+                "video": None,
+                "formats": sorted({f.suffix.lower() for f in found}),
+                "sparse": len(found) < _GOOD_IMAGES,
+            }
+        videos = sorted(f for f in scan_path.iterdir()
+                        if f.is_file() and f.suffix.lower() in _VIDEO_EXT)
+        if videos:
+            return {"count": 0, "dir": str(scan_path), "ingested": False,
+                    "video": str(videos[0]), "formats": [videos[0].suffix.lower()],
+                    "sparse": False, "video_info": _video_info(videos[0])}
+    except (OSError, PermissionError):
+        return None
+    return None
+
+
 def _scan_contents(scan_path: Path) -> dict:
     """Return a description of the files found inside a scan folder."""
     image_bag = lidar_bag = params_json = None
@@ -196,6 +316,16 @@ def _scan_contents(scan_path: Path) -> dict:
             except Exception:
                 pass
 
+    # Source discriminator. A LiDAR scan is whatever has both bags; anything
+    # else is checked for a phone capture. The LiDAR test stays first and
+    # unchanged, so no existing scan can be reclassified.
+    images = None
+    if image_bag and lidar_bag:
+        source = "lidar_bag"
+    else:
+        images = _image_set_contents(scan_path)
+        source = "image_set" if images else None
+
     return {
         "image_bag": image_bag,
         "lidar_bag": lidar_bag,
@@ -203,7 +333,9 @@ def _scan_contents(scan_path: Path) -> dict:
         "calibration": calibration_dir,
         "camera": camera_dir,
         "thumbnail": thumbnail_dir,
-        "valid": bool(image_bag and lidar_bag),
+        "source": source,
+        "images": images,
+        "valid": source is not None,
         "extras": extras,
         "thumbnails": thumbnails,
         "device": device_info,
@@ -394,9 +526,10 @@ async def process_start_handler(request):
     scan_path = data.get("scan_path")
     options = data.get("options", {})
 
-    if job_type not in ("pointcloud", "splat", "mesh"):
+    if job_type not in ("pointcloud", "splat", "mesh", "ingest"):
         return web.json_response(
-            {"error": "type must be 'pointcloud', 'splat' or 'mesh'"}, status=400
+            {"error": "type must be 'pointcloud', 'splat', 'mesh' or 'ingest'"},
+            status=400,
         )
     if not project_path or not scan_path:
         return web.json_response(
@@ -420,6 +553,8 @@ async def _run_job(job_id, job_type, project_path, scan_path, options):
             await _job_pointcloud(project_path, scan_path, options, queue, job)
         elif job_type == "mesh":
             await _job_mesh(project_path, scan_path, options, queue, job)
+        elif job_type == "ingest":
+            await _job_ingest(project_path, scan_path, options, queue, job)
         else:
             await _job_splat(project_path, scan_path, options, queue, job)
     except Exception as exc:
@@ -511,6 +646,19 @@ async def _job_pointcloud(project_path, scan_path, options, queue, job=None):
         }
     )
 
+    if contents.get("source") == "image_set":
+        await queue.put(
+            {
+                "event": "error",
+                "message": (
+                    "This is a phone capture, not a LiDAR scan — there is no "
+                    "range data to build a point cloud from. Run 'ingest' and "
+                    "then 'splat'; the splat job builds its own seed cloud "
+                    "from the photos."
+                ),
+            }
+        )
+        return
     if not contents.get("valid"):
         await queue.put(
             {"event": "error", "message": "Scan folder is missing required bag files"}
@@ -589,15 +737,18 @@ async def _job_pointcloud(project_path, scan_path, options, queue, job=None):
         )
 
 
-def _mesh_cmd(scan, contents, cloud_file, output_file, options):
-    """Build the process_mesh.py argv for a scan + seed cloud."""
+def _mesh_cmd(scan, contents, cloud_file, output_file, options, sfm_poses=None):
+    """Build the process_mesh.py argv for a scan + seed cloud.
+
+    ``sfm_poses`` selects the splat route: camera centres come from the SfM npz
+    and there is no bag to project photos from, so the colour arguments are
+    left off entirely and the mesh inherits the cloud's own RGB.
+    """
     cmd = [
         sys.executable,
         str(ROOT / "process_mesh.py"),
         "--cloud",
         str(cloud_file),
-        "--image-bag",
-        str(scan / contents["image_bag"]),
         "--output",
         str(output_file),
         "--camera",
@@ -619,9 +770,84 @@ def _mesh_cmd(scan, contents, cloud_file, output_file, options):
         "--colour-range",
         str(float(options.get("colour_range", 20.0))),
     ]
+    if sfm_poses:
+        cmd += ["--sfm-poses", str(sfm_poses)]
+        return cmd
+    cmd += ["--image-bag", str(scan / contents["image_bag"])]
     if contents.get("calibration"):
         cmd += ["--calibration", str(scan / "calibration")]
     return cmd
+
+
+async def _splat_points_cloud(proj: Path, ts: str, queue):
+    """The dense cloud a phone capture's mesh is built from: the trained
+    splat's gaussian centres.
+
+    Reuses an export if one is already on disk (the ⚪↓ Library button writes
+    the same file), otherwise makes it now — the user asked for a mesh, and
+    making them run a separate export first would be busywork. Returns None
+    after reporting the reason when there is nothing to mesh.
+    """
+    from lidarstudio import edit_ops
+
+    pc_dir = proj / "pointclouds"
+    splats = sorted(
+        (proj / "splats").glob(f"splat_{ts}*.ply") if (proj / "splats").exists() else []
+    )
+    if not splats:
+        await queue.put(
+            {
+                "event": "error",
+                "message": (
+                    f"No trained splat for '{ts}'. A phone capture is meshed "
+                    "from its splat (the only dense geometry the photo route "
+                    "produces), so train one first."
+                ),
+            }
+        )
+        return None
+    splat = max(splats, key=lambda p: p.stat().st_mtime)
+
+    existing = [
+        p
+        for p in (sorted(pc_dir.glob(f"{splat.stem}_points*.ply")) if pc_dir.exists() else [])
+        if p.stat().st_mtime >= splat.stat().st_mtime
+    ]
+    if existing:
+        cloud = max(existing, key=lambda p: p.stat().st_mtime)
+        await queue.put(
+            {"event": "log", "message": f"Reusing exported splat cloud: {cloud.name}"}
+        )
+        return cloud
+
+    out = pc_dir / f"{splat.stem}_points.ply"
+    await queue.put(
+        {
+            "event": "progress",
+            "percent": 2,
+            "message": f"Exporting the gaussian centres of {splat.name}…",
+        }
+    )
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, edit_ops.splat_to_cloud, str(splat), str(out), 0.05
+        )
+    except Exception as exc:
+        await queue.put(
+            {"event": "error", "message": f"Exporting the splat's points failed: {exc}"}
+        )
+        return None
+    await queue.put(
+        {
+            "event": "log",
+            "message": (
+                f"{result['kept']:,} of {result['total']:,} gaussians kept "
+                f"(opacity ≥ 0.05) → {Path(result['output']).name}"
+            ),
+        }
+    )
+    return Path(result["output"])
 
 
 async def _job_mesh(project_path, scan_path, options, queue, job=None):
@@ -640,11 +866,37 @@ async def _job_mesh(project_path, scan_path, options, queue, job=None):
         )
         return
 
+    # A phone capture has no LiDAR and no IMAGE bag, so Poisson is fed the
+    # TRAINED SPLAT's gaussian centres instead of a scanned cloud: training
+    # migrates the means onto real surfaces and prunes what no photo supports,
+    # which is the only dense geometry this route ever produces. (The sparse
+    # SfM cloud it started from is nowhere near dense enough — a few thousand
+    # points where Poisson wants hundreds of thousands.)
+    image_set = contents.get("source") == "image_set"
+    sfm_poses = None
+    if image_set:
+        ing = _ingest_dir(proj, scan)
+        if not (ing / "manifest.csv").exists():
+            await queue.put(
+                {
+                    "event": "error",
+                    "message": (
+                        f"'{scan.name}' is a phone capture that has not been "
+                        "ingested yet. Run 'ingest', then train a splat — the "
+                        "mesh is built from the splat."
+                    ),
+                }
+            )
+            return
+        scan = ing
+        contents = _scan_contents(scan)
+        ts = scan.name
+    else:
+        stem = Path(contents.get("lidar_bag") or "LIDAR_output.bag").stem
+        ts = stem.split("_", 1)[1] if "_" in stem else stem
+
     out_dir = proj / "meshes"
     out_dir.mkdir(exist_ok=True)
-
-    stem = Path(contents.get("lidar_bag") or "LIDAR_output.bag").stem
-    ts = stem.split("_", 1)[1] if "_" in stem else stem
     output_file = out_dir / f"mesh_{ts}.ply"
 
     # Seed cloud: an explicit one (e.g. an edited cloud) pins the mesh; otherwise
@@ -661,7 +913,28 @@ async def _job_mesh(project_path, scan_path, options, queue, job=None):
         )
         return
 
-    if seed_p:
+    if image_set:
+        sfm_poses = proj / "sfm" / f"sfm_viewmats_{ts}.npz"
+        if not sfm_poses.exists():
+            await queue.put(
+                {
+                    "event": "error",
+                    "message": (
+                        f"No reconstruction found for '{ts}' "
+                        f"({sfm_poses.name}). Train a splat on this capture "
+                        "first — that runs the SfM this mesh needs for its "
+                        "camera poses, and produces the geometry it meshes."
+                    ),
+                }
+            )
+            return
+        if seed_p:
+            cloud_file = seed_p
+        else:
+            cloud_file = await _splat_points_cloud(proj, ts, queue)
+            if cloud_file is None:
+                return
+    elif seed_p:
         cloud_file = seed_p
     else:
         pc_dir = proj / "pointclouds"
@@ -679,7 +952,7 @@ async def _job_mesh(project_path, scan_path, options, queue, job=None):
         dense = [p for p in pc_files if p.stem.endswith("_dense")]
         cloud_file = (dense or pc_files)[-1]
 
-    if edit_ops._find_traj(cloud_file) is None:
+    if not image_set and edit_ops._find_traj(cloud_file) is None:
         await queue.put(
             {
                 "event": "error",
@@ -692,8 +965,19 @@ async def _job_mesh(project_path, scan_path, options, queue, job=None):
     await queue.put(
         {"event": "log", "message": f"Meshing from cloud: {cloud_file.name}"}
     )
+    if image_set:
+        await queue.put(
+            {
+                "event": "log",
+                "message": (
+                    "Phone capture: normals oriented from the SfM cameras, "
+                    "colour carried from the splat. The mesh is UNITLESS and "
+                    "unlevelled — there is no LiDAR to scale or level against."
+                ),
+            }
+        )
 
-    cmd = _mesh_cmd(scan, contents, cloud_file, output_file, options)
+    cmd = _mesh_cmd(scan, contents, cloud_file, output_file, options, sfm_poses)
 
     await queue.put(
         {"event": "progress", "percent": 5, "message": "Launching process_mesh.py…"}
@@ -777,7 +1061,7 @@ def _system_health() -> dict:
             name, vram_gb = nm.strip(), float(mem) / 1024  # MiB → GiB
     except (OSError, subprocess.SubprocessError, ValueError):
         pass
-    stack_ok = False
+    stack_ok, stack_timed_out = False, False
     try:
         rr = subprocess.run(
             [_splat_python(), "-c",
@@ -785,13 +1069,24 @@ def _system_health() -> dict:
             capture_output=True, text=True, timeout=120,
         )
         stack_ok = rr.returncode == 0 and rr.stdout.strip().endswith("1")
+    except subprocess.TimeoutExpired:
+        # Brand-new GPU architectures (e.g. Blackwell) often make gsplat JIT-
+        # compile its CUDA extension on first import, which can outrun this
+        # probe's timeout even though the stack is actually fine — don't
+        # report a hard failure for that, it's just still warming up.
+        stack_timed_out = True
     except (OSError, subprocess.SubprocessError):
         pass
-    if not stack_ok or name is None:
+    if name is None:
+        gpu = {"grade": "red", "detail": "no CUDA GPU"}
+    elif stack_timed_out:
         gpu = {
-            "grade": "red",
-            "detail": (f"{name} — no CUDA/torch stack" if name else "no CUDA GPU"),
+            "grade": "amber",
+            "detail": f"{name}, {vram_gb:.0f} GB VRAM — CUDA stack still verifying "
+                      "(new GPU may be JIT-compiling kernels; retry shortly)",
         }
+    elif not stack_ok:
+        gpu = {"grade": "red", "detail": f"{name} — no CUDA/torch stack"}
     else:
         gpu = {
             "grade": grade(vram_gb, 12, 8),
@@ -840,14 +1135,25 @@ def _splat_python() -> str:
     return sys.executable
 
 
-@functools.lru_cache(maxsize=1)
-def _sfm_python():
-    """A Python interpreter with the SfM stack (pycolmap + bag/align deps),
-    used by process_sfm.py to auto-generate SfM poses. Same split-interpreter
-    pattern as _splat_python. Returns None when no candidate qualifies —
-    callers then tell the user how to proceed instead of crashing mid-job.
-    Override with $LIDARSTUDIO_SFM_PYTHON.
+@functools.lru_cache(maxsize=2)
+def _sfm_python(need_bags: bool = True):
+    """A Python interpreter with the SfM stack, used by process_sfm.py.
+
+    Two capability levels, because a photogrammetry-only install has no
+    rosbags: the LiDAR path must read an IMAGE bag (``need_bags=True``), while
+    an image set is already normalized JPEGs on disk and needs only
+    pycolmap/scipy/cv2. Probing for the union would reject a perfectly good
+    phone-capture interpreter.
+
+    Same split-interpreter pattern as _splat_python. Returns None when no
+    candidate qualifies — callers then tell the user how to proceed instead of
+    crashing mid-job. Override with $LIDARSTUDIO_SFM_PYTHON.
     """
+    probe = (
+        "import pycolmap, rosbags, scipy, cv2"
+        if need_bags
+        else "import pycolmap, scipy, cv2"
+    )
     seen = set()
     for cand in (
         os.environ.get("LIDARSTUDIO_SFM_PYTHON"),
@@ -860,7 +1166,7 @@ def _sfm_python():
         seen.add(cand)
         try:
             r = subprocess.run(
-                [cand, "-c", "import pycolmap, rosbags, scipy, cv2"],
+                [cand, "-c", probe],
                 capture_output=True,
                 timeout=120,
             )
@@ -871,6 +1177,173 @@ def _sfm_python():
         except (OSError, subprocess.SubprocessError):
             continue
     return None
+
+
+@functools.lru_cache(maxsize=1)
+def _ingest_python():
+    """An interpreter that can decode images (cv2 + PIL). The server's own
+    almost always can, so unlike the SfM probe this usually short-circuits."""
+    seen = set()
+    for cand in (sys.executable, shutil.which("python3"), "/usr/bin/python3"):
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        try:
+            r = subprocess.run(
+                [cand, "-c", "import cv2, PIL"], capture_output=True, timeout=120
+            )
+            if r.returncode == 0:
+                return cand
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return sys.executable
+
+
+def _ingest_dir(proj: Path, scan: Path) -> Path:
+    """Where a phone capture's normalized frames live inside the project.
+
+    Ingest never writes to the user's folder — a phone over MTP or a camera SD
+    card may be read-only, and a camera roll is not ours to modify. Pointing
+    the scan field at either the ORIGINAL capture or the ingested directory
+    resolves to the same place, so a job can be re-run either way.
+
+    Resolution is by recorded source path rather than by name: two captures
+    called 'DCIM' from different phones must not collide.
+    """
+    scan = Path(scan)
+    if (scan / "manifest.csv").is_file() and (scan / "images").is_dir():
+        return scan  # already the ingested form
+    src = scan.resolve()
+    root = proj / "scans"
+    if root.is_dir():
+        for d in sorted(root.iterdir()):
+            meta = d / "ingest.json"
+            if not meta.is_file():
+                continue
+            try:
+                rec = Path(json.loads(meta.read_text())["source"]).resolve()
+            except (OSError, ValueError, KeyError):
+                continue
+            # The recorded source is what was actually decoded, which may sit
+            # BELOW the folder the user pointed at: a video capture records the
+            # .mp4 itself, and a camera-roll export records the images/ or
+            # DCIM/ subfolder. Match on containment so all three shapes resolve.
+            if rec == src or rec.is_relative_to(src):
+                return d
+    # No prior ingest: name it after the capture, disambiguating a collision
+    # with a different source folder of the same name.
+    base = scan.name or "capture"
+    cand = root / base
+    if cand.exists():
+        digest = hashlib.sha1(str(src).encode()).hexdigest()[:6]
+        cand = root / f"{base}_{digest}"
+    return cand
+
+
+async def _job_ingest(project_path, scan_path, options, queue, job=None):
+    """Normalize a phone capture into <project>/scans/<name>/ (Phase 1).
+
+    Deliberately its own job rather than a step inside the splat run: decoding
+    is fast, SfM is not, and the user should be able to look at the frame count
+    and the mixed-lens warning BEFORE committing an hour of SIFT to a capture
+    that was never going to reconstruct.
+    """
+    job = job if job is not None else {}
+    proj = Path(project_path)
+    scan = Path(scan_path)
+    contents = _scan_contents(scan)
+
+    await queue.put(
+        {"event": "progress", "percent": 0, "message": "Starting photo ingest…"}
+    )
+    if contents.get("source") == "lidar_bag":
+        await queue.put(
+            {
+                "event": "error",
+                "message": (
+                    "That is a LiDAR scan folder — ingest is for phone captures. "
+                    "Use 'pointcloud' or 'splat' directly."
+                ),
+            }
+        )
+        return
+    if contents.get("source") != "image_set":
+        await queue.put(
+            {
+                "event": "error",
+                "message": (
+                    f"No phone capture found in {scan.name}: expected at least "
+                    f"{_MIN_IMAGES} photos (.jpg/.png/.heic) at the top level or "
+                    "in an images/, DCIM/ or single subfolder, or one video file."
+                ),
+            }
+        )
+        return
+
+    out_dir = _ingest_dir(proj, scan)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    images = contents.get("images") or {}
+    source = images.get("video") or images.get("dir") or str(scan)
+
+    await queue.put(
+        {
+            "event": "log",
+            "message": f"Ingesting {source} → {out_dir}",
+        }
+    )
+    cmd = [
+        _ingest_python(),
+        str(ROOT / "process_ingest.py"),
+        "--source",
+        source,
+        "--output",
+        str(out_dir),
+        "--max-edge",
+        str(int(options.get("max_edge", 2400))),
+        "--fps",
+        str(float(options.get("fps", 4.0))),
+        "--drop-blurry",
+        str(float(options.get("drop_blurry", 0.10))),
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+    except FileNotFoundError:
+        await queue.put(
+            {"event": "error", "message": "process_ingest.py not found."}
+        )
+        return
+    job["proc"] = proc
+    if job.get("cancelled"):
+        proc.terminate()
+    rc, err = await _stream_proc(proc, queue)
+    job["proc"] = None
+
+    manifest = out_dir / "manifest.csv"
+    if job.get("cancelled"):
+        await queue.put({"event": "cancelled", "message": "Ingest stopped."})
+    elif rc == 0 and manifest.exists():
+        n = (_scan_contents(out_dir).get("images") or {}).get("count", 0)
+        await queue.put(
+            {"event": "progress", "percent": 100, "message": f"Ingested {n} frames."}
+        )
+        await queue.put(
+            {
+                "event": "result",
+                "type": "ingest",
+                "path": str(out_dir),
+                "filename": out_dir.name,
+                "frames": n,
+            }
+        )
+    else:
+        await queue.put(
+            {
+                "event": "error",
+                "message": err or f"process_ingest.py exited with code {rc}",
+            }
+        )
 
 
 async def _job_splat(project_path, scan_path, options, queue, job=None):
@@ -890,8 +1363,31 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
     out_dir = proj / "splats"
     out_dir.mkdir(exist_ok=True)
 
-    stem = Path(contents.get("lidar_bag") or "LIDAR_output.bag").stem
-    ts = stem.split("_", 1)[1] if "_" in stem else stem
+    # A phone capture must be ingested before it can be trained: the trainer
+    # reads normalized frames and a manifest, not a camera roll. Resolve the
+    # scan onto its ingested form, and say so plainly if that has not been run.
+    image_set = contents.get("source") == "image_set"
+    if image_set:
+        ing = _ingest_dir(proj, scan)
+        if not (ing / "manifest.csv").exists():
+            await queue.put(
+                {
+                    "event": "error",
+                    "message": (
+                        f"'{scan.name}' is a phone capture that has not been "
+                        "ingested yet. Run the 'ingest' job on it first — it "
+                        "normalizes the photos into the project and reports "
+                        "any capture problems before the slow stages start."
+                    ),
+                }
+            )
+            return
+        scan = ing
+        contents = _scan_contents(scan)
+        ts = scan.name
+    else:
+        stem = Path(contents.get("lidar_bag") or "LIDAR_output.bag").stem
+        ts = stem.split("_", 1)[1] if "_" in stem else stem
     output_file = out_dir / f"splat_{ts}.ply"
 
     pc_dir = proj / "pointclouds"
@@ -915,6 +1411,24 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
         )
         return
 
+    # Force regeneration: the reconstruction is normally computed once per scan
+    # and reused forever, which is right when it is good and a trap when it is
+    # not — a folded orbit, or a change to how matching is chosen, both leave a
+    # stale npz that every later run silently inherits.
+    force_sfm = bool(options.get("force_sfm"))
+    if force_sfm and sfm_poses:
+        # An explicit file is an explicit choice; regenerating would ignore it.
+        force_sfm = False
+        await queue.put(
+            {
+                "event": "log",
+                "message": (
+                    "'Force SfM regeneration' ignored — an SfM poses file was "
+                    "given explicitly. Clear that field to regenerate."
+                ),
+            }
+        )
+
     # Full-resolution training REQUIRES SfM poses. Odometry poses carry ~0.7°
     # of error — a >10px misregistration at downscale-1 focal lengths — so the
     # photometric loss can never converge: the model limps at opacity ~0.03
@@ -928,7 +1442,12 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
     # trainable coloured cloud in the project.
     from lidarstudio import edit_ops
 
-    if seed_p:
+    if image_set:
+        # The seed is the sparse SfM cloud for THIS capture, produced by the
+        # SfM stage below. Never fall back to another cloud in the project:
+        # a LiDAR cloud shares no coordinate frame with these poses.
+        pc_files = [seed_p] if seed_p else []
+    elif seed_p:
         pc_files = [seed_p]
     else:
         pc_files = sorted(pc_dir.glob("pointcloud_*.ply")) if pc_dir.exists() else []
@@ -944,7 +1463,7 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
     # photos first — same occlusion-aware projection the generator uses — and
     # train on the coloured copy. Detection is by content (r==g==b everywhere),
     # since mono clouds share the generated-cloud naming.
-    if pc_files:
+    if pc_files and not image_set:
         seed_cloud = pc_files[-1]
         loop = asyncio.get_event_loop()
         try:
@@ -1031,9 +1550,122 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
     # downscale 1, where they are REQUIRED, a missing file is generated now
     # via process_sfm.py (COLMAP/GLOMAP + LiDAR alignment — CPU-heavy, on the
     # order of an hour or two, but a one-off per scan).
-    if not sfm_poses:
-        canonical = proj / "sfm" / f"sfm_viewmats_{ts}.npz"
-        if canonical.exists():
+    canonical = proj / "sfm" / f"sfm_viewmats_{ts}.npz"
+    seed_cloud_path = pc_dir / f"pointcloud_{ts}.ply"
+
+    if image_set:
+        # An image set has no odometry fallback: SfM is the only pose source,
+        # and it also produces the only possible seed cloud. Both are needed,
+        # so both are (re)generated together — a poses file without its
+        # matching cloud would train geometry against cameras from a different
+        # reconstruction.
+        if not sfm_poses and not force_sfm:
+            sfm_poses = str(canonical) if canonical.exists() else ""
+        need_sfm = force_sfm or not sfm_poses or not seed_cloud_path.exists()
+        if need_sfm:
+            sfm_py = await asyncio.to_thread(_sfm_python, False)
+            if sfm_py is None:
+                await queue.put(
+                    {
+                        "event": "error",
+                        "message": (
+                            "Photogrammetry needs pycolmap, and no Python with "
+                            "it was found (pip install 'lidarstudio"
+                            "[photogrammetry]', or set $LIDARSTUDIO_SFM_PYTHON)."
+                        ),
+                    }
+                )
+                return
+            n_img = (contents.get("images") or {}).get("count", 0)
+            await queue.put(
+                {
+                    "event": "progress",
+                    "percent": 1,
+                    "message": (
+                        ("Rebuilding the reconstruction from scratch: "
+                         if force_sfm else "")
+                        + f"reconstructing {n_img} photos (COLMAP feature "
+                        "matching + global mapping, CPU-bound — expect tens of "
+                        "minutes; reused by every later run)…"
+                    ),
+                }
+            )
+            sfm_cmd = [
+                sfm_py,
+                str(ROOT / "process_sfm.py"),
+                "--scan",
+                str(scan),
+                "--output",
+                str(canonical),
+                # The sparse points are the seed: there is no LiDAR cloud.
+                "--cloud-output",
+                str(seed_cloud_path),
+                "--workspace",
+                str(proj / "sfm" / f"work_{ts}"),
+                "--matching",
+                str(options.get("matching", "auto")),
+            ]
+            # Subject masking is an image_set-only lever: it exists for an
+            # object shot on a floor or a desk, where the flat background is
+            # what folds the orbit. A LiDAR room scan HAS no subject to
+            # segment, so the LiDAR branch below never offers it.
+            if options.get("mask_subject") or options.get("turntable"):
+                if options.get("turntable"):
+                    # Implies masking: solving in the subject's frame is what
+                    # makes a rotating subject reconstructible at all.
+                    sfm_cmd.append("--turntable")
+                else:
+                    sfm_cmd.append("--mask-subject")
+                if options.get("mask_classes"):
+                    sfm_cmd += ["--mask-classes", str(options["mask_classes"])]
+            proc = await asyncio.create_subprocess_exec(
+                *sfm_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            job["proc"] = proc
+            if job.get("cancelled"):
+                proc.terminate()
+            rc, err = await _stream_proc(proc, queue)
+            job["proc"] = None
+            if job.get("cancelled"):
+                await queue.put(
+                    {"event": "cancelled", "message": "Splat generation stopped."}
+                )
+                return
+            if rc != 0 or not canonical.exists():
+                await queue.put(
+                    {
+                        "event": "error",
+                        "message": err
+                        or f"Photo reconstruction failed (exit code {rc})",
+                    }
+                )
+                return
+            sfm_poses = str(canonical)
+        else:
+            await queue.put(
+                {
+                    "event": "log",
+                    "message": f"Reusing the existing reconstruction: {canonical.name}",
+                }
+            )
+        if not pc_files:
+            if not seed_cloud_path.exists():
+                await queue.put(
+                    {
+                        "event": "error",
+                        "message": (
+                            "The reconstruction produced no seed cloud "
+                            f"({seed_cloud_path.name}). Delete "
+                            f"{canonical.name} and re-run to rebuild both."
+                        ),
+                    }
+                )
+                return
+            pc_files = [seed_cloud_path]
+    elif not sfm_poses:
+        if canonical.exists() and not force_sfm:
             sfm_poses = str(canonical)
             await queue.put(
                 {
@@ -1041,7 +1673,7 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
                     "message": f"Using the project's generated SfM poses: {canonical.name}",
                 }
             )
-        elif int(options.get("downscale", 1)) < 2:
+        elif force_sfm or int(options.get("downscale", 1)) < 2:
             traj = edit_ops._find_traj(pc_files[-1]) if pc_files else None
             if traj is None:
                 await queue.put(
@@ -1076,8 +1708,12 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
                     "event": "progress",
                     "percent": 1,
                     "message": (
-                        "No SfM poses for this scan — generating them first "
-                        "(COLMAP + LiDAR alignment, CPU-bound, can take "
+                        (
+                            "Rebuilding the SfM poses from scratch"
+                            if force_sfm
+                            else "No SfM poses for this scan — generating them first"
+                        )
+                        + " (COLMAP + LiDAR alignment, CPU-bound, can take "
                         "an hour or two; reused by every later run)…"
                     ),
                 }
@@ -1174,14 +1810,40 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
     ]
     if sfm_poses:
         cmd += ["--sfm-poses", sfm_poses]
+        # Masks travel WITH the poses: a reconstruction solved on the subject
+        # alone must be trained on the subject alone, or the trainer spends
+        # itself fitting a background those cameras were never solved against
+        # (on a turntable capture, one that moved relative to the subject).
+        try:
+            import numpy as np
+
+            with np.load(sfm_poses) as d:
+                mdir = str(d["mask_dir"]) if "mask_dir" in d.files else ""
+        except Exception:
+            mdir = ""
+        if mdir and Path(mdir).is_dir():
+            cmd += ["--frame-masks", mdir]
+            await queue.put(
+                {
+                    "event": "log",
+                    "message": (
+                        "Training on the subject only, using the masks the "
+                        "reconstruction was solved with."
+                    ),
+                }
+            )
+        fisheye = None if image_set else True
         # process_sfm.py stores the bundle-adjusted OPENCV_FISHEYE intrinsics
         # alongside the poses; undistorting with the same lens model the poses
         # were optimised under avoids baking a ~2px radial warp into training.
         try:
             import numpy as np
 
-            with np.load(sfm_poses) as d:
-                fisheye = d["fisheye_params"] if "fisheye_params" in d.files else None
+            if fisheye is not None:
+                with np.load(sfm_poses) as d:
+                    fisheye = (
+                        d["fisheye_params"] if "fisheye_params" in d.files else None
+                    )
         except Exception:
             fisheye = None  # hand-supplied npz without the extra key — fine
         if fisheye is not None and len(fisheye) == 8:
@@ -1203,8 +1865,9 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
                 "message": f"Using existing point cloud: {pc_files[-1].name}",
             }
         )
-        # Training needs the seed's trajectory sidecar; warn up front if missing.
-        if edit_ops._find_traj(pc_files[-1]) is None:
+        # Training needs the seed's trajectory sidecar; warn up front if
+        # missing. Image sets never have one (SfM poses replace it entirely).
+        if not image_set and edit_ops._find_traj(pc_files[-1]) is None:
             await queue.put(
                 {
                     "event": "log",
@@ -1478,14 +2141,92 @@ async def edit_recolour_handler(request):
 _photo_index: dict = {}
 
 
-def _scan_photo_index(scan: Path):
-    if str(scan) in _photo_index:
-        return _photo_index[str(scan)]
-    from rosbags.highlevel import AnyReader
+def _index_stamp(source: Path):
+    """Cheap identity for a cached photo index, so a re-ingest is never served
+    from the previous run's frame list. An ingested set is stamped by its
+    manifest, which every ingest rewrites; anything else by itself.
+    """
+    try:
+        manifest = source.parent / "manifest.csv"
+        target = manifest if source.is_dir() and manifest.is_file() else source
+        st = target.stat()
+        return (str(target), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _scan_photo_index(scan: Path, proj: Path | None = None):
+    """(source, topic, frames) for the photo preview.
+
+    Two shapes behind one index: a bag yields (bag_path, topic, timestamps),
+    an image set yields (images_dir, label, filenames). Callers only ever use
+    ``len(frames)`` and ``frames[i]``, so the preview endpoints work on either
+    without knowing which they have.
+
+    Image sets are previewable BEFORE ingest — looking at the photos is how you
+    decide whether the capture is worth an hour of SfM — and AFTER it: given
+    the project, a capture that has been ingested previews the frames the
+    pipeline will actually train on, which for a video is the only way to see
+    them at all.
+    """
+    key = (str(scan), str(proj or ""))
+    hit = _photo_index.get(key)
+    if hit is not None:
+        stamp, value = hit
+        if stamp is not None and _index_stamp(value[0]) == stamp:
+            return value
 
     contents = _scan_contents(scan)
+    if contents.get("source") == "image_set":
+        info = contents.get("images") or {}
+        # Resolve a raw capture onto its ingested form when the project has
+        # one: after ingest, the frames that matter are the normalized ones in
+        # the project, not the originals the user pointed at.
+        if proj is not None and not info.get("ingested"):
+            ing = _ingest_dir(Path(proj), scan)
+            if (ing / "manifest.csv").is_file() and (ing / "images").is_dir():
+                contents = _scan_contents(ing)
+                info = contents.get("images") or {}
+        if info.get("video") and not info.get("ingested"):
+            raise FileNotFoundError(
+                "this capture is a video — run 'ingest' to decode it into "
+                "frames, then preview those"
+            )
+        img_dir = Path(info["dir"])
+        if info.get("ingested"):
+            names = [
+                r["name"]
+                for r in _read_manifest_names(img_dir.parent)
+                if (img_dir / r["name"]).exists()
+            ]
+        else:
+            names = sorted(
+                f.name for f in img_dir.iterdir()
+                if f.suffix.lower() in _STILL_EXT
+            )
+        value = (img_dir, f"{img_dir.parent.name}/{img_dir.name}/", names)
+        _photo_index[key] = (_index_stamp(img_dir), value)
+        return value
+
+    from rosbags.highlevel import AnyReader
+
     if not contents.get("image_bag"):
-        raise FileNotFoundError("no IMAGE_*.bag in scan folder")
+        # Neither a LiDAR bag nor a recognised phone capture. Say which of the
+        # two tests failed and by how much — "no IMAGE_*.bag" alone sends the
+        # user hunting for a bag they never had.
+        loose = sum(
+            1 for f in scan.iterdir()
+            if f.is_file() and f.suffix.lower() in _STILL_EXT
+        ) if scan.is_dir() else 0
+        if loose:
+            raise FileNotFoundError(
+                f"{scan.name} holds {loose} photo(s) — a phone capture needs at "
+                f"least {_MIN_IMAGES} (and {_GOOD_IMAGES}+ to reconstruct well)"
+            )
+        raise FileNotFoundError(
+            f"{scan.name} is neither a LiDAR scan (no IMAGE_*.bag) nor a phone "
+            f"capture (no .jpg/.png/.heic photos, no video)"
+        )
     bag = scan / contents["image_bag"]
     ts = []
     with AnyReader([bag]) as reader:
@@ -1496,30 +2237,74 @@ def _scan_photo_index(scan: Path):
         conns = [c for c in conns if c.topic == topic]
         for _conn, t, _raw in reader.messages(connections=conns):
             ts.append(t)
-    _photo_index[str(scan)] = (bag, topic, ts)
-    return _photo_index[str(scan)]
+    value = (bag, topic, ts)
+    _photo_index[key] = (_index_stamp(bag), value)
+    return value
 
 
 async def scan_photos_handler(request):
-    """POST /api/scan/photos — index the scan's camera images: {count, ts}."""
+    """POST /api/scan/photos — index the scan's camera images: {count, ts}.
+
+    ``project`` is optional and only matters for a phone capture: with it, a
+    capture that has been ingested previews its normalized frames instead of
+    the originals (and a video previews at all).
+    """
     data = await request.json()
     scan = Path((data.get("path") or "").strip())
+    proj = (data.get("project") or "").strip()
     if not scan.is_dir():
         return web.json_response({"error": "scan folder not found"}, status=404)
     try:
         loop = asyncio.get_event_loop()
-        _bag, topic, ts = await loop.run_in_executor(None, _scan_photo_index, scan)
+        _bag, topic, ts = await loop.run_in_executor(
+            None, _scan_photo_index, scan, Path(proj) if proj else None
+        )
         return web.json_response({"count": len(ts), "topic": topic})
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
 
 
-def _read_photo(scan: Path, index: int) -> bytes:
-    from rosbags.highlevel import AnyReader
+def _read_manifest_names(scan: Path):
+    """Manifest rows for an ingested image set, in file order."""
+    import csv as _csv
 
-    bag, topic, ts = _scan_photo_index(scan)
+    with open(Path(scan) / "manifest.csv", newline="") as f:
+        return list(_csv.DictReader(f))
+
+
+def _read_photo(scan: Path, index: int, proj: Path | None = None) -> bytes:
+    bag, topic, ts = _scan_photo_index(scan, proj)
     if not 0 <= index < len(ts):
         raise IndexError(f"frame {index} out of range 0..{len(ts) - 1}")
+    if bag.is_dir():  # image set: the frame IS a file
+        data = (bag / ts[index]).read_bytes()
+        suffix = (bag / ts[index]).suffix.lower()
+        if suffix in (".heic", ".heif"):
+            # Browsers do not render HEIC. Decode through Pillow (which needs
+            # pillow-heif registered) and re-encode, rather than returning
+            # bytes that would silently show as a broken image.
+            import io
+
+            from PIL import Image, ImageOps
+
+            try:
+                import pillow_heif
+
+                pillow_heif.register_heif_opener()
+            except ImportError as exc:
+                raise RuntimeError(
+                    "previewing HEIC photos needs pillow-heif "
+                    "(pip install 'lidarstudio[photogrammetry]')"
+                ) from exc
+            with Image.open(io.BytesIO(data)) as im:
+                im = ImageOps.exif_transpose(im).convert("RGB")
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=90)
+            return buf.getvalue()
+        return data
+
+    from rosbags.highlevel import AnyReader
+
     with AnyReader([bag]) as reader:
         conns = [c for c in reader.connections if c.topic == topic]
         for conn, _t, raw in reader.messages(
@@ -1554,6 +2339,7 @@ async def scan_photo_handler(request):
     """GET /api/scan/photo?path=<scan>&index=N[&rot=ccw&width=1600] — one
     camera JPEG from the bag, optionally rotated/downscaled for display."""
     scan = Path(request.query.get("path", ""))
+    proj = request.query.get("project", "")
     rot = request.query.get("rot", "")
     try:
         index = int(request.query.get("index", "0"))
@@ -1564,7 +2350,11 @@ async def scan_photo_handler(request):
         return web.Response(status=404, text="scan folder not found")
     try:
         loop = asyncio.get_event_loop()
-        jpeg = await loop.run_in_executor(None, _read_photo, scan, index)
+        if _scan_contents(scan).get("source") == "image_set":
+            rot = ""  # already upright — see _load_still's exif_transpose
+        jpeg = await loop.run_in_executor(
+            None, _read_photo, scan, index, Path(proj) if proj else None
+        )
         if rot or width:
             jpeg = await loop.run_in_executor(None, _prep_photo, jpeg, rot, width)
         return web.Response(body=jpeg, content_type="image/jpeg")
@@ -1582,6 +2372,10 @@ def _scan_sweep_index(scan: Path):
     from rosbags.highlevel import AnyReader
 
     contents = _scan_contents(scan)
+    if contents.get("source") == "image_set":
+        raise FileNotFoundError(
+            "a phone capture has no LiDAR sweeps — use 'Load photos' instead"
+        )
     if not contents.get("lidar_bag"):
         raise FileNotFoundError("no LIDAR_*.bag in scan folder")
     bag = scan / contents["lidar_bag"]

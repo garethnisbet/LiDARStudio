@@ -512,7 +512,7 @@ export function initLidarPanel() {
     if (sp.project) projectInput.value = sp.project;
     if (sp.scan) scanInput.value = sp.scan;
   } catch { /* ignore */ }
-  const typeSel = el('select', {}, ...['splat', 'pointcloud', 'mesh'].map(t => el('option', { value: t }, t)));
+  const typeSel = el('select', {}, ...['splat', 'pointcloud', 'mesh', 'ingest'].map(t => el('option', { value: t }, t)));
   const voxelInput = el('input', { type: 'number', step: '0.005', min: '0.005', value: '0.01' });
   // voxel is used only by the point-cloud job (splats are always GPU-trained).
   const lblVoxel = el('label', { class: 'muted', style: 'flex:1' }, 'voxel',
@@ -520,6 +520,90 @@ export function initLidarPanel() {
       + 'and slower. 0.01 m is dense; 0.05 m is a light preview cloud.', 'Voxel'),
     voxelInput);
   const pVoxel = el('div', { class: 'row' }, lblVoxel);
+  // ── Phone photogrammetry: 'ingest' normalizes a photo folder or video into
+  // the project before the slow reconstruction stages run. ──
+  const edgeInput = el('input', { type: 'number', step: '200', min: '800', max: '8000', value: '2400' });
+  const fpsInput = el('input', { type: 'number', step: '0.5', min: '0.5', max: '30', value: '4' });
+  const blurInput = el('input', { type: 'number', step: '0.05', min: '0', max: '0.5', value: '0.1' });
+  // Video frame rate. The number that actually matters is the FRAME COUNT the
+  // rate produces, and that depends on the clip: ingest keeps every
+  // round(native_fps / fps)-th frame. So the slider is paired with a live
+  // estimate read from the scan folder's video (probed by /api/scan/validate),
+  // which is the difference between picking a rate and picking a result.
+  const fpsSlider = el('input', { type: 'range', min: '0.5', max: '30', step: '0.5', value: '4', style: 'flex:1' });
+  const fpsOut = el('span', { class: 'muted', style: 'min-width:112px;text-align:right' }, '4 fps');
+  const fpsHint = el('div', { class: 'muted', style: 'font-size:11px;margin:2px 0 6px' }, '');
+  let videoInfo = null;   // {native_fps, frames, duration_s} of the scan's video
+  const ordinal = (n) => {
+    const suffix = (n % 100 >= 11 && n % 100 <= 13) ? 'th'
+      : ({ 1: 'st', 2: 'nd', 3: 'rd' })[n % 10] || 'th';
+    return n + suffix;
+  };
+  const fpsEstimate = () => {
+    const fps = parseFloat(fpsInput.value) || 4;
+    if (!videoInfo) {
+      fpsOut.textContent = fps + ' fps';
+      fpsHint.textContent = 'No video found in the scan folder — this rate applies '
+        + 'only to video captures.';
+      return;
+    }
+    const step = Math.max(1, Math.round(videoInfo.native_fps / fps));
+    const decoded = Math.ceil(videoInfo.frames / step);
+    // Mirror the ingest filter: it only thins a set that is already above the
+    // 20-frame floor, and never takes it below that.
+    const drop = Math.min(0.9, Math.max(0, parseFloat(blurInput.value) || 0));
+    const kept = decoded > 20 ? Math.max(20, Math.round(decoded * (1 - drop))) : decoded;
+    fpsOut.textContent = `${fps} fps \u00b7 \u2248${kept} frames`;
+    fpsHint.textContent = `every ${step === 1 ? '' : ordinal(step) + ' '}frame of `
+      + `${videoInfo.frames} (${videoInfo.duration_s}s @ ${Math.round(videoInfo.native_fps)} fps)`
+      + (kept < 20 ? ' \u2014 below the 20 SfM needs' : kept < 150
+        ? ' \u2014 thin; 150-400 reconstructs far better' : '');
+  };
+  fpsSlider.addEventListener('input', () => { fpsInput.value = fpsSlider.value; fpsEstimate(); });
+  fpsInput.addEventListener('input', () => { fpsSlider.value = fpsInput.value; fpsEstimate(); });
+  blurInput.addEventListener('input', fpsEstimate);
+  // Re-probe whenever the folder changes or the panel is opened on it; a folder
+  // that isn't a phone capture just leaves the estimate blank.
+  const refreshVideoInfo = async () => {
+    const scan = scanInput.value.trim();
+    if (!scan) { videoInfo = null; fpsEstimate(); return; }
+    try {
+      const r = await api('/api/scan/validate', { path: scan });
+      videoInfo = ((r.contents || {}).images || {}).video_info || null;
+    } catch { videoInfo = null; }
+    fpsEstimate();
+  };
+  scanInput.addEventListener('change', refreshVideoInfo);
+  const pIngest = el('div', {},
+    el('div', { class: 'row' },
+      el('label', { class: 'muted', style: 'flex:1' }, 'max edge px',
+        infoIcon('Photos are downscaled so their long edge is at most this many pixels. '
+          + '48 MP phone stills add nothing to reconstruction accuracy and dominate '
+          + 'matching time and memory; 2000-3000 px is the useful range.', 'Max edge'),
+        edgeInput),
+      el('label', { class: 'muted', style: 'flex:1' }, 'video fps',
+        infoIcon('Frames per second sampled from a video capture. Ingest keeps every '
+          + 'round(native fps / this)-th frame, so the frame count depends on the clip '
+          + '\u2014 the slider shows what you will actually get. 4 fps on a slow walk '
+          + 'gives dense overlap; raise it if you moved quickly, lower it if the '
+          + 'reconstruction is taking too long. SfM needs 20 frames at an absolute '
+          + 'minimum and reconstructs well from 150-400.', 'Video fps'),
+        fpsInput)),
+    el('div', { class: 'row', style: 'align-items:center' }, fpsSlider, fpsOut),
+    fpsHint,
+    el('div', { class: 'row' },
+      el('label', { class: 'muted', style: 'flex:1' }, 'drop blurry',
+        infoIcon('Fraction of the blurriest frames to discard, by Laplacian-variance '
+          + 'sharpness. A motion-blurred photo teaches soft edges everywhere it is '
+          + 'used, so dropping it helps — but dropped frames become missing coverage.',
+          'Drop blurry'),
+        blurInput)),
+    el('div', { class: 'muted', style: 'font-size:11px;line-height:1.5;margin-top:4px' },
+      'Point the scan folder at a folder of phone photos, or a folder containing one '
+      + 'video. Ingest normalizes them into the project (it never writes to your '
+      + 'originals), then run \u2018splat\u2019 on the same folder. '
+      + 'For a good capture: lock exposure and focus, move slowly, keep 70%+ overlap '
+      + 'between frames, and don\u2019t let the phone switch to the ultrawide lens.'));
   const monoCheck = el('input', { type: 'checkbox' });
   const lblMono = el('label', { class: 'muted', style: 'flex:1;display:flex;align-items:center;gap:6px' },
     monoCheck, 'monochromatic',
@@ -571,6 +655,22 @@ export function initLidarPanel() {
   // 'ultra' (0.05); editable by hand for other weights.
   const depthInput = el('input', { type: 'number', step: '0.01', min: '0', max: '1', value: '0' });
   const sfmInput = el('input', { placeholder: 'auto — generated when needed; or path to a .npz' });
+  // The reconstruction is computed once per scan and reused forever, which is
+  // a trap when the stored one is bad — nothing in the UI otherwise re-runs it
+  // short of deleting the .npz by hand. Stays ticked between runs, like every
+  // other control here: it used to clear itself after each Generate to protect
+  // against redoing an hour of SfM by accident, but that silently reused the
+  // known-bad reconstruction on the second run of a fix-and-retry loop, which
+  // is the exact situation the box exists for. A ticked box is visible.
+  const forceSfmCb = el('input', { type: 'checkbox' });
+  // Photo captures only: restrict SfM to the segmented subject. Blank classes
+  // = let the reconstruction vote on what the subject is.
+  const maskSubjectCb = el('input', { type: 'checkbox' });
+  const maskClassesInput = el('input', { placeholder: 'auto' });
+  // Turntable captures invert the problem: the camera is still and the
+  // subject spins, so the reconstruction has to be solved in the subject's
+  // frame — which is masking, plus a check against the one-axis model.
+  const turntableCb = el('input', { type: 'checkbox' });
   // Repopulate the individual controls from a quality preset (1-based index).
   const applyQuality = (idx) => {
     const q = QUALITY[Math.min(QUALITY.length - 1, Math.max(0, idx - 1))];
@@ -635,6 +735,59 @@ export function initLidarPanel() {
         + "'transformers' package in the training interpreter; the first use downloads "
         + 'the ~1.3 GB model.')),
     el('div', { class: 'row', style: 'align-items:center' },
+      el('label', { class: 'muted', style: 'flex:1;display:flex;align-items:center;gap:6px;white-space:nowrap' },
+        forceSfmCb, 'force SfM regeneration'),
+      infoIcon('Throw away this scan\u2019s stored reconstruction and build it again '
+        + 'before training. Normally SfM runs once per scan and every later run reuses '
+        + 'the .npz in the project\u2019s sfm/ folder \u2014 tick this when that file is '
+        + 'the problem: a reconstruction that folded the orbit, a re-ingest at a different '
+        + 'frame rate, or a change to how matching is chosen. Costs the full SfM time '
+        + 'again (tens of minutes for a phone capture, an hour or two for a LiDAR scan), '
+        + 'and for a phone capture it rebuilds the seed cloud too, since poses and seed '
+        + 'must come from the same reconstruction. Ignored if a poses path is set below.',
+        'Force SfM regeneration')),
+    el('div', { class: 'row', style: 'align-items:center' },
+      el('label', { class: 'muted', style: 'flex:1;display:flex;align-items:center;gap:6px;white-space:nowrap' },
+        maskSubjectCb, 'mask to subject'),
+      infoIcon('Photo captures only. Segments the subject in every frame and matches '
+        + 'features on it alone, ignoring the surface it stands on. An object shot on a '
+        + 'floor, desk or table is a small non-planar island in a large PLANE, and a plane '
+        + 'gives two-fold ambiguous camera geometry — so when the background supplies '
+        + 'most of the matches the reconstruction can fold the orbit, placing opposite '
+        + 'views on top of each other (the splat then looks right from one direction and '
+        + 'is mush from the others). Leave the box blank to auto-detect what the subject '
+        + 'is, or name it (a COCO class: cup, bowl, vase, bottle, potted plant, book, '
+        + 'teddy bear…). Only takes effect when the reconstruction is actually built '
+        + '— tick “force SfM regeneration” above as well if this scan '
+        + 'already has one. Needs torchvision in the SfM interpreter.',
+        'Mask to subject')),
+    el('div', { class: 'row', style: 'align-items:center' },
+      el('label', { class: 'muted', style: 'flex:1;display:flex;align-items:center;gap:6px;white-space:nowrap' },
+        turntableCb, 'turntable'),
+      infoIcon('Tick when the SUBJECT rotated and the camera stayed put (a lazy Susan, '
+        + 'a turntable, or the object spun by hand). This is a different capture, not a '
+        + 'variation on walking around: SfM only ever solves a STATIC scene, so with the '
+        + 'room included it reconstructs the room and treats the spinning subject as '
+        + 'contradictory evidence. Ticking this solves in the subject\u2019s frame '
+        + 'instead — it implies “mask to subject”, and the background is excluded from '
+        + 'training too. It then checks the result against the single-axis model a '
+        + 'turntable obeys and tells you the angle actually covered, which also catches '
+        + 'a folded solve that plain coverage cannot. ADVICE: put newspaper or a '
+        + 'patterned cloth ON the turntable so it rotates WITH the subject — a '
+        + 'symmetric or repetitively patterned object has nothing else to key on. '
+        + 'Light it evenly and diffusely: lighting stays fixed while the subject turns, '
+        + 'so hard shadows and specular highlights slide across the surface and bake in.',
+        'Turntable')),
+    el('div', { class: 'row', style: 'align-items:center' },
+      el('label', { class: 'muted', style: 'flex:1' }, 'subject class', maskClassesInput),
+      infoIcon('Which COCO class the subject is, for \u201cmask to subject\u201d and '
+        + '\u201cturntable\u201d. Leave it on auto and the capture votes on what its '
+        + 'subject is, over frames spread across the whole capture, so one odd frame '
+        + 'cannot rename it. Name one instead when auto picks the wrong thing: cup, '
+        + 'bowl, vase, bottle, wine glass, potted plant, teddy bear, book, clock, '
+        + 'sports ball, keyboard, mouse, cell phone, remote, scissors, toaster. '
+        + 'Ignored unless one of those two boxes is ticked.', 'Subject class')),
+    el('div', { class: 'row', style: 'align-items:center' },
       el('label', { class: 'muted', style: 'flex:1' }, 'SfM poses', sfmInput),
       infoIcon('Camera poses from Structure-from-Motion (COLMAP/GLOMAP, aligned to the '
         + 'LiDAR frame). The single biggest quality lever (~+4 dB, walls-to-parity) — it '
@@ -648,8 +801,11 @@ export function initLidarPanel() {
   // splat to that exact cloud — e.g. an edited one.
   const seedSel = el('select', {}, el('option', { value: '' }, 'seed cloud: auto'));
   const pSeed = el('div', { class: 'row', style: 'align-items:center' }, seedSel,
-    infoIcon("Which point cloud the splat is trained from. 'auto' uses the latest project "
-      + 'cloud; choose a specific or edited cloud to pin the splat to it.', 'Seed cloud'));
+    infoIcon("Which point cloud the splat is trained from, or the mesh reconstructed "
+      + "from. 'auto' uses the latest project cloud; choose a specific or edited cloud "
+      + 'to pin the job to it. For a phone capture, a mesh on \'auto\' uses the trained '
+      + "splat's gaussian centres — the only dense geometry the photo route produces — "
+      + 'exporting them first if needed.', 'Seed cloud'));
   const showGen = () => {
     const type = typeSel.value;
     // Seed cloud applies to splats and meshes (both reconstruct from a cloud);
@@ -659,6 +815,8 @@ export function initLidarPanel() {
     pVoxel.style.display = type === 'pointcloud' ? 'flex' : 'none';
     pMono.style.display = type === 'pointcloud' ? 'flex' : 'none';
     pHandle.style.display = type === 'pointcloud' ? 'flex' : 'none';
+    pIngest.style.display = type === 'ingest' ? 'block' : 'none';
+    if (type === 'ingest') refreshVideoInfo();
   };
   typeSel.addEventListener('change', showGen);
   showGen();
@@ -772,14 +930,20 @@ export function initLidarPanel() {
   const photoLoadBtn = el('button', { class: 'act', onclick: async () => {
     const scan = scanInput.value.trim();
     if (!scan) { photoStat.textContent = 'Enter a scan folder path above.'; return; }
-    photoStat.textContent = 'Indexing bag…';
+    photoStat.textContent = 'Indexing…';
+    // The project is what lets an already-ingested capture preview the frames
+    // the pipeline will train on — for a video, the only way to see them.
+    const project = projectInput.value.trim();
+    const q = (i) => `/api/scan/photo?path=${encodeURIComponent(scan)}`
+      + (project ? `&project=${encodeURIComponent(project)}` : '')
+      + `&index=${i}&rot=ccw&width=1600`;
     try {
-      const r = await api('/api/scan/photos', { path: scan });
+      const r = await api('/api/scan/photos', { path: scan, project });
       photoStat.textContent = `${r.count} photos (${r.topic})`;
       mvOpen({
         title: `Scan photos — ${r.count} frames`,
         count: r.count,
-        url: (i) => `/api/scan/photo?path=${encodeURIComponent(scan)}&index=${i}&rot=ccw&width=1600`,
+        url: q,
       });
     } catch (e) { photoStat.textContent = 'Error: ' + e.message; }
   } }, 'Load photos');
@@ -827,12 +991,24 @@ export function initLidarPanel() {
           patch_size: Number.isNaN(parseInt(patchInput.value)) ? 0 : parseInt(patchInput.value),
           depth_loss: parseFloat(depthInput.value) || 0,
           ...(sfmInput.value.trim() ? { sfm_poses: sfmInput.value.trim() } : {}),
+          ...(forceSfmCb.checked ? { force_sfm: true } : {}),
+          // Unlike force_sfm this is not a one-shot: it describes the scene,
+          // so it stays ticked and applies to every reconstruction of it.
+          ...(maskSubjectCb.checked ? { mask_subject: true } : {}),
+          ...(turntableCb.checked ? { turntable: true } : {}),
+          ...((maskSubjectCb.checked || turntableCb.checked) && maskClassesInput.value.trim()
+              ? { mask_classes: maskClassesInput.value.trim() } : {}),
           ...(seedSel.value ? { pointcloud: seedSel.value } : {}) }
       : type === 'mesh'
       // Surface-mesh defaults land the champion recipe (outlier-clean + Taubin
       // smooth); a chosen seed pins which cloud it reconstructs from.
       ? { depth: 10, smooth: 15, density_quantile: 0.03,
           ...(seedSel.value ? { pointcloud: seedSel.value } : {}) }
+      : type === 'ingest'
+      ? { max_edge: parseInt(edgeInput.value) || 2400,
+          fps: parseFloat(fpsInput.value) || 4,
+          // 0 is a real value (keep every frame), so don't use `||` here.
+          drop_blurry: Number.isNaN(parseFloat(blurInput.value)) ? 0.1 : parseFloat(blurInput.value) }
       : { voxel_size: parseFloat(voxelInput.value), mono: monoCheck.checked,
           keep_self_view: !handleCheck.checked };
     try {
@@ -851,6 +1027,11 @@ export function initLidarPanel() {
           es.close(); endRun();
         }
         else if (d.event === 'cancelled') { setBar(0, d.message); es.close(); endRun(); }
+        else if (d.event === 'result' && d.type === 'ingest') {
+          setBar(100, `Ingested ${d.frames} frames into ${d.filename} — now run 'splat'.`);
+          // The frames just changed; 'Load photos' should offer the new ones.
+          photoStat.textContent = `${d.frames} ingested frames ready — 'Load photos' shows them.`;
+        }
         else if (d.event === 'result') {
           setBar(100, `Done: ${d.filename} — loading…`);
           // Reload the new splat at the seed cloud's position/rotation so it
@@ -1430,12 +1611,15 @@ export function initLidarPanel() {
     el('div', { class: 'row' }, scanInput, scanBrowse),
     el('div', { class: 'row', style: 'align-items:center' }, typeSel,
       infoIcon('Output kind. splat = photoreal GPU-trained Gaussians (uses the quality '
-        + 'slider below); pointcloud = raw coloured LiDAR points.', 'Output type')),
+        + 'slider below); pointcloud = raw coloured LiDAR points; mesh = surface '
+        + 'reconstruction. ingest = prepare a phone-camera capture (photo folder or '
+        + 'video) for photogrammetry; run it once, then choose splat.', 'Output type')),
     pSeed,
     pTrained,
     pVoxel,
     pMono,
     pHandle,
+    pIngest,
     genBtn, stopBtn, barLabel, barWrap, logWrap,
     el('h4', {}, 'Scan photos'),
     pPhotos,

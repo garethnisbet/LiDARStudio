@@ -1,8 +1,41 @@
 # Design: `image_set` ingest — photogrammetry from phone photos
 
-**Status:** proposed
+**Status:** implemented, phases 0-3 (2026-08-21). Phases 4-5 remain open.
 **Date:** 2026-08-21
 **Scope:** add a second scan source (a folder of phone photos or a video) alongside the existing LiDAR bag source, producing point clouds and splats through the pipeline that already exists.
+
+---
+
+## 0. Phase 0 results — what the probe changed
+
+Run against the interpreter `_sfm_python()` locates (`/usr/bin/python3`,
+pycolmap **4.0.4**). Two assumptions in this document were wrong and the
+implementation differs accordingly:
+
+- **`refine_focal_length` is not on the mapper options.** It lives at
+  `GlobalPipelineOptions.mapper.bundle_adjustment.refine_focal_length` for
+  GLOMAP, and as `IncrementalPipelineOptions.ba_refine_focal_length` for the
+  incremental fallback. Both are set (§4.5) only when the camera is
+  uncalibrated.
+- **`pycolmap.has_cuda is False` on this build.** Dense MVS (§7.5) is therefore
+  *not available here at all*, which settles risk 2: the sparse SfM cloud is the
+  only seed the reconstruction itself can produce. Meshing does not wait on MVS —
+  it takes its density from the trained splat instead (§4.12).
+
+Confirmed as assumed: `match_exhaustive`, `match_vocabtree`, `match_spatial`
+and `match_image_pairs` all exist; `SIMPLE_RADIAL` is available.
+
+One thing the probe added that this document had not anticipated:
+**pycolmap ships no vocabulary tree** — `VocabTreePairingOptions.vocab_tree_path`
+defaults to `.`. Vocab-tree matching is therefore never selected automatically
+(§4.5.2); large unordered sets fall back to sequential+quadratic, and a user
+who has downloaded a tree can pass `--matching vocabtree --vocab-tree <path>`.
+
+Verified end-to-end on a synthetic 60-frame room-corner capture with known
+camera poses: all 60 frames registered, camera centres recovered to 0.57% of
+scene extent after sim(3) alignment to ground truth, and the solved focal
+length converged to 699.4 px against a true 700.0 px. A splat trained from that
+capture reached 27.0 dB in 800 iterations.
 
 ---
 
@@ -53,7 +86,8 @@ The only genuine cost is that the product name stops describing the whole produc
 - Fusing a phone capture and a LiDAR capture into one reconstruction.
 - Metric scale from phone sensors (ARKit/ARCore pose export). Section 8 keeps the
   hook open; the work is out of scope here.
-- Mesh generation from image sets — deferred until dense MVS exists (§7.5).
+- Meshing a phone capture *directly from SfM points*. The mesh route goes
+  through the trained splat instead (§4.12); a dense-MVS seed stays deferred (§7.5).
 
 ---
 
@@ -83,12 +117,18 @@ Add a `source` discriminator to the returned dict:
 
 ```python
 "source": "lidar_bag" | "image_set" | None,
-"images": {"count": N, "dir": ..., "formats": [...], "video": ...},
+"images": {"count": N, "dir": ..., "formats": [...], "video": ..., "sparse": bool},
 ```
 
-Detection rule: no `LIDAR_*.bag` present, **and** ≥20 images (`.jpg .jpeg .png .heic`)
+Detection rule: no `LIDAR_*.bag` present, **and** ≥4 images (`.jpg .jpeg .png .heic`)
 either at the top level or inside a single subdirectory (`images/`, `DCIM/`, or the
 sole subdirectory present) → `image_set`. A lone `.mp4`/`.mov` also qualifies.
+
+Two thresholds, not one: 4 is geometry's hard floor (`_MIN_IMAGES`), 20 is the
+count a capture *should* have (`_GOOD_IMAGES` / `REC_FRAMES`). Between them the
+set is detected, previewable and ingestable, with `"sparse": true` and an
+ingest warning — a 12-photo orbit of a small object often does reconstruct, and
+a folder that silently fails to be recognised is worse than one that warns.
 
 `valid` changes from `bool(image_bag and lidar_bag)` to `source is not None`.
 
@@ -214,8 +254,8 @@ optional and require `sfm_poses`.
 Each needs an explicit, readable message rather than an obscure downstream failure:
 
 - `--mono` and `edit_ops.recolour` — both need a trajectory sidecar.
-- The **mesh job** — screened-Poisson on sparse SfM points produces garbage. Re-enable
-  when MVS lands.
+- The **mesh job on the SfM cloud** — screened-Poisson on sparse SfM points produces
+  garbage. It runs on the splat instead (§4.12).
 - Panel previews `_scan_photo_index` (`lidar_jobs.py:1492`) and `scan_sweeps`
   (`:1590`) — both are bag readers. The sweep preview has no image_set analogue; the
   photo preview should be reimplemented against the manifest.
@@ -242,6 +282,33 @@ photogrammetry = [
 
 No kiss-icp, rosbags, or open3d — a phone-only user installs a substantially
 lighter stack than `pipeline`.
+
+---
+
+### 4.12 Meshing a phone capture: Poisson on the splat
+
+Screened Poisson needs dense, normal-bearing geometry. Without MVS the reconstruction
+gives only a sparse SfM cloud — but the **trained splat** is dense: training migrates
+the gaussian means onto real surfaces, densifies thin structure and prunes whatever no
+photo supports. Exporting the centres (`edit_ops.splat_to_cloud`, already built for the
+LiDAR path) turns the splat into a cloud Poisson can eat.
+
+Three substitutions make `process_mesh.py` run without any LiDAR artifact:
+
+| LiDAR route | Phone route |
+| --- | --- |
+| `.traj.npz` trajectory | `--sfm-poses sfm/sfm_viewmats_<ts>.npz` (world→cam viewmats inverted to camera centres) |
+| photo re-projection from `IMAGE_*.bag` | the cloud's own per-point RGB, from the splat's SH DC term |
+| metric, gravity-levelled frame | the SfM frame: **unitless and unlevelled** |
+
+Poses are used for one thing only: orienting normals toward the camera that saw each
+point. That inherits the LiDAR route's known limitation — a surface no camera looked at
+gets its normal flipped toward the nearest camera anyway — which matters more here,
+where an orbit around a closed object never sees the base it stands on.
+
+`_job_mesh` resolves the seed itself: an explicit seed pins the mesh, otherwise it
+reuses an export newer than the splat, or makes one. A stale export (from a splat
+retrained since) is rebuilt rather than silently reused.
 
 ---
 
@@ -296,7 +363,7 @@ and loads in the viewer (sideways and unscaled — that's Phase 4).
 
 ### Phase 5 — dense MVS
 
-§7.5. Better seed, and re-enables the mesh job.
+§7.5. Better seed, and a mesh built from scanned rather than trained geometry.
 
 ---
 
@@ -318,8 +385,10 @@ and loads in the viewer (sideways and unscaled — that's Phase 4).
 ### 7.5 Dense MVS (deferred)
 
 `undistort_images` → `patch_match_stereo` → `stereo_fusion`, producing a dense cloud
-that both improves the splat seed and re-enables screened-Poisson meshing. Gated on a
-CUDA-enabled COLMAP build (risk 2).
+that improves the splat seed and gives §4.12 a mesh source that is measured rather
+than trained. Gated on a CUDA-enabled COLMAP build (risk 2): pycolmap 4.0.4 here
+exposes both entry points but reports `has_cuda: False`, and there is no `colmap`
+CLI installed, so patch-match stereo refuses despite the local RTX 3090.
 
 ---
 

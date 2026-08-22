@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 """
-Surface Mesh Generator (LiDAR → screened Poisson → photo-coloured mesh)
+Surface Mesh Generator (dense cloud → screened Poisson → coloured mesh)
 
-Turns the fused, gravity-levelled world cloud produced by
-``process_pointcloud.py`` into a watertight triangle mesh and colours every
-vertex by re-projecting it into the camera photos — the "robust deliverable"
-alternative to Gaussian splatting.  Because the LiDAR already gives metric
-geometry and the trajectory sidecar gives real camera poses, this avoids the
-scale/geometry guessing that makes image-only photogrammetry fragile.
+Turns a dense point cloud into a watertight triangle mesh.  Two sources feed it:
+
+  * **LiDAR** — the fused, gravity-levelled world cloud from
+    ``process_pointcloud.py``, with its ``.traj.npz`` trajectory.  Every vertex
+    is coloured by re-projecting it into the camera photos.  Because the LiDAR
+    gives metric geometry and the trajectory gives real camera poses, this
+    avoids the scale/geometry guessing that makes image-only photogrammetry
+    fragile.
+  * **A trained splat** (``--sfm-poses``) — the gaussian centres exported by
+    ``edit_ops.splat_to_cloud``.  This is the phone-capture route: there is no
+    LiDAR and no IMAGE bag, so camera centres come from the SfM npz and colour
+    comes from the cloud's own per-point RGB (the splat already solved it
+    photometrically).  The result is unitless and unlevelled — the SfM frame
+    has no metric scale to inherit.
 
 Pipeline:
-    1. Load the fused cloud + its ``.traj.npz`` trajectory sidecar (same frame).
+    1. Load the cloud + camera centres (``.traj.npz`` trajectory, or the
+       world→cam viewmats in an SfM npz).
     2. Estimate normals, then ORIENT them toward the nearest camera (we know
        which way is "outward" from the poses — far more reliable than the
        tangent-plane heuristic Poisson normally leans on).
@@ -18,26 +27,35 @@ Pipeline:
     4. Trim the low-density Poisson "balloon" and crop to the cloud's bounds.
     5. Colour each vertex via the occlusion-aware multi-view fisheye projector
        reused from process_pointcloud (falls back to the nearest cloud colour
-       for vertices no camera saw).
+       for vertices no camera saw).  With no bag/calibration — the splat route
+       — every vertex takes the nearest cloud point's colour instead.
     6. Write a vertex-coloured PLY.
 
 Usage (invoked by the server; runnable standalone):
-    python process_mesh.py
+    python process_mesh.py                     # LiDAR
         --cloud      /project/pointclouds/pointcloud_<ts>.ply
         --image-bag  /scan/IMAGE_<ts>.bag
         --output     /project/meshes/mesh_<ts>.ply
         [--calibration /scan/calibration]
         [--camera front]           # comma list to colour from several cameras
+        [--colour-range 20.0]
+
+    python process_mesh.py                     # splat (phone capture)
+        --cloud      /project/pointclouds/splat_<ts>_points.ply
+        --sfm-poses  /project/sfm/sfm_viewmats_<ts>.npz
+        --output     /project/meshes/mesh_<ts>.ply
+
+    Shared by both:
         [--depth 10]               # Poisson octree depth (9 draft…11 fine)
         [--density-quantile 0.02]  # drop this fraction of lowest-density verts
         [--decimate 0]             # target triangle count (0 = keep all)
-        [--colour-range 20.0]
 
 Progress protocol matches the sibling scripts: lines beginning
 ``PROGRESS:<percent>:<message>`` drive the server's progress bar.
 
 Required packages:
-    pip install rosbags open3d numpy opencv-python-headless scipy
+    pip install open3d numpy opencv-python-headless scipy   (+ rosbags for the
+    LiDAR route, which reads the IMAGE bag)
 """
 
 import argparse
@@ -65,6 +83,26 @@ def _find_traj(cloud: Path):
         if cand.exists():
             return cand
     return None
+
+
+def cam_centres_from_sfm(npz_path: Path):
+    """Camera centres from a process_sfm.py npz.
+
+    ``viewmats`` are world→cam (``vm[:3, 3] == -R @ c``), so the centre is
+    ``-R.T @ vm[:3, 3]`` — the same inversion process_splat does. These are the
+    only poses the phone route has; unlike the LiDAR trajectory they carry no
+    metric scale, which matters for *interpreting* the mesh but not for
+    orienting normals, the one thing they are used for here.
+    """
+    import numpy as np
+
+    with np.load(str(npz_path)) as z:
+        if "viewmats" not in z:
+            raise KeyError(f"{npz_path.name} has no 'viewmats' array")
+        vm = np.asarray(z["viewmats"], dtype=np.float64)
+    R = vm[:, :3, :3]
+    t = vm[:, :3, 3]
+    return -np.einsum("nji,nj->ni", R, t)
 
 
 def orient_normals_to_cameras(pcd, cam_centers):
@@ -139,7 +177,18 @@ def fill_uncoloured_from_cloud(rgb, verts, pcd):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cloud", required=True, help="fused world-frame .ply")
-    parser.add_argument("--image-bag", required=True)
+    parser.add_argument(
+        "--image-bag",
+        default=None,
+        help="LiDAR scan's IMAGE_*.bag, for photo-projected vertex colour. "
+        "Omit on the splat route — colour then comes from the cloud itself.",
+    )
+    parser.add_argument(
+        "--sfm-poses",
+        default=None,
+        help="process_sfm.py npz, used instead of a .traj.npz sidecar for the "
+        "camera centres that orient normals (the phone-capture route)",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--calibration", default=None)
     parser.add_argument(
@@ -191,13 +240,18 @@ def main():
     parser.add_argument("--colour-range", type=float, default=20.0)
     args = parser.parse_args()
 
-    ppc._require("open3d", "numpy", "rosbags", "cv2")
+    # rosbags is only needed to read an IMAGE bag; a photogrammetry-only
+    # install has no rosbags and must still be able to mesh a splat.
+    need = ["open3d", "numpy", "cv2"]
+    if args.image_bag:
+        need.append("rosbags")
+    ppc._require(*need)
     import numpy as np
     import open3d as o3d
 
     cloud = Path(args.cloud)
     output = Path(args.output)
-    image_bag = Path(args.image_bag)
+    image_bag = Path(args.image_bag) if args.image_bag else None
 
     # 1. Load cloud + trajectory (both already gravity-levelled → same frame).
     progress(5, f"Loading cloud {cloud.name}…")
@@ -208,15 +262,34 @@ def main():
         sys.exit(1)
     print(f"  cloud: {n_in:,} points", flush=True)
 
-    traj_path = _find_traj(cloud)
-    if traj_path is None:
-        print(f"ERROR: no trajectory sidecar (.traj.npz) for {cloud.name}", flush=True)
-        print("  Re-generate the cloud so poses are available for colouring.", flush=True)
-        sys.exit(1)
-    traj = np.load(str(traj_path))
-    poses, lidar_ts = traj["poses"], traj["ts"]
-    cam_centers = poses[:, :3, 3]
-    print(f"  trajectory: {len(poses):,} poses from {traj_path.name}", flush=True)
+    poses = lidar_ts = None
+    if args.sfm_poses:
+        # Splat route: the SfM npz is the only pose source, and it is used for
+        # normal orientation only — photo projection needs a bag we don't have.
+        sfm_path = Path(args.sfm_poses)
+        if not sfm_path.exists():
+            print(f"ERROR: SfM poses not found: {sfm_path}", flush=True)
+            sys.exit(1)
+        try:
+            cam_centers = cam_centres_from_sfm(sfm_path)
+        except (KeyError, ValueError) as e:
+            print(f"ERROR: cannot read camera poses from {sfm_path.name}: {e}",
+                  flush=True)
+            sys.exit(1)
+        print(f"  SfM poses: {len(cam_centers):,} cameras from {sfm_path.name}",
+              flush=True)
+    else:
+        traj_path = _find_traj(cloud)
+        if traj_path is None:
+            print(f"ERROR: no trajectory sidecar (.traj.npz) for {cloud.name}",
+                  flush=True)
+            print("  Re-generate the cloud so poses are available for colouring, "
+                  "or pass --sfm-poses.", flush=True)
+            sys.exit(1)
+        traj = np.load(str(traj_path))
+        poses, lidar_ts = traj["poses"], traj["ts"]
+        cam_centers = poses[:, :3, 3]
+        print(f"  trajectory: {len(poses):,} poses from {traj_path.name}", flush=True)
 
     # 1b. Pre-clean: LiDAR surfaces carry a few cm of thickness plus stray
     #     returns, so Poisson fits a wobbly slab instead of one sheet. Strip
@@ -271,7 +344,7 @@ def main():
     rgb = np.zeros((len(verts), 3), np.uint8)
     calib_dir = Path(args.calibration) if args.calibration else None
     cameras = [c.strip() for c in args.camera.split(",") if c.strip()]
-    if calib_dir and calib_dir.exists():
+    if image_bag and calib_dir and calib_dir.exists():
         for ci, cam in enumerate(cameras):
             try:
                 calib = ppc.load_calibration(calib_dir, cam)
@@ -299,9 +372,16 @@ def main():
         if n_fill:
             print(f"  filled {n_fill:,} unseen verts from nearest cloud colour", flush=True)
     else:
-        # No calibration → carry the cloud's own colours onto the mesh.
-        print("  no calibration — colouring from nearest cloud point", flush=True)
-        fill_uncoloured_from_cloud(rgb, verts, pcd)
+        # No bag/calibration → carry the cloud's own colours onto the mesh. On
+        # the splat route this is not a fallback but the intended path: those
+        # RGBs came from the SH DC term of a photometrically-trained model, so
+        # they already are the multi-view answer.
+        print("  no image bag/calibration — colouring from nearest cloud point",
+              flush=True)
+        n_fill = fill_uncoloured_from_cloud(rgb, verts, pcd)
+        if not n_fill and len(verts):
+            print("  WARNING: the cloud carries no colour — mesh will be black",
+                  flush=True)
 
     mesh.vertex_colors = o3d.utility.Vector3dVector(rgb.astype(np.float64) / 255.0)
 

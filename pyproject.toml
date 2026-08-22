@@ -49,6 +49,19 @@ pipeline = [
     "rosbags",
     "scipy",
 ]
+# Photogrammetry from phone photos or video: reconstruct a capture with COLMAP
+# and train a splat from it. Deliberately excludes kiss-icp, rosbags and open3d
+# — a phone-only user needs no LiDAR odometry, no bag reader and no mesh stack,
+# so this is a substantially lighter install than `pipeline`. (Splat training
+# still needs torch + gsplat + CUDA, as it does on the LiDAR path.)
+photogrammetry = [
+    "pycolmap",
+    "opencv-python-headless",
+    "pillow",
+    "pillow-heif",
+    "numpy",
+    "scipy",
+]
 
 [project.scripts]
 lidarstudio = "lidarstudio.__main__:main"

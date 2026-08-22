@@ -36,8 +36,108 @@ Turn a raw scan folder (LiDAR + IMU + image `.bag` files) into a cloud, splat, o
 - **Point cloud** — KISS-ICP registration + multi-view photo colouring, voxel-downsampled.
 - **Splat** — GPU-trained 3D Gaussian Splatting (needs CUDA + torch/gsplat), seeded from the coloured cloud. A draft→max **quality** slider drives resolution / iterations / gaussian cap; expert overrides (anisotropy cap, render-patch size, SfM poses) sit below it. Full-resolution runs auto-generate SfM camera poses (COLMAP/GLOMAP, sim(3)-aligned to the LiDAR trajectory). Training renders **full frames** with an **annealed position LR** and **antialiased (Mip-Splatting) rasterisation** — on the reference scan this recipe reaches 26.7 dB train-view PSNR, at parity with commercial reconstructions of the same scanner class. An **ultra** preset adds a LiDAR-anchored monocular depth prior (Depth Anything V2) for slightly crisper fine detail — budget for a much longer run: the per-frame prior computation alone takes hours (~6 h on the reference scan) before training starts, plus a ~30 GB temporary cache.
 - **Mesh** — screened-Poisson surface reconstruction from the dense cloud, photo-coloured (best for rooms and flat surfaces; thin structures stay the splat's job).
+- **Ingest** — prepare a **phone-camera capture** for photogrammetry (see below).
 
 Progress streams live into the panel; the result loads straight into the scene and appears in the Library.
+
+### Phone camera photogrammetry
+
+A scan folder does not have to come from a LiDAR scanner. Point it at a folder of
+phone photos, or a folder holding one video, and the panel switches to the
+photogrammetry path — the reconstruction comes from the photos alone.
+
+1. Set **type** to `ingest` and hit Generate. This decodes the capture (HEIC and
+   video included), applies EXIF orientation, downscales, drops the blurriest
+   frames, and writes normalized frames plus a manifest into
+   `<project>/scans/<name>/`. Your original folder is never modified, so a
+   read-only phone mount or SD card is fine. Warnings about a mixed-lens capture
+   or thin coverage appear here — before the slow stages, not after.
+2. Set **type** to `splat` and hit Generate on the same folder. COLMAP
+   solves the camera poses and lens, exports the sparse points as the seed
+   cloud, and trains a splat from them. The cloud and the splat both land in the
+   Library and can be edited, cropped, erased and exported like any other.
+
+Both stages are CPU-bound apart from training; the reconstruction is cached in
+`<project>/sfm/` and reused by later runs.
+
+**Capture guidance** — these cause most photogrammetry failures:
+
+- **Lock exposure and focus before shooting.** Exposure drift wrecks splat colour;
+  autofocus changes the lens frame to frame, which a single camera model cannot represent.
+- **Prefer video** — denser coverage and constant intrinsics.
+- **Don't let the phone switch to the ultrawide** mid-capture.
+- **Move slowly.** Blurry frames get dropped, and dropped frames become missing coverage.
+- **Give the scene something to key on.** This is the big one for single objects.
+  SfM matches *texture*, and a plain floor or a bare desk offers almost none — a
+  mug photographed on clean floorboards yielded only ~90 usable features per
+  1920×1080 frame outside the mug itself, and none of them matched between frames
+  a second apart. Scatter irregular detail around the subject: keys, crumpled
+  paper, newspaper, a patterned cloth. Costs nothing, and it is the difference
+  between a reconstruction and a folded one.
+- **Beware symmetric, repetitively patterned subjects.** A plain mug, bowl or vase
+  is close to a surface of revolution, and a repeating print makes views 90° apart
+  genuinely ambiguous. With nothing else in frame, no matcher or mapper settles it
+  — the clutter above is the fix, not more compute.
+
+#### Subject masking and turntable captures
+
+Two options on the `splat` panel handle objects that the guidance above cannot save.
+Both only apply when the reconstruction is actually built, so tick **force SfM
+regeneration** as well on a scan that already has one.
+
+**mask to subject** segments the subject in every frame (Mask R-CNN) and matches
+features on it alone. Use it when the *background* is the problem — busy, moving,
+or changing between frames. Leave the class box on `auto` to let the capture vote
+on what the subject is, or name a COCO class (`cup`, `bowl`, `vase`, `bottle`,
+`potted plant`, `book`, `teddy bear`, …). Note this is the opposite of the advice
+above: masking helps when the background is *misleading*, and hurts when it is
+merely sparse, since it throws away what little context there was.
+
+**turntable** is for the inverted capture: the subject rotated (a lazy Susan, or
+spun by hand) and the camera stayed put. This is a genuinely different problem, not
+a variation on walking around — SfM only ever solves a *static* scene, so with the
+room included it faithfully reconstructs the room and treats the spinning subject
+as contradictory evidence. Ticking it solves in the subject's frame instead (it
+implies masking), excludes the background from training too, and then checks the
+result against the single-axis model a turntable obeys:
+
+```
+pose_i = Rot(axis, theta_i) · pose_0
+```
+
+The whole capture is one axis, one camera pose, and one angle per frame. That makes
+the **frame order** evidence no amount of feature matching can supply — a turntable
+turns one way, so a solve that sends the subject back the way it came is caught and
+reported, where coverage and reprojection error both look fine. You get the angle
+actually covered, so "it only went 200°" and "it folded" are told apart.
+
+For turntable captures specifically:
+
+- **Put newspaper or a patterned cloth _on_ the turntable**, so it rotates *with*
+  the subject. It joins the subject's rigid body and lends it the asymmetric detail
+  a symmetric object lacks. For a plain mug this is usually the difference between
+  working and not.
+- **Light it evenly and diffusely.** This is the one real disadvantage of a
+  turntable: the lighting stays fixed while the subject turns, so hard shadows and
+  specular highlights slide across the surface and bake into the splat. A splat
+  assumes appearance is a property of the surface; here it isn't.
+- **Keep the camera genuinely still** — a tripod. Camera drift is indistinguishable
+  from subject rotation, and it is the subject you want.
+- **Turn steadily and in one direction**, and don't let a hand stay in frame.
+
+From the command line the same levers are `process_sfm.py --mask-subject`,
+`--mask-classes`, `--turntable` and `--turntable-snap` (which discards the
+radius/elevation/tilt wobble a solve invents but a real turntable does not have).
+`--mapper {incremental,glomap}` picks the reconstruction engine; incremental is the
+default because global rotation averaging commits to one consensus over all pairs
+at once, and on an ambiguous scene the wrong consensus wins outright — measured on
+one capture as 60° of solved viewpoint spread versus incremental's 90° from an
+identical match database.
+
+What a phone capture does *not* give you, because there is no LiDAR: the result is
+**unitless and unlevelled** — it loads at an arbitrary size and orientation, so
+measurements are meaningless until you scale it by hand. Point-cloud generation and
+meshing are LiDAR-only (the SfM cloud is far too sparse for Poisson).
 
 ### Library
 
@@ -100,7 +200,7 @@ The scene around the LiDAR tools is a general-purpose 3D editor:
 | `lidar_jobs.py` | `/api/*` handlers: projects, scan validation, job orchestration + SSE progress, file proxy |
 | `process_pointcloud.py` | bag reading, IMU deskew, KISS-ICP registration, photo colouring (run as subprocess per job) |
 | `process_splat.py` | GPU 3DGS training (gsplat/CUDA): full-frame rendering, MCMC densification, annealed position LR, antialiased rasterisation |
-| `process_sfm.py` | COLMAP/GLOMAP camera poses from the scan photos, sim(3)-aligned to the LiDAR trajectory (auto-run for full-res splats) |
+| `process_sfm.py` | COLMAP camera poses (incremental; GLOMAP fallback) from the scan photos, sim(3)-aligned to the LiDAR trajectory (auto-run for full-res splats) |
 | `process_mesh.py` | screened-Poisson mesh from the dense cloud, photo-coloured |
 | `edit_ops.py`, `cloud_ops.py`, `splat_io.py` | decimate, SOR, crop, recolour, transform bake, PLY I/O, pose sidecars |
 
@@ -116,7 +216,9 @@ src/lidarstudio/
   lidar_jobs.py          LiDAR workflow API handlers
   process_pointcloud.py  bag → coloured, registered point cloud
   process_splat.py       cloud → GPU-trained gaussian splat (gsplat/CUDA)
-  process_sfm.py         scan photos → SfM camera poses (COLMAP/GLOMAP)
+  process_sfm.py         scan photos → SfM camera poses (COLMAP, GLOMAP fallback)
+  process_ingest.py      phone photos/video → normalized frames + manifest
+  frame_source.py        one posed-frame iterator over bags or image sets
   process_mesh.py        dense cloud → photo-coloured Poisson mesh
   edit_ops.py            edit operations (decimate, SOR, crop, recolour, bake)
   cloud_ops.py           point-cloud helpers (open3d)

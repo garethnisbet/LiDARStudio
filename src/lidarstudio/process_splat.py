@@ -42,7 +42,15 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # Reuse the bag/calibration/pose helpers from the point-cloud stage.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import process_pointcloud as ppc  # noqa: E402
+import frame_source  # noqa: E402
+
+# LiDAR-only, and an image set never reaches this module's bag/calibration
+# paths. Guarded for the same reason as in process_sfm.py: a photogrammetry-only
+# install must not depend on the bag stack staying importable.
+try:
+    import process_pointcloud as ppc  # noqa: E402
+except ImportError:  # pragma: no cover - depends on install extras
+    ppc = None
 
 
 def progress(pct: int, msg: str):
@@ -219,6 +227,27 @@ def _frame_cache_root(explicit=None, need_bytes=0):
     return max(usable)[1]  # most free space
 
 
+def _image_set_intrinsics(sfm_poses):
+    """(camera_model, params) solved by SfM, from the poses npz.
+
+    An image set has no factory calibration — the lens is whatever bundle
+    adjustment converged on, so the poses file is the only place the
+    intrinsics exist, and training MUST use the same ones the poses were
+    optimised under.
+    """
+    import numpy as np
+
+    with np.load(sfm_poses, allow_pickle=True) as d:
+        if "camera_model" not in d.files:
+            raise RuntimeError(
+                f"{Path(sfm_poses).name} has no camera_model — it predates "
+                "image-set support. Re-run the SfM stage for this capture."
+            )
+        model = str(d["camera_model"])
+        params = np.asarray(d["camera_params"], dtype=np.float64).reshape(-1)
+    return model, params
+
+
 def build_camera_frames(
     scan: Path,
     traj_path: Path,
@@ -234,6 +263,7 @@ def build_camera_frames(
     mask_box=None,
     mask_from: int = 0,
     mask_canon_pts=None,
+    frame_masks=None,
     memmap_frames: bool = False,
     frame_cache_dir=None,
     fisheye_intrinsics=None,
@@ -269,12 +299,62 @@ def build_camera_frames(
     import cv2
     import numpy as np
 
-    calib = ppc.load_calibration(scan / "calibration", camera)
-    K0 = calib["K"].astype(np.float64)
-    D = calib["D"].astype(np.float64)
-    T = calib["T"].astype(np.float64)  # lidar → camera (4×4)
+    # Which source are we training from? An image set brings its own frames,
+    # its own (SfM-solved) intrinsics, and a pinhole-radial lens model, so it
+    # skips the factory calibration and the LiDAR trajectory entirely.
+    image_set = frame_source.is_image_set(scan)
 
-    if fisheye_intrinsics is not None:
+    if image_set:
+        if sfm_poses is None:
+            raise RuntimeError(
+                "an image set has no odometry poses — --sfm-poses is required "
+                "(run the SfM stage first)"
+            )
+        cam_model, cam_params = _image_set_intrinsics(sfm_poses)
+        # SIMPLE_RADIAL is (f, cx, cy, k); RADIAL adds k2; PINHOLE is
+        # (fx, fy, cx, cy). Normalise all of them to a K plus OpenCV's
+        # (k1, k2, p1, p2) distortion vector.
+        if cam_model in ("SIMPLE_RADIAL", "RADIAL"):
+            f, cx, cy = cam_params[0], cam_params[1], cam_params[2]
+            fx = fy = f
+            ks = list(cam_params[3:])
+        elif cam_model == "SIMPLE_PINHOLE":
+            f, cx, cy = cam_params[0], cam_params[1], cam_params[2]
+            fx = fy = f
+            ks = []
+        elif cam_model == "PINHOLE":
+            fx, fy, cx, cy = cam_params[:4]
+            ks = []
+        elif cam_model == "OPENCV":
+            # COLMAP's OPENCV params are already (fx, fy, cx, cy, k1, k2, p1, p2).
+            fx, fy, cx, cy = cam_params[:4]
+            ks = list(cam_params[4:8])
+        else:
+            raise RuntimeError(
+                f"unsupported image-set camera model {cam_model!r} — expected "
+                "SIMPLE_RADIAL, RADIAL, PINHOLE or OPENCV"
+            )
+        K0 = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
+        # OpenCV's distCoeffs are (k1, k2, p1, p2) in that order. The radial
+        # models above contribute only k1 (and k2); their tangential terms do
+        # not exist, so they stay zero.
+        dist = np.zeros(4, dtype=np.float64)
+        for i, k in enumerate(ks[:4]):
+            dist[i] = float(k)
+        D = dist
+        T = np.eye(4)  # unused: the SfM viewmats are already world→cam
+        print(
+            f"  image set: {cam_model} f={fx:.1f} c=({cx:.1f},{cy:.1f}) "
+            f"dist={dist.tolist()}",
+            flush=True,
+        )
+    else:
+        calib = ppc.load_calibration(scan / "calibration", camera)
+        K0 = calib["K"].astype(np.float64)
+        D = calib["D"].astype(np.float64)
+        T = calib["T"].astype(np.float64)  # lidar → camera (4×4)
+
+    if fisheye_intrinsics is not None and not image_set:
         # Override the factory calibration with bundle-adjusted intrinsics
         # (fx,fy,cx,cy,k1,k2,k3,k4 — COLMAP OPENCV_FISHEYE convention, same
         # portrait-rotated frame as calib.json). When training against SfM
@@ -296,17 +376,18 @@ def build_camera_frames(
         )
         K0, D = Kr, fi[4:].copy()
 
-    traj = np.load(traj_path)
-    traj_ts = traj["ts"].astype(np.int64)
-    poses = traj["poses"].astype(np.float64)  # (N,4,4) sensor→world (levelled)
-    order = np.argsort(traj_ts)
-    traj_ts, poses = traj_ts[order], poses[order]
+    traj_ts = poses = None
+    if not image_set:
+        traj = np.load(traj_path)
+        traj_ts = traj["ts"].astype(np.int64)
+        poses = traj["poses"].astype(np.float64)  # (N,4,4) sensor→world (levelled)
+        order = np.argsort(traj_ts)
+        traj_ts, poses = traj_ts[order], poses[order]
 
-    # Locate the image bag in the scan folder.
-    img_bags = sorted(scan.glob("IMAGE_*.bag")) or sorted(scan.glob("*.bag"))
-    img_bag = next((b for b in img_bags if "IMAGE" in b.name.upper()), None)
-    if img_bag is None:
-        raise FileNotFoundError(f"no IMAGE_*.bag in {scan}")
+        # Locate the image bag up front, so a scan folder without one fails
+        # here rather than part-way through the frame loop. (frame_source is
+        # the single implementation of this lookup.)
+        frame_source.find_image_bag(scan)
 
     radial = D.reshape(4).astype(np.float64)
     Dk = radial.reshape(4, 1)
@@ -321,6 +402,32 @@ def build_camera_frames(
             for t, vm in zip(ext["bag_ts_ns"], ext["viewmats"])
         }
         print(f"  external SfM poses: {len(sfm_vm)} frames from {sfm_poses}", flush=True)
+    # Per-frame subject masks from process_sfm.py --mask-subject/--turntable.
+    # Keyed by the SAME join key as the poses (never by enumeration order), so
+    # a frame dropped between the two runs cannot shift masks onto the wrong
+    # images — the failure that yields a plausible-looking wrong splat.
+    mask_by_key = None
+    n_frame_masks = 0
+    if frame_masks:
+        mdir = Path(frame_masks)
+        if not frame_source.is_image_set(scan):
+            raise SystemExit(
+                "--frame-masks needs an ingested image set: the masks are "
+                "named after its manifest frames."
+            )
+        keys = frame_source.image_set_keys(scan)
+        mask_by_key = {}
+        for name, key in keys.items():
+            f = mdir / (name + ".png")
+            if f.exists():
+                mask_by_key[int(key)] = cv2.imread(str(f), cv2.IMREAD_GRAYSCALE)
+        print(
+            f"  frame masks: {len(mask_by_key)}/{len(keys)} from {mdir} "
+            "(training ignores everything outside the subject)",
+            flush=True,
+        )
+        if not mask_by_key:
+            raise SystemExit(f"--frame-masks: no masks found in {mdir}")
     skipped = 0
     frames = []
     # Optional on-disk frame cache: instead of holding every uint8 frame in host
@@ -329,7 +436,9 @@ def build_camera_frames(
     # resident, so RSS stays bounded by RAM regardless of resolution × count.
     mm_file = mm_path = mm_shape = None
     mm_count = 0
-    for bag_i, (ts, img) in enumerate(ppc.read_images(img_bag, camera, rot=image_rot)):
+    for bag_i, (ts, img) in enumerate(
+        frame_source.open_frames(scan, camera, rot=image_rot)
+    ):
         if sfm_vm is not None and int(ts) not in sfm_vm:
             skipped += 1
             continue
@@ -351,14 +460,49 @@ def build_camera_frames(
                 # BELOW the fisheye's native px/radian (e.g. 433 vs 563 at 120°),
                 # silently blurring the sharpest part of every training photo.
                 Wo, Ho = round(W * undistort_scale), round(H * undistort_scale)
-                f = (Wo / 2.0) / np.tan(np.radians(undistort_fov) / 2.0)
-                Kp = np.array([[f, 0, Wo / 2.0], [0, f, Ho / 2.0], [0, 0, 1.0]])
-                m1, m2 = cv2.fisheye.initUndistortRectifyMap(
-                    K, Dk, np.eye(3), Kp, (Wo, Ho), cv2.CV_16SC2
-                )
+                if image_set:
+                    # --undistort-fov exists to choose how much of a 180°
+                    # fisheye to keep. A phone already has a normal FOV and
+                    # nothing to crop, so forcing a 120° virtual pinhole would
+                    # stretch the periphery and resample the sharp centre
+                    # BELOW its native resolution. Keep the solved focal
+                    # length; undistortion here only removes the mild radial
+                    # bend.
+                    f = float(K[0, 0])
+                    Kp = np.array(
+                        [
+                            [K[0, 0] * undistort_scale, 0, Wo / 2.0],
+                            [0, K[1, 1] * undistort_scale, Ho / 2.0],
+                            [0, 0, 1.0],
+                        ]
+                    )
+                else:
+                    f = (Wo / 2.0) / np.tan(np.radians(undistort_fov) / 2.0)
+                    Kp = np.array([[f, 0, Wo / 2.0], [0, f, Ho / 2.0], [0, 0, 1.0]])
+                if image_set:
+                    # A phone lens is a mild radial one, not a 180° fisheye:
+                    # OpenCV's standard (Brown-Conrady) model matches what
+                    # COLMAP solved, and the virtual pinhole keeps the source
+                    # focal length so nothing is resampled away.
+                    m1, m2 = cv2.initUndistortRectifyMap(
+                        K, radial, np.eye(3), Kp, (Wo, Ho), cv2.CV_16SC2
+                    )
+                    lens = "radial"
+                else:
+                    m1, m2 = cv2.fisheye.initUndistortRectifyMap(
+                        K, Dk, np.eye(3), Kp, (Wo, Ho), cv2.CV_16SC2
+                    )
+                    lens = "fisheye"
                 maps = (m1, m2, Kp)
+                # Report the FOV actually produced: on the image_set path it
+                # comes from the solved focal length, not --undistort-fov.
+                fov_out = (
+                    2 * np.degrees(np.arctan((Wo / 2.0) / Kp[0, 0]))
+                    if image_set
+                    else undistort_fov
+                )
                 print(
-                    f"  undistort: fisheye → pinhole {undistort_fov:.0f}° "
+                    f"  undistort: {lens} → pinhole {fov_out:.0f}° "
                     f"(f={f:.1f}px, {Wo}×{Ho})",
                     flush=True,
                 )
@@ -414,6 +558,22 @@ def build_camera_frames(
             frame["mask_png"] = _dynamic_mask_png(
                 img, K, viewmat, mask_box, mask_canon_pts
             )
+        elif mask_by_key is not None:
+            m = mask_by_key.get(int(ts))
+            if m is not None:
+                # The mask was drawn on the SOURCE frame, so it has to travel
+                # through the same downscale and undistortion the image just
+                # did or it lands on the wrong pixels. Nearest-neighbour
+                # throughout: a mask is a label, not a signal to interpolate.
+                if downscale > 1:
+                    m = cv2.resize(m, (w // downscale, h // downscale),
+                                   interpolation=cv2.INTER_NEAREST)
+                if undistort:
+                    m = cv2.remap(m, maps[0], maps[1],
+                                  interpolation=cv2.INTER_NEAREST,
+                                  borderMode=cv2.BORDER_CONSTANT)
+                frame["mask_png"] = cv2.imencode(".png", m)[1]
+                n_frame_masks += 1
         if drop_blurry > 0:
             # Laplacian variance as a sharpness score; motion-blurred handheld
             # frames teach the model soft edges everywhere they're sampled.
@@ -451,8 +611,9 @@ def build_camera_frames(
             f["image"] = mm[f.pop("idx")]
     n_masked = sum(1 for f in frames if f.get("mask_png") is not None)
     if n_masked:
+        kind = "subject" if mask_by_key is not None else "dynamic-object"
         print(
-            f"  dynamic-object mask active on {n_masked}/{len(frames)} frame(s)",
+            f"  {kind} mask active on {n_masked}/{len(frames)} frame(s)",
             flush=True,
         )
     if not frames:
@@ -1696,6 +1857,14 @@ def main():
         "matches the lens model the poses were optimised under",
     )
     p.add_argument(
+        "--frame-masks",
+        default=None,
+        help="directory of per-frame subject masks (<image name>.png, 0 = "
+        "ignore) from process_sfm.py --mask-subject/--turntable. Training "
+        "then learns the subject only and never tries to fit a background "
+        "that moved relative to it — which on a turntable capture it did.",
+    )
+    p.add_argument(
         "--mask-box",
         default=None,
         help="x1,y1,z1,x2,y2,z2 world-space box around a dynamic object "
@@ -1733,9 +1902,23 @@ def main():
 
     traj_path = Path(str(pc) + ".traj.npz")
 
+    # An image set has no odometry, hence no trajectory sidecar — its poses
+    # come entirely from SfM, which is the same configuration full-resolution
+    # LiDAR training already runs in. The sidecar requirement therefore
+    # applies only to the LiDAR path.
+    if frame_source.is_image_set(scan):
+        if not args.sfm_poses:
+            print(
+                "ERROR: training from a phone capture requires --sfm-poses "
+                "(there is no odometry to fall back on). Run the SfM stage "
+                "for this image set first.",
+                flush=True,
+            )
+            sys.exit(1)
+        traj_path = None
     # GPU training needs the KISS-ICP trajectory sidecar + CUDA. Fail loudly
     # rather than emit a low-value CPU splat when either is missing.
-    if not traj_path.exists():
+    elif not traj_path.exists():
         print(
             f"ERROR: no trajectory sidecar ({traj_path.name}) — GPU training needs "
             "it. Regenerate the point cloud, re-run the edit (edits carry the "
@@ -1799,6 +1982,7 @@ def main():
         mask_box=mask_box,
         mask_from=args.mask_from,
         mask_canon_pts=mask_canon,
+        frame_masks=args.frame_masks,
         memmap_frames=args.memmap_frames,
         frame_cache_dir=args.frame_cache_dir,
         fisheye_intrinsics=(
