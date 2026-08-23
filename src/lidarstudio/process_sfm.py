@@ -573,6 +573,29 @@ def build_region_masks(images_dir: Path, mask_dir: Path, region):
     return frac
 
 
+def auto_match_window(n_frames: int) -> int:
+    """Frames either side that --matching ordered may match, chosen from the
+    frame count rather than fixed.
+
+    The window counts FRAMES but what matters is the ANGLE it spans, and on a
+    turntable angle IS baseline. A fixed window therefore breaks the moment the
+    frame rate changes: the same House capture ingested at 15.5 fps (219
+    frames) solved cleanly with a window of 20 spanning ~38 deg, while at 30 fps
+    (442 frames) that window spanned ~19 deg with only ~0.8 deg between
+    neighbours — too little parallax to triangulate against. Measured, same
+    footage, window 20 vs 40 at 442 frames:
+
+        20 -> 231/442 registered, 96 deg of turn, rms_rot 8.00 deg
+        40 -> 442/442 registered, 412 deg of turn, rms_rot 0.18 deg
+
+    So the window scales with the frame count, targeting roughly 30 deg of
+    rotation for a single-turn capture. Clamped at both ends: too narrow cannot
+    triangulate, and too wide starts reaching far enough round to let a
+    symmetric subject fold, which is what ordered matching exists to prevent.
+    """
+    return max(12, min(60, round(n_frames / 12)))
+
+
 def build_ordered_pairs(names, window: int, out_path: Path) -> int:
     """Match pairs within ``window`` frames of each other, and no others.
 
@@ -652,6 +675,9 @@ def extract_and_match(db: Path, images_dir: Path, model: str, params,
     if strategy == "ordered":
         names = [p.name for p in sorted(images_dir.glob("*.jpg"))]
         pairs_path = db.parent / "pairs_ordered.txt"
+        if window <= 0:
+            window = auto_match_window(len(names))
+            log(f"match window auto: {window} frames for {len(names)} frames")
         n = build_ordered_pairs(names, window, pairs_path)
         progress(30, f"SfM poses: ordered matching ({n:,} pairs, window "
                      f"{window} frames)…")
@@ -1740,11 +1766,12 @@ def main():
         "silhouette keypoints that carry the outline (0 disables)",
     )
     p.add_argument(
-        "--match-window", type=int, default=20,
+        "--match-window", type=int, default=0,
         help="for --matching ordered: how many frames either side may match "
-        "(default 20). It must be wide enough for real overlap and narrower "
-        "than the angle at which the subject starts to look like itself "
-        "again — at 15 fps and a ~15 s turn, 20 frames is about 25 deg.",
+        "(0 = auto, about a twelfth of the frame count). The window counts "
+        "FRAMES but what matters is the ANGLE it spans, so a fixed value "
+        "breaks when the frame rate changes: the same capture at 442 frames "
+        "registered 231 of them with a window of 20 and all 442 with 40.",
     )
     p.add_argument(
         "--carve-seed",

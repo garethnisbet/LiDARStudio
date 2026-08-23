@@ -289,3 +289,15 @@ def test_a_turntable_capture_defaults_to_ordered_matching():
 def test_a_non_turntable_capture_keeps_the_size_based_choice():
     assert process_sfm.choose_matching(50) == "exhaustive"
     assert process_sfm.choose_matching(500) == "sequential"
+
+
+@pytest.mark.parametrize("frames,expect", [
+    (219, 18),    # 15.5 fps House: a window of 20 worked, 18 is the same ballpark
+    (442, 37),    # 30 fps House: 20 registered 231/442, 40 registered all of them
+    (60, 12),     # clamped: too narrow cannot triangulate at all
+    (5000, 60),   # clamped: too wide reaches far enough round to let a fold back in
+])
+def test_the_match_window_scales_with_frame_count(frames, expect):
+    """A window counts FRAMES but must span an ANGLE, so a fixed value breaks
+    the moment the frame rate changes."""
+    assert process_sfm.auto_match_window(frames) == expect
