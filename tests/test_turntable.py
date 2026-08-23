@@ -158,3 +158,58 @@ def test_a_short_but_genuine_turn_warns_only_about_coverage(capsys):
     out = capsys.readouterr().out
     assert "only turned 140 deg" in out
     assert "do not fit a turntable" not in out
+
+
+def test_a_fold_is_caught_by_net_rotation_not_by_step_direction():
+    """Regression: `monotonic` cannot gate the fold warning. Measured on the
+    House capture it read 0.87 for BOTH a solve with a 171 deg fold and the
+    same capture solved cleanly with --matching ordered — it counts per-frame
+    step direction, which on a 219-frame solve is dominated by jitter."""
+    import numpy as np
+
+    axis, point = np.array([0.0, 1.0, 0.0]), np.zeros(3)
+
+    def poses(angles_deg):
+        base = np.eye(4)
+        base[:3, 3] = [0.0, 0.0, -4.0]
+        return process_sfm.apply_turntable(
+            np.array([base] * len(angles_deg)), axis, point,
+            np.radians(np.asarray(angles_deg)),
+        )
+
+    n = 200
+    clean = np.linspace(0, 360, n)
+    # forwards, back, forwards — net progress near zero, like the real fold
+    folded = np.concatenate([np.linspace(0, 120, n // 2),
+                             np.linspace(120, 5, n // 2)])
+    f_clean = process_sfm.fit_turntable(poses(clean))
+    f_folded = process_sfm.fit_turntable(poses(folded))
+    assert f_clean["directness"] > 0.9, f_clean["directness"]
+    assert f_folded["directness"] < 0.3, f_folded["directness"]
+
+
+def test_uneven_sampling_is_caught_even_when_coverage_is_complete():
+    """The House capture turned 411 deg and still lost a roof slope: coverage
+    and SAMPLING are different questions, so a full turn is not a clean bill."""
+    import numpy as np
+
+    even = np.linspace(0, 360, 216)
+    # same span, same frame count, but two thirds of them crammed into 60 deg
+    lumpy = np.concatenate([np.linspace(0, 60, 144), np.linspace(60, 360, 72)])
+    s_even = process_sfm.angular_sampling(even)
+    s_lumpy = process_sfm.angular_sampling(lumpy)
+    assert s_even["min"] >= process_sfm.MIN_VIEWS_PER_30DEG, s_even
+    assert s_lumpy["min"] < process_sfm.MIN_VIEWS_PER_30DEG, s_lumpy
+    # `ratio` is deliberately NOT asserted here: when most of the arc is the
+    # sparse part, the median window count equals the minimum and the ratio
+    # collapses to 1.0. `min` is the number that carries the meaning.
+    assert s_even["min"] > s_lumpy["min"]
+
+
+def test_sampling_is_not_confused_by_a_short_arc():
+    """A capture spanning less than one window is judged by coverage, not by
+    sampling — it must not also be accused of turning unevenly."""
+    import numpy as np
+
+    s = process_sfm.angular_sampling(np.linspace(0, 12, 40))
+    assert s["min"] == 40 and s["ratio"] == 1.0

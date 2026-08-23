@@ -779,6 +779,101 @@ def _mesh_cmd(scan, contents, cloud_file, output_file, options, sfm_poses=None):
     return cmd
 
 
+async def _dense_cloud(proj: Path, ts: str, sfm_poses: Path, queue, options):
+    """The dense cloud a phone capture's mesh should be built from: MVS.
+
+    Photogrammetry's normal route to a surface is SfM for poses then multi-view
+    stereo for geometry, and that is what Poisson wants — a real surface sample
+    with real normals. The splat route (_splat_points_cloud) reaches a cloud by
+    training a full 3DGS model and harvesting its gaussian centres, which costs
+    hours and yields points placed to minimise photometric loss rather than to
+    lie on the surface.
+
+    Returns None — never an error — when MVS is not available or has nothing to
+    work from, so the caller can fall back to the splat route rather than
+    stranding a user whose only dense geometry is a trained splat.
+    """
+    sparse = sfm_poses.parent / (sfm_poses.stem + "_sparse")
+    if not sparse.is_dir():
+        await queue.put(
+            {
+                "event": "log",
+                "message": (
+                    f"No sparse model beside {sfm_poses.name}, so dense stereo "
+                    "cannot run — this reconstruction predates it. Re-run the "
+                    "reconstruction to enable MVS meshing; falling back to the "
+                    "splat's points for now."
+                ),
+            }
+        )
+        return None
+
+    pc_dir = proj / "pointclouds"
+    pc_dir.mkdir(exist_ok=True)
+    out = pc_dir / f"dense_{ts}.ply"
+    newest = max((f.stat().st_mtime for f in sparse.iterdir()), default=0)
+    if out.exists() and out.stat().st_mtime >= newest:
+        await queue.put(
+            {"event": "log", "message": f"Reusing the dense cloud: {out.name}"}
+        )
+        return out
+
+    sfm_py = await asyncio.to_thread(_sfm_python, False)
+    if sfm_py is None:
+        return None
+    images = proj / "scans" / ts / "images"
+    if not images.is_dir():
+        await queue.put(
+            {
+                "event": "log",
+                "message": f"Ingested frames not found at {images} — skipping MVS.",
+            }
+        )
+        return None
+
+    await queue.put(
+        {
+            "event": "progress",
+            "percent": 2,
+            "message": (
+                "Dense stereo (MVS): a depth map per image, then fusion. "
+                "GPU-bound and the slow part of meshing — but it replaces "
+                "training a splat just to get points."
+            ),
+        }
+    )
+    cmd = [
+        sfm_py,
+        str(ROOT / "process_dense.py"),
+        "--sparse", str(sparse),
+        "--images", str(images),
+        "--output", str(out),
+        "--max-image-size", str(int(options.get("dense_max_image_size", 2000))),
+    ]
+    if options.get("dense_no_crop"):
+        cmd.append("--no-crop")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except FileNotFoundError:
+        return None
+    rc, err = await _stream_proc(proc, queue)
+    if rc != 0 or not out.exists():
+        await queue.put(
+            {
+                "event": "log",
+                "message": (
+                    (err or f"process_dense.py exited with code {rc}")
+                    + " — falling back to the splat's points."
+                ),
+            }
+        )
+        return None
+    return out
+
+
 async def _splat_points_cloud(proj: Path, ts: str, queue):
     """The dense cloud a phone capture's mesh is built from: the trained
     splat's gaussian centres.
@@ -916,22 +1011,32 @@ async def _job_mesh(project_path, scan_path, options, queue, job=None):
     if image_set:
         sfm_poses = proj / "sfm" / f"sfm_viewmats_{ts}.npz"
         if not sfm_poses.exists():
+            # Run it here rather than sending the user to train a splat first.
+            # The mesh comes from dense stereo now, so a splat would be hours
+            # of work for a side effect — SfM is what this actually needs.
             await queue.put(
                 {
-                    "event": "error",
+                    "event": "log",
                     "message": (
-                        f"No reconstruction found for '{ts}' "
-                        f"({sfm_poses.name}). Train a splat on this capture "
-                        "first — that runs the SfM this mesh needs for its "
-                        "camera poses, and produces the geometry it meshes."
+                        f"No reconstruction for '{ts}' yet — running SfM now. "
+                        "It is a one-off per capture, and the splat job "
+                        "reuses the same result."
                     ),
                 }
             )
-            return
+            if await _run_image_set_sfm(
+                proj, scan, ts, contents, options, queue, job, False, "Meshing"
+            ) is None:
+                return
         if seed_p:
             cloud_file = seed_p
         else:
-            cloud_file = await _splat_points_cloud(proj, ts, queue)
+            # MVS first: it is the direct route from photos to a surface. The
+            # splat's centres remain the fallback for captures reconstructed
+            # before the sparse model was kept, and for CPU-only installs.
+            cloud_file = await _dense_cloud(proj, ts, sfm_poses, queue, options)
+            if cloud_file is None:
+                cloud_file = await _splat_points_cloud(proj, ts, queue)
             if cloud_file is None:
                 return
     elif seed_p:
@@ -971,8 +1076,11 @@ async def _job_mesh(project_path, scan_path, options, queue, job=None):
                 "event": "log",
                 "message": (
                     "Phone capture: normals oriented from the SfM cameras, "
-                    "colour carried from the splat. The mesh is UNITLESS and "
-                    "unlevelled — there is no LiDAR to scale or level against."
+                    + ("colour from the fused stereo depths."
+                       if cloud_file.name.startswith("dense_")
+                       else "colour carried from the splat.")
+                    + " The mesh is UNITLESS and unlevelled — there is no "
+                    "LiDAR to scale or level against."
                 ),
             }
         )
@@ -1346,6 +1454,117 @@ async def _job_ingest(project_path, scan_path, options, queue, job=None):
         )
 
 
+async def _run_image_set_sfm(proj: Path, scan: Path, ts: str, contents,
+                             options, queue, job, force_sfm: bool = False,
+                             label: str = "Reconstruction"):
+    """Reconstruct an image set: poses npz + sparse model + sparse seed cloud.
+
+    Shared by the splat job (which trains against the poses) and the mesh job
+    (which needs the sparse model for MVS). It used to live inside the splat
+    job alone, which made SfM reachable ONLY by training a splat — so a
+    mesh-only user had to spend hours on a splat purely for its side effect,
+    then discard it, because the mesh now comes from dense stereo instead.
+
+    Returns the canonical npz path, or None after reporting why.
+    """
+    canonical = proj / "sfm" / f"sfm_viewmats_{ts}.npz"
+    seed_cloud_path = proj / "pointclouds" / f"pointcloud_{ts}.ply"
+    seed_cloud_path.parent.mkdir(parents=True, exist_ok=True)
+    sfm_py = await asyncio.to_thread(_sfm_python, False)
+    if sfm_py is None:
+        await queue.put(
+            {
+                "event": "error",
+                "message": (
+                    "Photogrammetry needs pycolmap, and no Python with "
+                    "it was found (pip install 'lidarstudio"
+                    "[photogrammetry]', or set $LIDARSTUDIO_SFM_PYTHON)."
+                ),
+            }
+        )
+        return None
+    n_img = (contents.get("images") or {}).get("count", 0)
+    await queue.put(
+        {
+            "event": "progress",
+            "percent": 1,
+            "message": (
+                ("Rebuilding the reconstruction from scratch: "
+                 if force_sfm else "")
+                + f"reconstructing {n_img} photos (COLMAP feature "
+                "matching + global mapping, CPU-bound — expect tens of "
+                "minutes; reused by every later run)…"
+            ),
+        }
+    )
+    sfm_cmd = [
+        sfm_py,
+        str(ROOT / "process_sfm.py"),
+        "--scan",
+        str(scan),
+        "--output",
+        str(canonical),
+        # The sparse points are the seed: there is no LiDAR cloud.
+        "--cloud-output",
+        str(seed_cloud_path),
+        "--workspace",
+        str(proj / "sfm" / f"work_{ts}"),
+        "--matching",
+        str(options.get("matching", "auto")),
+        # Incremental here, GLOMAP on the LiDAR branch below — the two
+        # capture types fail differently, so they get different
+        # mappers. A phone capture of one object is where global
+        # averaging picks the wrong consensus (60 deg of solved spread
+        # against incremental's 90 from the same matches).
+        "--mapper",
+        str(options.get("mapper", "incremental")),
+    ]
+    # Subject masking is an image_set-only lever: it exists for an
+    # object shot on a floor or a desk, where the flat background is
+    # what folds the orbit. A LiDAR room scan HAS no subject to
+    # segment, so the LiDAR branch below never offers it.
+    if (options.get("mask_subject") or options.get("turntable")
+            or options.get("mask_region")):
+        if options.get("turntable"):
+            # Implies masking: solving in the subject's frame is what
+            # makes a rotating subject reconstructible at all.
+            sfm_cmd.append("--turntable")
+        elif options.get("mask_subject"):
+            sfm_cmd.append("--mask-subject")
+        # Region and classes are the same question answered two ways,
+        # and process_sfm rejects both at once — so pick here rather
+        # than hand it a command it will refuse.
+        if options.get("mask_region"):
+            sfm_cmd += ["--mask-region", str(options["mask_region"])]
+        elif options.get("mask_classes"):
+            sfm_cmd += ["--mask-classes", str(options["mask_classes"])]
+    proc = await asyncio.create_subprocess_exec(
+        *sfm_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    job["proc"] = proc
+    if job.get("cancelled"):
+        proc.terminate()
+    rc, err = await _stream_proc(proc, queue)
+    job["proc"] = None
+    if job.get("cancelled"):
+        await queue.put(
+            {"event": "cancelled", "message": f"{label} stopped."}
+        )
+        return None
+    if rc != 0 or not canonical.exists():
+        await queue.put(
+            {
+                "event": "error",
+                "message": err
+                or f"Photo reconstruction failed (exit code {rc})",
+            }
+        )
+        return None
+    return canonical
+
+
 async def _job_splat(project_path, scan_path, options, queue, job=None):
     job = job if job is not None else {}
     proj = Path(project_path)
@@ -1563,91 +1782,10 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
             sfm_poses = str(canonical) if canonical.exists() else ""
         need_sfm = force_sfm or not sfm_poses or not seed_cloud_path.exists()
         if need_sfm:
-            sfm_py = await asyncio.to_thread(_sfm_python, False)
-            if sfm_py is None:
-                await queue.put(
-                    {
-                        "event": "error",
-                        "message": (
-                            "Photogrammetry needs pycolmap, and no Python with "
-                            "it was found (pip install 'lidarstudio"
-                            "[photogrammetry]', or set $LIDARSTUDIO_SFM_PYTHON)."
-                        ),
-                    }
-                )
-                return
-            n_img = (contents.get("images") or {}).get("count", 0)
-            await queue.put(
-                {
-                    "event": "progress",
-                    "percent": 1,
-                    "message": (
-                        ("Rebuilding the reconstruction from scratch: "
-                         if force_sfm else "")
-                        + f"reconstructing {n_img} photos (COLMAP feature "
-                        "matching + global mapping, CPU-bound — expect tens of "
-                        "minutes; reused by every later run)…"
-                    ),
-                }
-            )
-            sfm_cmd = [
-                sfm_py,
-                str(ROOT / "process_sfm.py"),
-                "--scan",
-                str(scan),
-                "--output",
-                str(canonical),
-                # The sparse points are the seed: there is no LiDAR cloud.
-                "--cloud-output",
-                str(seed_cloud_path),
-                "--workspace",
-                str(proj / "sfm" / f"work_{ts}"),
-                "--matching",
-                str(options.get("matching", "auto")),
-                # Incremental here, GLOMAP on the LiDAR branch below — the two
-                # capture types fail differently, so they get different
-                # mappers. A phone capture of one object is where global
-                # averaging picks the wrong consensus (60 deg of solved spread
-                # against incremental's 90 from the same matches).
-                "--mapper",
-                str(options.get("mapper", "incremental")),
-            ]
-            # Subject masking is an image_set-only lever: it exists for an
-            # object shot on a floor or a desk, where the flat background is
-            # what folds the orbit. A LiDAR room scan HAS no subject to
-            # segment, so the LiDAR branch below never offers it.
-            if options.get("mask_subject") or options.get("turntable"):
-                if options.get("turntable"):
-                    # Implies masking: solving in the subject's frame is what
-                    # makes a rotating subject reconstructible at all.
-                    sfm_cmd.append("--turntable")
-                else:
-                    sfm_cmd.append("--mask-subject")
-                if options.get("mask_classes"):
-                    sfm_cmd += ["--mask-classes", str(options["mask_classes"])]
-            proc = await asyncio.create_subprocess_exec(
-                *sfm_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            job["proc"] = proc
-            if job.get("cancelled"):
-                proc.terminate()
-            rc, err = await _stream_proc(proc, queue)
-            job["proc"] = None
-            if job.get("cancelled"):
-                await queue.put(
-                    {"event": "cancelled", "message": "Splat generation stopped."}
-                )
-                return
-            if rc != 0 or not canonical.exists():
-                await queue.put(
-                    {
-                        "event": "error",
-                        "message": err
-                        or f"Photo reconstruction failed (exit code {rc})",
-                    }
-                )
+            if await _run_image_set_sfm(
+                proj, scan, ts, contents, options, queue, job, force_sfm,
+                "Splat generation",
+            ) is None:
                 return
             sfm_poses = str(canonical)
         else:

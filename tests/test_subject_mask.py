@@ -196,3 +196,168 @@ def test_the_mask_directory_reaches_colmap(monkeypatch, tmp_path):
     # spent differently: fainter keypoints, higher cap.
     assert seen["extraction_options"].sift.peak_threshold < 0.0066
     assert seen["extraction_options"].sift.max_num_features > 8192
+
+
+# ── --mask-region: a subject COCO has no name for ────────────────────
+
+def test_a_box_region_parses_to_its_four_corners():
+    assert process_sfm.parse_mask_region("0.25,0.1,0.75,0.9") == [
+        (0.25, 0.1), (0.75, 0.1), (0.75, 0.9), (0.25, 0.9)
+    ]
+
+
+def test_a_polygon_region_keeps_its_points():
+    assert process_sfm.parse_mask_region("0,0,1,0,0.5,1") == [
+        (0.0, 0.0), (1.0, 0.0), (0.5, 1.0)
+    ]
+
+
+@pytest.mark.parametrize("spec,match", [
+    ("0.1,0.2,0.3", "even count"),
+    ("0.1,0.2", "box .4 numbers"),
+    ("0.1,0.2,1.5,0.9", r"\[0, 1\]"),
+    ("0.8,0.2,0.3,0.9", "x0<x1"),
+    ("0.1,0.1,0.5,0.5,0.9,0.9", "encloses no area"),
+    ("0.1,0.2,left,0.9", "not a list of numbers"),
+])
+def test_a_malformed_region_stops_the_run(spec, match):
+    """Never a fallback: the failure --mask-region exists to prevent is a mask
+    that silently keeps the whole frame, so a bad region must not become one."""
+    with pytest.raises(SystemExit, match=match):
+        process_sfm.parse_mask_region(spec)
+
+
+def test_a_region_mask_keeps_exactly_the_stated_box(frames, tmp_path):
+    out = tmp_path / "masks"
+    # frames are 40 rows x 60 cols; keep the middle half horizontally.
+    process_sfm.build_region_masks(
+        frames, out, process_sfm.parse_mask_region("0.25,0.0,0.75,1.0")
+    )
+    m = cv2.imread(str(out / "0000.jpg.png"), cv2.IMREAD_GRAYSCALE)
+    assert m.shape == (40, 60)
+    assert m[20, 5] == 0 and m[20, 55] == 0, "outside the box must be excluded"
+    assert m[20, 30] == 255, "inside the box must be kept"
+
+
+def test_every_frame_gets_a_region_mask_named_for_it(frames, tmp_path):
+    out = tmp_path / "masks"
+    process_sfm.build_region_masks(
+        frames, out, process_sfm.parse_mask_region("0.1,0.1,0.9,0.9")
+    )
+    assert sorted(p.name for p in out.glob("*.png")) == [
+        f"{i:04d}.jpg.png" for i in range(5)
+    ]
+
+
+def test_a_region_needs_no_segmenter(frames, tmp_path, monkeypatch):
+    """The whole point for a non-COCO subject: no torchvision in the path."""
+    monkeypatch.setattr(
+        process_sfm, "_maskrcnn_detector",
+        lambda: pytest.fail("build_region_masks must not load a detector"),
+    )
+    process_sfm.build_region_masks(
+        frames, tmp_path / "masks", process_sfm.parse_mask_region("0.2,0.2,0.8,0.8")
+    )
+
+
+def test_a_too_tight_region_warns(frames, tmp_path, capsys):
+    process_sfm.build_region_masks(
+        frames, tmp_path / "masks",
+        process_sfm.parse_mask_region("0.50,0.50,0.55,0.55"),
+    )
+    assert "too little for SIFT" in capsys.readouterr().out
+
+
+# ── --mask-classes: a name the segmenter cannot emit ─────────────────
+
+def _detector_knowing(*labels):
+    """A detector that publishes a vocabulary, the way _maskrcnn_detector does."""
+    def detect(path):
+        return [("cup", 0.99, _blob())]
+    detect.labels = frozenset(labels)
+    return detect
+
+
+def test_an_unknown_mask_class_stops_the_run(frames, tmp_path):
+    """The silent failure this replaces: no detection matches the name, every
+    frame falls through to all-pass, and the run finishes with masking doing
+    nothing at all."""
+    with pytest.raises(SystemExit, match="no such class"):
+        process_sfm.build_subject_masks(
+            frames, tmp_path / "masks", classes=["mug"],
+            detector=_detector_knowing("cup", "bowl", "cell phone"),
+        )
+
+
+@pytest.mark.parametrize("asked,meant", [
+    ("mug", "cup"),            # a synonym: edit distance scores this 0.33
+    ("phone", "cell phone"),   # a prefix: difflib finds this one
+    ("plant", "potted plant"),
+    ("bowls", "bowl"),         # a plain typo
+    ("scisors", "scissors"),
+    ("glass", "wine glass"),   # the compound rule, with no synonym entry
+])
+def test_the_rejection_suggests_the_class_that_was_meant(
+    frames, tmp_path, asked, meant
+):
+    with pytest.raises(SystemExit, match=f"did you mean '{meant}'"):
+        process_sfm.build_subject_masks(
+            frames, tmp_path / "masks", classes=[asked],
+            # Includes the distractors the real 80-class list supplies:
+            # difflib ranks 'elephant'/'airplane' above 'potted plant' for
+            # 'plant', and 'spoon'/'horse' above 'cell phone' for 'phone'.
+            detector=_detector_knowing(
+                "cup", "bowl", "cell phone", "potted plant", "vase",
+                "elephant", "airplane", "spoon", "horse", "scissors", "wine glass",
+            ),
+        )
+
+
+def test_a_known_mask_class_is_accepted(frames, tmp_path):
+    missing = process_sfm.build_subject_masks(
+        frames, tmp_path / "masks", classes=["cup"], dilate=0,
+        detector=_detector_knowing("cup", "bowl"),
+    )
+    assert missing == 0
+
+
+def test_only_the_unknown_names_are_reported(frames, tmp_path):
+    """A partly-right list must point at the wrong entry, not all of them."""
+    with pytest.raises(SystemExit) as e:
+        process_sfm.build_subject_masks(
+            frames, tmp_path / "masks", classes=["cup", "widget"],
+            detector=_detector_knowing("cup", "bowl"),
+        )
+    assert "'widget'" in str(e.value) and "'cup'" not in str(e.value).split("\n\n")[0]
+
+
+def test_a_detector_without_a_vocabulary_is_not_second_guessed(frames, tmp_path):
+    """The injected doubles in these tests publish no labels; validation must
+    skip rather than reject everything."""
+    missing = process_sfm.build_subject_masks(
+        frames, tmp_path / "masks", classes=["anything"], dilate=0,
+        detector=lambda p: [("anything", 0.99, _blob())],
+    )
+    assert missing == 0
+
+
+def test_turntable_degrades_to_unmasked_rather_than_refusing(frames, tmp_path, capsys):
+    """--turntable IMPLIES masking rather than asking for it, so a subject COCO
+    cannot name must not block the run. Measured on a plywood house: unmasked
+    gave 219/219 frames and a 228 deg turn, against 162 and 43 deg masked."""
+    got = process_sfm.build_subject_masks(
+        frames, tmp_path / "masks", required=False,
+        detector=lambda p: [("dog", 0.99, _blob())],
+    )
+    assert got is None, "no masks built"
+    assert "being solved UNMASKED" in capsys.readouterr().out
+    assert not (tmp_path / "masks").exists(), \
+        "an empty <output>_masks dir reads as 'masks were made'"
+
+
+def test_an_explicit_mask_subject_still_refuses(frames, tmp_path):
+    with pytest.raises(SystemExit, match="no recognisable subject"):
+        process_sfm.build_subject_masks(
+            frames, tmp_path / "masks", required=True,
+            detector=lambda p: [("dog", 0.99, _blob())],
+        )

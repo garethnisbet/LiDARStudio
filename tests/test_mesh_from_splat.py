@@ -183,13 +183,21 @@ def test_mesh_job_without_a_splat_says_to_train_one(capture):
     assert errors and "train one first" in errors[0]
 
 
-def test_mesh_job_without_sfm_poses_says_to_train_a_splat(capture):
+def test_mesh_job_runs_sfm_itself_when_there_are_no_poses(capture):
+    """It used to send the user off to train a splat first. The mesh comes
+    from dense stereo now, so that would be hours of GPU for a side effect —
+    the job runs the reconstruction it actually needs instead."""
     project, scan, ts = capture
     (project / "sfm" / f"sfm_viewmats_{ts}.npz").unlink()
 
     events = _run_mesh(project, scan)
+    msgs = [e.get("message", "") for e in events]
+    assert any("running SfM now" in m for m in msgs), msgs
+    assert not any("Train a splat" in m for m in msgs)
+    # This fixture has no real frames, so the reconstruction fails — the point
+    # is that the failure comes from SfM, not from a refusal to attempt it.
     errors = [e["message"] for e in events if e["event"] == "error"]
-    assert errors and "Train a splat" in errors[0]
+    assert errors and "Train a splat" not in errors[0]
 
 
 def test_mesh_job_requires_ingest_first(tmp_path):

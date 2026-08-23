@@ -10,12 +10,18 @@ Turns a dense point cloud into a watertight triangle mesh.  Two sources feed it:
     gives metric geometry and the trajectory gives real camera poses, this
     avoids the scale/geometry guessing that makes image-only photogrammetry
     fragile.
+  * **A dense MVS cloud** (``--sfm-poses``) — the fused stereo depths from
+    ``process_dense.py``.  This is the preferred phone-capture route: real
+    surface samples with real normals, which is what Poisson actually wants.
+    Camera centres come from the SfM npz and colour from the cloud's own RGB.
+    The result is unitless and unlevelled — the SfM frame has no metric scale
+    to inherit.
   * **A trained splat** (``--sfm-poses``) — the gaussian centres exported by
-    ``edit_ops.splat_to_cloud``.  This is the phone-capture route: there is no
-    LiDAR and no IMAGE bag, so camera centres come from the SfM npz and colour
-    comes from the cloud's own per-point RGB (the splat already solved it
-    photometrically).  The result is unitless and unlevelled — the SfM frame
-    has no metric scale to inherit.
+    ``edit_ops.splat_to_cloud``.  The fallback route, for captures whose
+    reconstruction kept no sparse model and for CPU-only installs (COLMAP's
+    patch-match is CUDA-only).  It costs a full splat training run to obtain a
+    cloud, and gaussian centres are placed to minimise photometric loss rather
+    than to lie on the surface, so expect floaters and softer detail than MVS.
 
 Pipeline:
     1. Load the cloud + camera centres (``.traj.npz`` trajectory, or the

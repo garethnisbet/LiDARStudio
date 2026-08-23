@@ -18,7 +18,9 @@ Automates the July-2026 campaign pipeline that produced the champion
      incremental mapping (GLOMAP fallback; --mapper) with the factory
      OPENCV_FISHEYE calibration as a shared-camera prior; optionally
      (--mask-subject) restricted to the segmented subject, for an object
-     shot on a floor or desk whose flat background folds the orbit;
+     shot on a floor or desk whose flat background folds the orbit, or
+     (--mask-region) to a stated image region when the subject is not a
+     class COCO knows and the camera did not move;
   C. sim(3)-align (Umeyama, iterative median trimming) the SfM poses to
      the LiDAR odometry trajectory — residuals ARE the LiDAR drift;
   D. loop closure: spatially-close frame pairs from the aligned poses
@@ -92,6 +94,12 @@ MASK_VOTE_FRAMES = 12  # frames sampled to choose the subject class
 # capture is called "not a turntable". A jittered synthetic turntable fits to
 # 0.5% of radius / 0.3 deg; a walk-around run with --turntable measured 46% and
 # 13.6 deg, so anything in between is comfortably separated.
+# Frames per 30 deg of turn below which a stretch reconstructs badly. Measured
+# on the House capture: sectors with 4-6 frames yielded 608-660 sparse points
+# per image and holed geometry, against 1069-1287 and clean surface for
+# sectors with 13-19. Eight is the midpoint of that gap.
+MIN_VIEWS_PER_30DEG = 8
+
 MAX_TT_POS_RESIDUAL = 0.05  # fraction of the turn radius
 MAX_TT_ROT_RESIDUAL = 3.0  # degrees
 
@@ -226,11 +234,99 @@ def _maskrcnn_detector():
             for j in range(len(out["scores"]))
         ]
 
+    # The vocabulary, so build_subject_masks can reject a --mask-classes name
+    # this segmenter can never emit. COCO's list is padded with
+    # "__background__" and "N/A" placeholders that are not askable classes.
+    detect.labels = frozenset(
+        n for n in names if n not in ("__background__", "N/A")
+    )
     return detect
 
 
+# True synonyms, where the user's word shares no stem with COCO's. Edit
+# distance cannot reach these ('mug' scores 0.33 against 'cup') and neither
+# can the compound rule below.
+_CLASS_SYNONYMS = {
+    "mug": "cup",
+    "tumbler": "cup",
+    "mobile": "cell phone",
+    "smartphone": "cell phone",
+    "jar": "vase",
+    "flask": "bottle",
+    "controller": "remote",
+}
+
+
+def _near_misses(name, known):
+    """Up to three classes the user plausibly meant, best first.
+
+    Three tiers, because fuzzy matching alone is actively misleading here: on
+    the real 80-class list difflib answers 'plant' with 'elephant' (0.62) and
+    'airplane' (0.62) before 'potted plant' (0.59), and 'phone' with 'spoon'
+    and 'horse'. So synonyms and COCO's compound names are resolved first, and
+    edit distance is left to do only what it is good at — plain typos.
+    """
+    import difflib
+
+    q = name.strip().lower()
+    hits = []
+    syn = _CLASS_SYNONYMS.get(q)
+    if syn and syn in known:
+        hits.append(syn)
+    # COCO compounds its names — 'cell phone', 'potted plant', 'wine glass',
+    # 'sports ball', 'teddy bear' — so naming the head noun alone is a
+    # systematic miss rather than a slip.
+    hits += [c for c in sorted(known) if q in c.lower().split() and c not in hits]
+    # Unambiguous typos only: 'bowls'/'bowl' is 0.89, 'scisors'/'scissors'
+    # 0.93, while the noise above sits at 0.6.
+    hits += [
+        c for c in difflib.get_close_matches(name, sorted(known), n=3, cutoff=0.7)
+        if c not in hits
+    ]
+    return hits[:3]
+
+
+def _reject_unknown_classes(wanted, known):
+    """Stop on a --mask-classes name the segmenter can never emit.
+
+    Without this the run does not fail, which is worse than failing: no
+    detection ever matches the name, every frame falls through to the all-pass
+    mask at the bottom of build_subject_masks, and the reconstruction finishes
+    with masking silently doing nothing — re-arming the planar-background fold
+    that --mask-subject exists to prevent, and handing the trainer all-pass
+    loss masks on the --turntable path.
+
+    ``known`` of None means the detector does not publish a vocabulary (an
+    injected test double), and there is nothing to check against.
+
+    The near-miss suggestions are the point: 'mug' for 'cup', 'phone' for
+    'cell phone' and 'plant' for 'potted plant' are each one keystroke from
+    working, and listing 80 COCO classes would bury that.
+    """
+    if not known:
+        return
+    unknown = sorted(w for w in wanted if w not in known)
+    if not unknown:
+        return
+    lines = []
+    for u in unknown:
+        near = _near_misses(u, known)
+        lines.append(
+            f"  {u!r}"
+            + (f" — did you mean {', '.join(repr(c) for c in near)}?" if near else "")
+        )
+    raise SystemExit(
+        "--mask-classes: the segmenter has no such class:\n"
+        + "\n".join(lines)
+        + "\n\nIt can only emit its own COCO classes, so an unknown name "
+        "matches nothing and leaves every frame unmasked — the run would "
+        "finish with masking doing nothing at all. Pass --mask-region instead "
+        "when the subject has no COCO class."
+    )
+
+
 def build_subject_masks(images_dir: Path, mask_dir: Path, classes=None,
-                        dilate: int = 15, detector=None):
+                        dilate: int = 15, detector=None, required: bool = True):
     """Segment the capture's subject in every frame; write COLMAP masks.
 
     Why this exists: an object photographed on a floor or a desk is a small
@@ -264,6 +360,7 @@ def build_subject_masks(images_dir: Path, mask_dir: Path, classes=None,
     # the whole capture.
     if classes:
         wanted = set(classes)
+        _reject_unknown_classes(wanted, getattr(detect, "labels", None))
     else:
         votes = {}
         step = max(1, len(frames) // MASK_VOTE_FRAMES)
@@ -275,11 +372,35 @@ def build_subject_masks(images_dir: Path, mask_dir: Path, classes=None,
             if best:
                 votes[best] = votes.get(best, 0) + 1
         if not votes:
+            if not required:
+                # --turntable IMPLIES masking rather than asking for it, and a
+                # subject COCO cannot name is not a reason to refuse the run:
+                # measured on a plywood house, solving unmasked gave 219/219
+                # frames and a 228 deg turn against 162 and 43 deg for the same
+                # capture masked to a fixed region. Say so and carry on.
+                print(
+                    "WARNING: no recognisable subject to mask (looked for: "
+                    f"{', '.join(SUBJECT_CLASSES)}), so this turntable is "
+                    "being solved UNMASKED. That is often fine, and on a "
+                    "manual turntable it is often BETTER: the platter "
+                    "co-rotates with the subject, so its texture is signal. "
+                    "If the solve folds, pass --mask-region around the "
+                    "PLATTER — everything that turns — not around the "
+                    "subject alone.",
+                    flush=True,
+                )
+                # mask_dir was created before the vote could run; an empty
+                # <output>_masks beside the npz reads as "masks were made".
+                try:
+                    mask_dir.rmdir()
+                except OSError:
+                    pass
+                return None
             raise SystemExit(
                 "--mask-subject found no recognisable subject in this capture "
                 f"(looked for: {', '.join(SUBJECT_CLASSES)}). Pass "
-                "--mask-classes with the COCO class name of the subject, or "
-                "drop --mask-subject."
+                "--mask-classes with the COCO class name of the subject, "
+                "--mask-region with a box around it, or drop --mask-subject."
             )
         wanted = {max(votes, key=votes.get)}
         log(f"masking subject class '{next(iter(wanted))}' "
@@ -323,9 +444,163 @@ def build_subject_masks(images_dir: Path, mask_dir: Path, classes=None,
     return missing
 
 
+def parse_mask_region(spec: str):
+    """Parse ``--mask-region`` into a polygon of normalised (x, y) points.
+
+    Four numbers are a box's opposite corners (x0,y0,x1,y1); six or more are a
+    polygon, three points minimum. Coordinates are FRACTIONS of the frame
+    (0,0 top-left, 1,1 bottom-right) rather than pixels, so one region survives
+    a re-ingest at a different --max-edge and can be read off a preview of any
+    size.
+
+    Every rejection here is a SystemExit rather than a fallback, because the
+    failure this option exists to avoid is a mask that silently keeps
+    everything: a region that cannot be parsed must stop the run, not quietly
+    become a no-op.
+    """
+    try:
+        vals = [float(v) for v in spec.replace(";", ",").split(",") if v.strip()]
+    except ValueError:
+        raise SystemExit(f"--mask-region: not a list of numbers: {spec!r}")
+    if len(vals) % 2:
+        raise SystemExit(
+            f"--mask-region takes x,y pairs, so an even count — got {len(vals)}"
+        )
+    if len(vals) < 4:
+        raise SystemExit(
+            "--mask-region needs a box (4 numbers: x0,y0,x1,y1) or a polygon "
+            f"(6 or more) — got {len(vals)}"
+        )
+    if not all(0.0 <= v <= 1.0 for v in vals):
+        raise SystemExit(
+            "--mask-region coordinates are fractions of the frame, so every "
+            f"value must be in [0, 1] — got {spec!r}"
+        )
+    if len(vals) == 4:
+        x0, y0, x1, y1 = vals
+        if x1 <= x0 or y1 <= y0:
+            raise SystemExit(
+                "--mask-region box is x0,y0,x1,y1 with x0<x1 and y0<y1 — got "
+                f"{spec!r}"
+            )
+        return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    pts = list(zip(vals[::2], vals[1::2]))
+    # Shoelace area: a polygon whose points are collinear encloses nothing and
+    # would mask the whole capture away.
+    n = len(pts)
+    area = 0.5 * abs(sum(
+        pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+        for i in range(n)
+    ))
+    if area < 1e-6:
+        raise SystemExit(f"--mask-region polygon encloses no area: {spec!r}")
+    return pts
+
+
+def build_region_masks(images_dir: Path, mask_dir: Path, region):
+    """Write COLMAP masks keeping one FIXED image region in every frame.
+
+    build_subject_masks can only ask for what COCO knows, which is the 19
+    tabletop objects in SUBJECT_CLASSES. A machine part, a casting, a rock or
+    a printed bracket is not among them and there is no label to pass to
+    --mask-classes either: the detector never emits it, every frame falls
+    through to an all-pass mask, and the run continues with masking silently
+    doing nothing. A stated region is the answer for those subjects, and it
+    needs no torchvision at all.
+
+    It is sound precisely when the CAMERA is fixed — a turntable — because the
+    subject then occupies the same part of every frame by construction. On a
+    walk-around the subject travels through the frame and a fixed region would
+    mask it away; that is what build_subject_masks is for.
+
+    It also does something the class mask cannot: the region MAY deliberately
+    include the platter, so a patterned cloth or sheet of newspaper laid ON the
+    turntable — the standard fix for a symmetric subject folding the solve —
+    reaches matching instead of being segmented away with the background.
+
+    ``region`` is a polygon of normalised (x, y) from parse_mask_region. No
+    dilation is applied: unlike a pixel-tight instance mask, a stated region is
+    already the boundary the user meant.
+    """
+    import cv2
+    import numpy as np
+
+    frames = sorted(images_dir.glob("*.jpg"))
+    if not frames:
+        raise SystemExit(f"no frames to mask in {images_dir}")
+    mask_dir.mkdir(parents=True, exist_ok=True)
+
+    by_size = {}  # rasterise once per distinct frame size, not once per frame
+    for n, path in enumerate(frames):
+        if n % 50 == 0:
+            progress(6 + int(6 * n / len(frames)),
+                     f"SfM poses: masking region ({n}/{len(frames)})…")
+        h, w = cv2.imread(str(path)).shape[:2]
+        img = by_size.get((h, w))
+        if img is None:
+            img = np.zeros((h, w), np.uint8)
+            pts = np.array(
+                [(round(x * (w - 1)), round(y * (h - 1))) for x, y in region],
+                np.int32,
+            )
+            cv2.fillPoly(img, [pts], 255)
+            by_size[(h, w)] = img
+        cv2.imwrite(str(mask_dir / (path.name + ".png")), img)
+
+    frac = 100 * float(np.mean([(m > 0).mean() for m in by_size.values()]))
+    log(f"region masks: {len(frames)} frames, keeping {frac:.0f}% of the frame"
+        + (f" ({len(by_size)} frame sizes)" if len(by_size) > 1 else ""))
+    if frac < 2:
+        print(
+            f"WARNING: the region keeps only {frac:.1f}% of the frame — too "
+            "little for SIFT to find matchable structure in. Widen "
+            "--mask-region.",
+            flush=True,
+        )
+    return frac
+
+
+def build_ordered_pairs(names, window: int, out_path: Path) -> int:
+    """Match pairs within ``window`` frames of each other, and no others.
+
+    The fold that ruins a symmetric subject is a LONG-RANGE false match. A view
+    of the back of a two-gabled house really does look like the front, so the
+    mapper is free to place frame 150 at frame 30's angle, and no amount of
+    feature evidence can rule it out — measured on the House capture as a solve
+    that climbed to +79 deg, jumped BACK 136 deg, climbed again, and covered
+    173 deg of a full turn while registering all 219 frames.
+
+    Frame ORDER is the evidence matching cannot supply: on an ordered capture
+    the subject cannot be at two angles at once, so a pair 120 frames apart is
+    not a neighbour however well it matches. Deleting those pairs from the
+    graph makes the fold STRUCTURALLY IMPOSSIBLE rather than merely unlikely —
+    the mapper never sees the edge it would have folded along.
+
+    Note this is strictly stronger than ``--matching sequential``, which sets
+    ``quadratic_overlap`` and therefore deliberately adds pairs at 1, 2, 4, 8,
+    16... frames apart. Those long reaches are the fold's route back in.
+
+    The cost is that the two ends of a full turn never meet, so the arc drifts
+    instead of closing. On a turntable that is much the cheaper error: drift is
+    what the single-axis fit regularises (--turntable-snap), while a fold
+    silently merges two different sides of the subject into one.
+    """
+    pairs = []
+    for i in range(len(names)):
+        for j in range(i + 1, min(i + window + 1, len(names))):
+            pairs.append(f"{names[i]} {names[j]}")
+    if not pairs:
+        raise SystemExit(
+            f"--matching ordered: {len(names)} frames with a window of "
+            f"{window} yields no pairs"
+        )
+    out_path.write_text("\n".join(pairs) + "\n")
+    return len(pairs)
+
+
 def extract_and_match(db: Path, images_dir: Path, model: str, params,
                       strategy: str = "sequential", vocab_tree=None,
-                      mask_dir=None):
+                      mask_dir=None, window: int = 20):
     import pycolmap
 
     reader = pycolmap.ImageReaderOptions()
@@ -361,7 +636,16 @@ def extract_and_match(db: Path, images_dir: Path, model: str, params,
     )
     log(f"feature extraction done (camera model {model})")
 
-    if strategy == "exhaustive":
+    if strategy == "ordered":
+        names = [p.name for p in sorted(images_dir.glob("*.jpg"))]
+        pairs_path = db.parent / "pairs_ordered.txt"
+        n = build_ordered_pairs(names, window, pairs_path)
+        progress(30, f"SfM poses: ordered matching ({n:,} pairs, window "
+                     f"{window} frames)…")
+        pairing = pycolmap.ImportedPairingOptions()
+        pairing.match_list_path = str(pairs_path)
+        pycolmap.match_image_pairs(database_path=db, pairing_options=pairing)
+    elif strategy == "exhaustive":
         progress(30, "SfM poses: exhaustive matching…")
         pycolmap.match_exhaustive(database_path=db)
     elif strategy == "vocabtree":
@@ -648,13 +932,8 @@ def viewmats_from_sfm(sfm, ts_by_name):
 # ── Seed cloud from the sparse reconstruction ────────────────────────
 
 
-def export_sparse_cloud(rec, out_path: Path, viewmat_transform=None):
-    """Write ``rec.points3D`` as a coloured binary PLY — the splat seed.
-
-    Every COLMAP 3D point carries an RGB colour averaged over the images that
-    observed it, which is exactly the (xyz, rgb) form load_coloured_ply wants.
-    Typically 50k-500k points: thin next to a LiDAR cloud's millions, but MCMC
-    densification grows the model from it.
+def _sparse_points(rec):
+    """``(xyz, rgb)`` of the reconstruction's 3D points.
 
     Points with a long track are kept preferentially — a point seen by two
     images is frequently a mismatch, and seeding the trainer with those puts
@@ -672,10 +951,14 @@ def export_sparse_cloud(rec, out_path: Path, viewmat_transform=None):
         for pt in rec.points3D.values():
             xyz.append(pt.xyz)
             rgb.append(pt.color)
-    xyz = np.asarray(xyz, dtype=np.float64)
-    rgb = np.asarray(rgb, dtype=np.uint8)
-    if viewmat_transform is not None:
-        xyz = viewmat_transform(xyz)
+    return (np.asarray(xyz, dtype=np.float64),
+            np.asarray(rgb, dtype=np.uint8))
+
+
+def _write_ply(xyz, rgb, out_path: Path):
+    """Coloured binary PLY, written-then-renamed so a crash leaves no
+    half-written cloud where an existence check would find one."""
+    import numpy as np
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     n = len(xyz)
@@ -696,8 +979,208 @@ def export_sparse_cloud(rec, out_path: Path, viewmat_transform=None):
         f.write(header.encode())
         f.write(data.tobytes())
     tmp.rename(out_path)
+    return n
+
+
+def export_sparse_cloud(rec, out_path: Path, viewmat_transform=None):
+    """Write ``rec.points3D`` as a coloured binary PLY — the splat seed.
+
+    Every COLMAP 3D point carries an RGB colour averaged over the images that
+    observed it, which is exactly the (xyz, rgb) form load_coloured_ply wants.
+    Typically 50k-500k points: thin next to a LiDAR cloud's millions, but MCMC
+    densification grows the model from it.
+    """
+    xyz, rgb = _sparse_points(rec)
+    if viewmat_transform is not None:
+        xyz = viewmat_transform(xyz)
+    n = _write_ply(xyz, rgb, out_path)
     log(f"seed cloud: {n:,} points → {out_path}")
     return n
+
+
+# ── Silhouette carving: the shape information matching cannot see ────
+
+
+def _project(camera, xyz_cam):
+    """Pixel coordinates for camera-frame points, and which ones are usable.
+
+    Delegates the lens model to pycolmap so every COLMAP camera (SIMPLE_RADIAL
+    for a solved phone lens, OPENCV_FISHEYE for the factory calibration) is
+    handled by the same code that solved the poses. Points at or behind the
+    principal plane have no projection and are reported unusable rather than
+    silently wrapping to a pixel.
+    """
+    import numpy as np
+
+    front = xyz_cam[:, 2] > 1e-9
+    uv = np.full((len(xyz_cam), 2), -1.0)
+    if front.any():
+        uv[front] = camera.img_from_cam(np.ascontiguousarray(xyz_cam[front]))
+    return uv, front
+
+
+def pycolmap_camera(model, params, width, height):
+    """A pycolmap Camera from the npz's ``camera_model``/``camera_params``, so
+    the carve projects through the same lens the poses were solved under."""
+    import pycolmap
+
+    return pycolmap.Camera(
+        model=str(model), width=int(width), height=int(height),
+        params=[float(x) for x in params],
+    )
+
+
+def carve_visual_hull(mask_dir: Path, images_dir: Path, names, viewmats,
+                      camera, seed_xyz, grid=256, views=72, erode=0):
+    """Space-carve the subject from its silhouettes — shape without texture.
+
+    A turntable capture is a tomographic acquisition: every mask is a
+    projection of the subject, and the masks stacked against rotation angle
+    are its sinogram. The inversion is not filtered backprojection — a
+    silhouette is a binary occupancy projection, a max along each ray, not a
+    density integral — so the reconstruction is the intersection of the
+    back-projected silhouette cones, the visual hull, carved here on a voxel
+    grid.
+
+    Why it is worth doing at all: SILHOUETTES NEED NO TEXTURE. On the capture
+    this was written for, ~150 frames of blank glazed cylinder yielded zero
+    features and zero sparse points, leaving the seed cloud a half-mug — yet
+    every one of those frames carries a perfectly good outline. Matching and
+    carving read different channels of the same capture, and the channel that
+    fails on a featureless subject is not the one used here.
+
+    Limits, in the order they will bite:
+
+    * The hull is an upper bound on shape and CANNOT see concavities. A mug's
+      bore carves as solid unless views look down into it; a capture level
+      with the rim recovers the outside and fills the inside.
+    * It is only as good as its worst silhouette. Masks written for MATCHING
+      are dilated (--mask-dilate, 15 px) to keep the silhouette keypoints that
+      carry the outline, and that dilation inflates the hull on every ray —
+      hence ``erode``, which cancels it.
+    * A box from --mask-region is not a silhouette. Carving against one
+      returns the box, so this refuses to run on region masks.
+    * A subject cut off by the frame edge carves away the part that left the
+      frame, since "outside the image" and "outside the subject" are the same
+      test here.
+
+    Returns ``(xyz, rgb)`` for the surface voxels, coloured from the frames
+    that see them (nearest-surface-per-pixel, so a front surface is not
+    painted with the colour of the one behind it).
+    """
+    import cv2
+    import numpy as np
+
+    sel = list(range(0, len(names), max(1, len(names) // max(1, views))))[:views]
+    if len(sel) < 8:
+        raise SystemExit(
+            f"--carve-seed needs at least 8 views to intersect, got {len(sel)}"
+        )
+
+    # The volume: the sparse points are subject-only (they were matched under
+    # the same masks), so their extent bounds the subject even though they
+    # cover only the textured side of it. Percentiles rather than min/max —
+    # one stray triangulation must not inflate the grid.
+    lo = np.percentile(seed_xyz, 1, axis=0)
+    hi = np.percentile(seed_xyz, 99, axis=0)
+    mid, half = (hi + lo) / 2, (hi - lo) / 2 * 1.35
+    lo, hi = mid - half, mid + half
+    step = (hi - lo) / (grid - 1)
+    log(f"carving {grid}^3 voxels over a "
+        f"{hi[0] - lo[0]:.3f}x{hi[1] - lo[1]:.3f}x{hi[2] - lo[2]:.3f} box "
+        f"from {len(sel)} of {len(names)} views")
+
+    occ = np.ones(grid ** 3, bool)
+    kernel = np.ones((erode, erode), np.uint8) if erode > 0 else None
+    clipped = 0
+    for k, i in enumerate(sel):
+        if k % 10 == 0:
+            progress(93 + int(4 * k / len(sel)),
+                     f"SfM poses: carving silhouettes ({k}/{len(sel)})…")
+        m = cv2.imread(str(mask_dir / (names[i] + ".png")), cv2.IMREAD_GRAYSCALE)
+        if m is None:
+            continue
+        if kernel is not None:
+            m = cv2.erode(m, kernel)
+        if not m.any():
+            continue  # eroded to nothing: this view carries no constraint
+        h, w = m.shape
+        if m[0].any() or m[-1].any() or m[:, 0].any() or m[:, -1].any():
+            clipped += 1
+        vm = viewmats[i]
+        idx = np.flatnonzero(occ)
+        for c0 in range(0, len(idx), 4_000_000):  # bound peak memory
+            chunk = idx[c0:c0 + 4_000_000]
+            ijk = np.stack(np.unravel_index(chunk, (grid, grid, grid)), axis=1)
+            xyz = lo + ijk * step
+            cam = xyz @ vm[:3, :3].T + vm[:3, 3]
+            uv, front = _project(camera, cam)
+            u = np.rint(uv[:, 0]).astype(np.int64)
+            v = np.rint(uv[:, 1]).astype(np.int64)
+            good = front & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+            inside = np.zeros(len(chunk), bool)
+            inside[good] = m[v[good], u[good]] > 0
+            occ[chunk[~inside]] = False
+        if not occ.any():
+            raise SystemExit(
+                "--carve-seed: the silhouettes intersect in nothing. The poses "
+                "and the masks disagree, which means the solve is wrong rather "
+                "than the carve — check the turntable fit first."
+            )
+    if clipped:
+        print(
+            f"WARNING: the subject touches the frame edge in {clipped}/"
+            f"{len(sel)} carved views. Outside the image reads as outside the "
+            "subject, so the part that left the frame is carved away — "
+            "re-shoot with the subject fully inside every frame.",
+            flush=True,
+        )
+
+    vol = occ.reshape(grid, grid, grid)
+    interior = np.zeros_like(vol)
+    interior[1:-1, 1:-1, 1:-1] = (
+        vol[1:-1, 1:-1, 1:-1] & vol[:-2, 1:-1, 1:-1] & vol[2:, 1:-1, 1:-1]
+        & vol[1:-1, :-2, 1:-1] & vol[1:-1, 2:, 1:-1]
+        & vol[1:-1, 1:-1, :-2] & vol[1:-1, 1:-1, 2:]
+    )
+    surf = np.flatnonzero(vol & ~interior)
+    if not len(surf):
+        raise SystemExit("--carve-seed: the carved hull has no surface")
+    xyz = lo + np.stack(np.unravel_index(surf, (grid, grid, grid)), axis=1) * step
+    log(f"carved hull: {vol.sum():,} voxels, {len(xyz):,} on the surface "
+        f"({100 * vol.sum() / vol.size:.1f}% of the box)")
+
+    # Colour: a surface point is painted only by the views where it is the
+    # NEAREST hull point along its pixel's ray, so the far wall of the subject
+    # is not painted with the near wall's colour.
+    acc = np.zeros((len(xyz), 3), np.float64)
+    cnt = np.zeros(len(xyz), np.int64)
+    for k, i in enumerate(sel):
+        img = cv2.imread(str(images_dir / names[i]))
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        cam = xyz @ viewmats[i][:3, :3].T + viewmats[i][:3, 3]
+        uv, front = _project(camera, cam)
+        u = np.rint(uv[:, 0]).astype(np.int64)
+        v = np.rint(uv[:, 1]).astype(np.int64)
+        good = np.flatnonzero(front & (u >= 0) & (u < w) & (v >= 0) & (v < h))
+        if not len(good):
+            continue
+        pix = v[good] * w + u[good]
+        order = good[np.lexsort((cam[good, 2], pix))]
+        first = np.ones(len(order), bool)
+        first[1:] = np.diff(v[order] * w + u[order]) != 0
+        vis = order[first]
+        acc[vis] += img[v[vis], u[vis]][:, ::-1]  # BGR → RGB
+        cnt[vis] += 1
+    seen = cnt > 0
+    rgb = np.full((len(xyz), 3), 128, np.uint8)
+    rgb[seen] = np.clip(acc[seen] / cnt[seen, None], 0, 255).astype(np.uint8)
+    if (~seen).any():
+        log(f"carved hull: {int((~seen).sum()):,} points never faced a camera "
+            "— left grey")
+    return xyz, rgb
 
 
 # ── Stage D: loop closure ────────────────────────────────────────────
@@ -872,6 +1355,19 @@ def fit_turntable(viewmats):
 
     steps = np.diff(theta)
     forward = float((steps > 0).mean()) if len(steps) else 1.0
+    # How much of the turning actually GOT anywhere. A fold walks the subject
+    # forwards and back, so its net rotation is a small fraction of the total
+    # it travelled; a clean turn spends every degree making progress. Measured
+    # on the House capture: 0.06 folded against 1.00 for the same capture
+    # solved with --matching ordered.
+    #
+    # This replaces `monotonic` as the fold TEST. That metric counts the
+    # fraction of per-frame steps going the dominant way, which on a 219-frame
+    # solve is dominated by jitter on small steps: it read 0.87 for BOTH those
+    # solves, missing a 171 deg fold and libelling a clean one. It stays in the
+    # log because per-frame jitter is worth seeing, but it cannot gate.
+    total = float(np.abs(steps).sum())
+    directness = abs(float(theta[-1] - theta[0])) / total if total > 1e-9 else 1.0
     return {
         "axis": axis,
         "point": point,
@@ -879,6 +1375,7 @@ def fit_turntable(viewmats):
         "span": float(np.degrees(theta.max() - theta.min())),
         "radius": radius,
         "monotonic": max(forward, 1.0 - forward),
+        "directness": directness,
         "rms_pos": rms_pos / radius if radius > 0 else float("inf"),
         "rms_rot": float(np.degrees(rot_err).mean()),
     }
@@ -903,6 +1400,38 @@ def apply_turntable(viewmats, axis, point, theta):
     return np.array(out)
 
 
+def angular_sampling(angles, window: float = 30.0):
+    """How EVENLY the capture sampled the turn, as frames per ``window`` deg.
+
+    Coverage and sampling are different questions. A capture can go all the way
+    round and still starve one side, because a hand turn is never steady. MVS
+    does not need *a* view of a surface, it needs several consistent ones — a
+    depth survives only if enough neighbouring views corroborate it — so a thin
+    sector reconstructs badly even though nothing about it was occluded.
+
+    Measured on the House capture, which turned 411 deg yet lost most of one
+    roof slope: 71 frames in the densest 30 deg against 4 in the thinnest, and
+    the starved sectors averaged 608-660 sparse points per image against
+    1069-1287 in the well-sampled ones. The two roof slopes are identical
+    plywood seen from a camera at a constant 51.8 deg elevation, so nothing
+    about the SUBJECT could explain why one reconstructed and the other did
+    not — only how long the capture lingered on each.
+
+    The window is slid over the covered arc rather than binned, so the answer
+    does not depend on where bin edges happen to fall.
+    """
+    import numpy as np
+
+    a = np.sort(np.asarray(angles, float))
+    if len(a) < 3 or (a[-1] - a[0]) < window:
+        return {"min": len(a), "median": float(len(a)), "ratio": 1.0}
+    centres = np.arange(a[0] + window / 2, a[-1] - window / 2 + 1e-9, window / 6)
+    counts = np.array([int(np.sum(np.abs(a - c) <= window / 2)) for c in centres])
+    med = float(np.median(counts))
+    return {"min": int(counts.min()), "median": med,
+            "ratio": med / max(int(counts.min()), 1)}
+
+
 def report_turntable(viewmats, snap: bool):
     """Log the turntable fit, warn when the solve does not behave like one,
     and (with ``snap``) replace the poses with the fitted model."""
@@ -912,7 +1441,8 @@ def report_turntable(viewmats, snap: bool):
     log(
         f"turntable fit: {fit['span']:.0f} deg of subject rotation, "
         f"radius {fit['radius']:.2f} scene units, "
-        f"{100 * fit['monotonic']:.0f}% of steps turning the same way; "
+        f"{100 * fit['monotonic']:.0f}% of steps turning the same way, "
+        f"{100 * fit['directness']:.0f}% of the turning net; "
         f"model residual {100 * fit['rms_pos']:.1f}% of radius, "
         f"{fit['rms_rot']:.2f} deg"
     )
@@ -935,16 +1465,21 @@ def report_turntable(viewmats, snap: bool):
             "tripod) or the solve failed outright.",
             flush=True,
         )
-    elif fit["monotonic"] < 0.9:
+    elif fit["directness"] < 0.7:
         print(
-            f"WARNING: only {100 * fit['monotonic']:.0f}% of frames keep "
-            "turning the same way, so the solve has the subject rotating back "
-            "and forth — it has FOLDED, matching late frames onto early ones. "
+            f"WARNING: only {100 * fit['directness']:.0f}% of the rotation "
+            "gets anywhere — the subject turns forwards and back, so the "
+            "solve has FOLDED, matching late frames onto early ones. "
             "A turntable turns one way, so this is a solve failure, not a "
             "capture failure. It happens when the subject is symmetric or "
             "repetitively patterned and there is nothing else to key on: put "
             "a sheet of newspaper or a patterned cloth ON the turntable so it "
-            "rotates WITH the subject and gives it asymmetric detail.",
+            "rotates WITH the subject and gives it asymmetric detail — and if "
+            "you mask, keep that cloth INSIDE the mask (--mask-region around "
+            "the platter), or the masking throws away the very texture you "
+            "added. To rescue THIS capture without re-shooting, re-run with "
+            "--matching ordered: it matches only frames near each other in "
+            "time, which makes the fold structurally impossible.",
             flush=True,
         )
     elif fit["span"] < 270:
@@ -952,6 +1487,38 @@ def report_turntable(viewmats, snap: bool):
             f"WARNING: the subject only turned {fit['span']:.0f} deg, so the "
             "rest of it was never photographed — expect the unseen part to be "
             "missing or soft.",
+            flush=True,
+        )
+    # Reported separately from the fold/residual checks above, not as an
+    # alternative to them: a capture can be a perfect single-axis turn and
+    # still be sampled too unevenly to reconstruct.
+    samp = angular_sampling(fit["angles"])
+    log(f"angular sampling: {samp['median']:.0f} frames per 30 deg of turn "
+        f"(thinnest stretch {samp['min']})")
+    if samp["min"] < MIN_VIEWS_PER_30DEG:
+        # Two different faults share the symptom. A capture whose TYPICAL
+        # density is also thin was simply too short; one whose typical density
+        # is fine was turned unevenly, and only part of the subject suffers.
+        even = samp["median"] < MIN_VIEWS_PER_30DEG
+        print(
+            (f"WARNING: the whole turn is thinly sampled — about "
+             f"{samp['median']:.0f} frames per 30 deg, thinnest stretch "
+             f"{samp['min']}. "
+             if even else
+             f"WARNING: the turn was sampled UNEVENLY — the thinnest 30 deg "
+             f"of it has only {samp['min']} frames against a typical "
+             f"{samp['median']:.0f}. ")
+            + "Dense stereo keeps a depth only where enough neighbouring "
+            "views agree, so "
+            + ("the subject will come out holed all over"
+               if even else
+               "that stretch of the subject will come out holed while the "
+               "rest is clean")
+            + " even though it was photographed. "
+            + ("Shoot for longer, or raise --fps at ingest."
+               if even else
+               "Turn more slowly and STEADILY — a motorised turntable removes "
+               "this failure entirely."),
             flush=True,
         )
     if snap:
@@ -1085,9 +1652,12 @@ def main():
     p.add_argument(
         "--matching",
         default="auto",
-        choices=("auto", "sequential", "exhaustive", "vocabtree"),
+        choices=("auto", "ordered", "sequential", "exhaustive", "vocabtree"),
         help="feature-matching strategy (auto: sequential for video/ordered "
-        "captures, exhaustive for small unordered sets)",
+        "captures, exhaustive for small unordered sets). 'ordered' matches "
+        "only frames within --match-window of each other, which makes a FOLD "
+        "structurally impossible on a symmetric subject — use it when the "
+        "turntable fit reports the subject rotating back and forth.",
     )
     p.add_argument(
         "--vocab-tree",
@@ -1107,9 +1677,13 @@ def main():
         "--turntable",
         action="store_true",
         help="the SUBJECT rotated and the camera stayed put. Solves in the "
-        "subject's frame (implies --mask-subject, which is what makes that "
-        "frame the one SfM sees) and checks the result against the "
-        "single-axis model a turntable obeys. The masks are kept beside the "
+        "subject's frame and checks the result against the single-axis model "
+        "a turntable obeys. Implies --mask-subject, but note that masking to "
+        "the SUBJECT alone often hurts here: the platter co-rotates, so its "
+        "texture belongs to the same rigid body. Measured on a plywood house, "
+        "unmasked gave 219/219 frames against 162 and a collapsed 43 deg turn "
+        "for the same capture masked to a box around the subject. Prefer "
+        "--mask-region around the whole platter. Masks are kept beside the "
         "poses so training can exclude the background too.",
     )
     p.add_argument(
@@ -1130,7 +1704,20 @@ def main():
         "--mask-classes",
         default=None,
         help="comma-separated COCO class names for --mask-subject "
-        "(default: auto-detect the subject by vote across the capture)",
+        "(default: auto-detect the subject by vote across the capture). A "
+        "name the segmenter has no class for is rejected up front rather "
+        "than matching nothing; use --mask-region for a subject COCO cannot "
+        "name.",
+    )
+    p.add_argument(
+        "--mask-region",
+        default=None,
+        help="mask to a FIXED image region instead of a segmented class: "
+        "'x0,y0,x1,y1' for a box, or 'x0,y0,x1,y1,x2,y2,…' for a polygon, as "
+        "FRACTIONS of the frame (0,0 top-left). For --turntable subjects COCO "
+        "has no name for — a machine part, a casting — where --mask-classes "
+        "has nothing to ask for. Needs no torchvision, and may include the "
+        "platter so a patterned cloth laid on it survives into matching.",
     )
     p.add_argument(
         "--mask-dilate",
@@ -1138,6 +1725,31 @@ def main():
         default=15,
         help="grow each subject mask by this many pixels, keeping the "
         "silhouette keypoints that carry the outline (0 disables)",
+    )
+    p.add_argument(
+        "--match-window", type=int, default=20,
+        help="for --matching ordered: how many frames either side may match "
+        "(default 20). It must be wide enough for real overlap and narrower "
+        "than the angle at which the subject starts to look like itself "
+        "again — at 15 fps and a ~15 s turn, 20 frames is about 25 deg.",
+    )
+    p.add_argument(
+        "--carve-seed",
+        action="store_true",
+        help="seed the cloud from the subject SILHOUETTES as well as the "
+        "matched points: a turntable capture is a tomographic acquisition, "
+        "and a silhouette needs no texture, so the blank side of a subject "
+        "that yields no features still constrains its shape. Needs "
+        "--turntable with segmented masks; the hull cannot see concavities.",
+    )
+    p.add_argument(
+        "--carve-grid", type=int, default=256,
+        help="voxels per axis for --carve-seed (default 256)",
+    )
+    p.add_argument(
+        "--carve-views", type=int, default=72,
+        help="how many frames to carve with, spread over the capture "
+        "(default 72 — one every 5 deg of a full turn)",
     )
     p.add_argument(
         "--workspace",
@@ -1165,6 +1777,45 @@ def main():
         help="fail if SfM registers fewer than this fraction of frames",
     )
     args = p.parse_args()
+
+    # Parsed up front: a malformed region should cost nothing, not surface an
+    # hour into a run. Mutually exclusive with --mask-classes because they are
+    # two answers to the same question, and silently letting one win is the
+    # class of bug this option exists to remove.
+    if args.mask_region and args.mask_classes:
+        print(
+            "ERROR: --mask-region and --mask-classes both say what the "
+            "subject is — pass one. Use --mask-region when COCO has no name "
+            "for the subject, --mask-classes when it does.",
+            flush=True,
+        )
+        return 1
+    mask_region = parse_mask_region(args.mask_region) if args.mask_region else None
+    if args.carve_seed:
+        # Refused rather than warned: each of these makes the carve return
+        # something confidently wrong — the box, or a hull built on poses the
+        # silhouettes were never checked against.
+        if mask_region is not None:
+            print(
+                "ERROR: --carve-seed needs a segmented silhouette, and "
+                "--mask-region is a stated box. Carving against a box returns "
+                "the box. Use --mask-subject, or a segmenter that outlines "
+                "this subject.",
+                flush=True,
+            )
+            return 1
+        if not args.turntable:
+            print(
+                "ERROR: --carve-seed needs --turntable. The hull is only as "
+                "good as the poses, and the turntable fit is what checks "
+                "them; on a walk-around there is no such check.",
+                flush=True,
+            )
+            return 1
+        if not args.cloud_output:
+            print("ERROR: --carve-seed has nothing to write without "
+                  "--cloud-output", flush=True)
+            return 1
 
     import numpy as np
 
@@ -1250,21 +1901,47 @@ def main():
             log(f"capture is {'ordered' if _capture_is_ordered(scan) else 'unordered'}; "
                 f"matching {strategy} ({n_frames} frames)")
     mask_dir = None
-    if args.mask_subject or args.turntable:
+    if mask_region is not None or args.mask_subject or args.turntable:
         # Masks outlive the workspace: turntable training needs the same
         # per-frame masks the poses were solved from, and --keep-workspace is
         # off by default. Sitting beside the npz, they are found the way the
         # poses are.
         mask_dir = output.parent / (output.stem + "_masks")
-        classes = (
-            [c.strip() for c in args.mask_classes.split(",") if c.strip()]
-            if args.mask_classes
-            else None
-        )
-        progress(6, "SfM poses: segmenting the subject…")
-        build_subject_masks(images_dir, mask_dir, classes, args.mask_dilate)
+        if mask_region is not None:
+            if not args.turntable:
+                print(
+                    "WARNING: --mask-region keeps the SAME image region in "
+                    "every frame, which only follows the subject while the "
+                    "camera is fixed (--turntable). On a walk-around the "
+                    "subject travels through the frame and a fixed region "
+                    "will mask it away — use --mask-subject there.",
+                    flush=True,
+                )
+            progress(6, "SfM poses: masking the stated region…")
+            build_region_masks(images_dir, mask_dir, mask_region)
+        else:
+            classes = (
+                [c.strip() for c in args.mask_classes.split(",") if c.strip()]
+                if args.mask_classes
+                else None
+            )
+            progress(6, "SfM poses: segmenting the subject…")
+            # Explicit --mask-subject must fail if it cannot mask; --turntable
+            # alone only implies it, so it degrades to unmasked instead.
+            if build_subject_masks(images_dir, mask_dir, classes,
+                                   args.mask_dilate,
+                                   required=bool(args.mask_subject)) is None:
+                mask_dir = None
+    if strategy == "ordered" and not args.no_loop_closure:
+        # Stage D pairs frames that are spatially close in the SOLVED poses,
+        # which is exactly the long-range edge 'ordered' removed on purpose —
+        # and on a symmetric subject the folded pose is what makes two
+        # different sides look spatially close. Re-adding it undoes the fix.
+        log("ordered matching: loop closure disabled (it would re-add the "
+            "long-range pairs the fold needs)")
+        args.no_loop_closure = True
     extract_and_match(db, images_dir, model, params, strategy, args.vocab_tree,
-                      mask_dir)
+                      mask_dir, args.match_window)
 
     progress(38, "SfM poses: mapping (pass 1)…")
     rec = run_mapping(db, images_dir, ws / "sparse", "pass 1", refine,
@@ -1346,9 +2023,52 @@ def main():
     else:
         coverage = report_coverage(viewmats) if image_set else None
 
+    if image_set:
+        # The reconstruction outlives the workspace, for the same reason the
+        # masks do: dense stereo (process_dense.py) needs the sparse model,
+        # and the only other way back to it is re-running the whole solve.
+        # Sitting beside the npz, it is found the way the poses are.
+        sparse_out = output.parent / (output.stem + "_sparse")
+        shutil.rmtree(sparse_out, ignore_errors=True)
+        sparse_out.mkdir(parents=True, exist_ok=True)
+        rec.write(str(sparse_out))
+        log(f"sparse model kept for dense stereo → {sparse_out}")
+        if args.turntable_snap:
+            print(
+                "WARNING: --turntable-snap rewrote the exported poses but not "
+                "the sparse model, so a dense reconstruction from it will sit "
+                "in the UNSNAPPED frame. Re-run without --turntable-snap "
+                "before meshing.",
+                flush=True,
+            )
+
     # The seed cloud must come from the SAME reconstruction as the exported
     # poses, or the splat trains geometry against cameras that never saw it.
-    if args.cloud_output:
+    if args.cloud_output and args.carve_seed:
+        progress(92, "SfM poses: carving the silhouette hull…")
+        import cv2
+
+        sparse_xyz, sparse_rgb = _sparse_points(rec)
+        h, w = cv2.imread(str(images_dir / names[0])).shape[:2]
+        cam = pycolmap_camera(cam_model, cam_params, w, h)
+        hull_xyz, hull_rgb = carve_visual_hull(
+            mask_dir, images_dir, names, viewmats, cam, sparse_xyz,
+            grid=args.carve_grid, views=args.carve_views,
+            # Cancel the dilation the MATCHING masks carry: it is there to keep
+            # the outline keypoints, and it inflates the hull on every ray.
+            erode=args.mask_dilate,
+        )
+        # Both, not either: the matched points are metrically the better
+        # geometry wherever texture exists, and the hull is the only geometry
+        # at all where it does not.
+        n = _write_ply(
+            np.vstack([sparse_xyz, hull_xyz]),
+            np.vstack([sparse_rgb, hull_rgb]),
+            Path(args.cloud_output),
+        )
+        log(f"seed cloud: {n:,} points ({len(sparse_xyz):,} matched + "
+            f"{len(hull_xyz):,} carved) → {args.cloud_output}")
+    elif args.cloud_output:
         progress(92, "SfM poses: exporting the sparse seed cloud…")
         export_sparse_cloud(rec, Path(args.cloud_output))
 
