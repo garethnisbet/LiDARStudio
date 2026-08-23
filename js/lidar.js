@@ -595,7 +595,21 @@ export function initLidarPanel() {
   blurInput.addEventListener('input', fpsEstimate);
   // Re-probe whenever the folder changes or the panel is opened on it; a folder
   // that isn't a phone capture just leaves the estimate blank.
+  // showGen() re-probes when the type is 'ingest', and this now calls showGen()
+  // so the capture selector can follow the folder — which is a cycle. The guard
+  // breaks it after one pass rather than removing either call, since both are
+  // wanted: pick a folder and the panel must settle on the right branch.
+  let probing = false;
   const refreshVideoInfo = async () => {
+    if (probing) return;
+    probing = true;
+    try {
+      await probeScan();
+    } finally {
+      probing = false;
+    }
+  };
+  const probeScan = async () => {
     const scan = scanInput.value.trim();
     if (!scan) { videoInfo = null; fpsEstimate(); return; }
     try {
