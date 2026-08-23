@@ -757,8 +757,15 @@ def _mesh_cmd(scan, contents, cloud_file, output_file, options, sfm_poses=None):
         str(int(options.get("depth", 10))),
         "--density-quantile",
         str(float(options.get("density_quantile", 0.03))),
+        # An MVS mesh runs to millions of triangles — 2.28M verts / 4.5M tris
+        # and 167 MB on a 219-frame capture — which the viewer cannot open.
+        # The splat route never produced anything that big, so the default is
+        # per-route rather than global.
         "--decimate",
-        str(int(options.get("decimate", 0))),
+        str(int(options.get(
+            "decimate",
+            500_000 if str(cloud_file.name).startswith("dense_") else 0,
+        ))),
         "--outlier-neighbors",
         str(int(options.get("outlier_neighbors", 20))),
         "--outlier-std",
@@ -769,6 +776,10 @@ def _mesh_cmd(scan, contents, cloud_file, output_file, options, sfm_poses=None):
         str(int(options.get("smooth", 15))),
         "--colour-range",
         str(float(options.get("colour_range", 20.0))),
+        "--scale",
+        str(float(options.get("scale", 1.0))),
+        "--scale-longest",
+        str(float(options.get("scale_longest", 0.0))),
     ]
     if sfm_poses:
         cmd += ["--sfm-poses", str(sfm_poses)]

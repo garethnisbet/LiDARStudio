@@ -244,6 +244,17 @@ def main():
         "denoise that removes the Poisson 'cauliflower' texture.",
     )
     parser.add_argument("--colour-range", type=float, default=20.0)
+    parser.add_argument(
+        "--scale", type=float, default=1.0,
+        help="multiply the finished mesh by this factor (an SfM frame is "
+        "unitless, so a metric mesh has to be told its scale once)",
+    )
+    parser.add_argument(
+        "--scale-longest", type=float, default=0.0,
+        help="scale so the mesh's longest bounding-box side measures this "
+        "(e.g. 250 for 250 mm) — measure the real object once with a rule. "
+        "Applied on top of --scale; 0 disables.",
+    )
     args = parser.parse_args()
 
     # rosbags is only needed to read an IMAGE bag; a photogrammetry-only
@@ -390,6 +401,27 @@ def main():
                   flush=True)
 
     mesh.vertex_colors = o3d.utility.Vector3dVector(rgb.astype(np.float64) / 255.0)
+
+    # 5b. Scale. A phone capture's frame is UNITLESS — SfM has no way to know
+    # how big anything is — so a mesh destined for collision checking or any
+    # other metric use has to be told once. Measuring the object's longest
+    # dimension with a rule is the practical way to say it; a bare multiplier
+    # is there for when the factor is already known.
+    factor = float(args.scale)
+    if args.scale_longest > 0:
+        v = np.asarray(mesh.vertices)
+        longest = float((v.max(axis=0) - v.min(axis=0)).max()) if len(v) else 0.0
+        if longest <= 0:
+            raise SystemExit("--scale-longest: the mesh has no extent to scale")
+        factor *= args.scale_longest / longest
+        print(f"  scaling so the longest side is {args.scale_longest:g} "
+              f"(was {longest:.4f} scene units)", flush=True)
+    if factor != 1.0:
+        mesh.scale(factor, center=(0.0, 0.0, 0.0))
+        v = np.asarray(mesh.vertices)
+        ext = v.max(axis=0) - v.min(axis=0)
+        print(f"  scaled by {factor:.6g} — bounding box now "
+              f"{ext[0]:.3f} x {ext[1]:.3f} x {ext[2]:.3f}", flush=True)
 
     # 6. Write.
     progress(95, f"Writing {len(mesh.vertices):,} verts to {output.name}…")

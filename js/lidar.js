@@ -534,6 +534,11 @@ export function initLidarPanel() {
   const fpsOut = el('span', { class: 'muted', style: 'min-width:112px;text-align:right' }, '4 fps');
   const fpsHint = el('div', { class: 'muted', style: 'font-size:11px;margin:2px 0 6px' }, '');
   let videoInfo = null;   // {native_fps, frames, duration_s} of the scan's video
+  // 'image_set' | 'lidar_bag' | null. Several controls are capture-specific and
+  // are silently IGNORED by the other branch — subject masking has no meaning
+  // for a LiDAR room scan, and calibration/colour-range none for a phone — so
+  // the panel hides what cannot apply rather than offering a dead control.
+  let scanSource = null;
   const ordinal = (n) => {
     const suffix = (n % 100 >= 11 && n % 100 <= 13) ? 'th'
       : ({ 1: 'st', 2: 'nd', 3: 'rd' })[n % 10] || 'th';
@@ -570,8 +575,10 @@ export function initLidarPanel() {
     try {
       const r = await api('/api/scan/validate', { path: scan });
       videoInfo = ((r.contents || {}).images || {}).video_info || null;
-    } catch { videoInfo = null; }
+      scanSource = (r.contents || {}).source || null;
+    } catch { videoInfo = null; scanSource = null; }
     fpsEstimate();
+    showGen();
   };
   scanInput.addEventListener('change', refreshVideoInfo);
   const pIngest = el('div', {},
@@ -671,6 +678,20 @@ export function initLidarPanel() {
   // subject spins, so the reconstruction has to be solved in the subject's
   // frame — which is masking, plus a check against the one-axis model.
   const turntableCb = el('input', { type: 'checkbox' });
+  // A fixed image region instead of a segmented class, for a subject COCO has
+  // no name for. Box 'x0,y0,x1,y1' or a polygon, as fractions of the frame.
+  const maskRegionInput = el('input', { placeholder: 'none  e.g. 0.25,0.05,0.72,0.93' });
+  // Matcher. 'auto' picks ordered for a turntable (fold-proof), exhaustive for
+  // a small unordered set, sequential above 300 frames.
+  const matchingSel = el('select', {},
+    el('option', { value: 'auto' }, 'matching: auto'),
+    el('option', { value: 'ordered' }, 'ordered (fold-proof)'),
+    el('option', { value: 'exhaustive' }, 'exhaustive'),
+    el('option', { value: 'sequential' }, 'sequential'));
+  // Mesh-only: dense stereo resolution, decimation and metric scale.
+  const denseSizeInput = el('input', { type: 'number', step: '100', min: '400', max: '4000', value: '1600' });
+  const decimateInput = el('input', { type: 'number', step: '50000', min: '0', value: '500000' });
+  const scaleLongestInput = el('input', { type: 'number', step: '1', min: '0', value: '0' });
   // Repopulate the individual controls from a quality preset (1-based index).
   const applyQuality = (idx) => {
     const q = QUALITY[Math.min(QUALITY.length - 1, Math.max(0, idx - 1))];
@@ -761,6 +782,24 @@ export function initLidarPanel() {
         + '— tick “force SfM regeneration” above as well if this scan '
         + 'already has one. Needs torchvision in the SfM interpreter.',
         'Mask to subject')),
+
+    el('div', { class: 'row', style: 'align-items:center' },
+      el('label', { class: 'muted', style: 'flex:1' }, 'SfM poses', sfmInput),
+      infoIcon('Camera poses from Structure-from-Motion (COLMAP/GLOMAP, aligned to the '
+        + 'LiDAR frame). The single biggest quality lever (~+4 dB, walls-to-parity) — it '
+        + 'corrects per-frame camera drift. Leave empty for automatic handling: an '
+        + 'already-generated project pose file is reused, and a full-resolution '
+        + '(downscale 1) run generates one first if missing — a CPU-only step of an hour '
+        + 'or two, done once per scan and stored in the project’s sfm/ folder. '
+        + 'Downscale 2+ without a pose file uses the LiDAR-odometry poses. A path entered '
+        + 'here overrides all of that.', 'SfM poses')));
+  // Reconstruction controls: these drive SfM, which BOTH the splat job and the
+  // mesh job now run — a mesh on a fresh capture reconstructs it itself rather
+  // than making the user train a splat for the side effect. They lived in the
+  // splat-only panel until then, which meant a mesh could not be told its
+  // capture was a turntable, and so could not get fold-proof matching.
+  const hRecon = el('h4', { style: 'margin:10px 0 4px' }, 'Reconstruction (photo captures)');
+  const pRecon = el('div', {},
     el('div', { class: 'row', style: 'align-items:center' },
       el('label', { class: 'muted', style: 'flex:1;display:flex;align-items:center;gap:6px;white-space:nowrap' },
         turntableCb, 'turntable'),
@@ -788,15 +827,51 @@ export function initLidarPanel() {
         + 'sports ball, keyboard, mouse, cell phone, remote, scissors, toaster. '
         + 'Ignored unless one of those two boxes is ticked.', 'Subject class')),
     el('div', { class: 'row', style: 'align-items:center' },
-      el('label', { class: 'muted', style: 'flex:1' }, 'SfM poses', sfmInput),
-      infoIcon('Camera poses from Structure-from-Motion (COLMAP/GLOMAP, aligned to the '
-        + 'LiDAR frame). The single biggest quality lever (~+4 dB, walls-to-parity) — it '
-        + 'corrects per-frame camera drift. Leave empty for automatic handling: an '
-        + 'already-generated project pose file is reused, and a full-resolution '
-        + '(downscale 1) run generates one first if missing — a CPU-only step of an hour '
-        + 'or two, done once per scan and stored in the project’s sfm/ folder. '
-        + 'Downscale 2+ without a pose file uses the LiDAR-odometry poses. A path entered '
-        + 'here overrides all of that.', 'SfM poses')));
+      el('label', { class: 'muted', style: 'flex:1' }, 'mask region', maskRegionInput),
+      infoIcon('Mask to a FIXED image region instead of a segmented class, for a '
+        + 'subject COCO has no name for: a machine part, a casting, a laser-cut model. '
+        + 'Give a box "x0,y0,x1,y1" or a polygon "x0,y0,x1,y1,x2,y2..." as FRACTIONS '
+        + 'of the frame (0,0 is top-left). Only meaningful when the camera is fixed (a '
+        + 'turntable), since a fixed region only follows the subject while the camera '
+        + 'does not move. IMPORTANT: on a manual turntable draw it around the PLATTER, '
+        + 'not the subject \u2014 the platter co-rotates, so its texture is signal. '
+        + 'Masking tightly to the subject measured WORSE on a real capture: 162 frames '
+        + 'and a collapsed 43 deg turn, against 219 frames and 228 deg unmasked. Needs '
+        + 'no torchvision. Mutually exclusive with subject class.', 'Mask region')),
+    el('div', { class: 'row', style: 'align-items:center' },
+      matchingSel,
+      infoIcon('How image pairs are chosen for feature matching. "auto" picks ordered '
+        + 'for a turntable, exhaustive for a small unordered set, sequential above 300 '
+        + 'frames. "ordered" matches only frames near each other in TIME, which makes a '
+        + 'FOLD structurally impossible: on a symmetric subject a view of the back '
+        + 'matches the front, and the mapper is otherwise free to place a late frame at '
+        + 'an early frame\u2019s angle. Measured on a plywood model house, same '
+        + 'footage: exhaustive recovered 173 deg of a full turn with a 171 deg backward '
+        + 'jump; ordered recovered 411 deg cleanly, fitted the single-axis model 8x '
+        + 'better, and matched 5.7x faster. Note "sequential" is NOT fold-proof \u2014 '
+        + 'it deliberately reaches 1,2,4,8,16... frames out, which is the fold\u2019s '
+        + 'route back in.', 'Matching')));
+  const mLbl = (t, inp, info) =>
+    el('label', { class: 'muted', style: 'flex:1' }, t, infoIcon(info, t), inp);
+  const hMesh = el('h4', { style: 'margin:10px 0 4px' }, 'Mesh (photo captures)');
+  const pMesh = el('div', {},
+    el('div', { class: 'row' },
+      mLbl('stereo px', denseSizeInput,
+        'Long edge the dense-stereo depth maps are computed at. THE cost driver: '
+        + '219 frames took 2 h 07 at 1600 px and 41 min at 1000 px, roughly quadratic. '
+        + 'It also sets geometric detail, so drop it to ~1200 for a fast first look and '
+        + 'raise it once the capture is known good.'),
+      mLbl('decimate', decimateInput,
+        'Target triangle count for the finished mesh. Dense stereo produces millions '
+        + '\u2014 a 219-frame capture gave 4.5M triangles and 167 MB, which the viewer '
+        + 'cannot open \u2014 so the MVS route decimates to 500k by default. 0 keeps '
+        + 'everything, for export rather than viewing.'),
+      mLbl('longest mm', scaleLongestInput,
+        'Metric scale. A phone capture\u2019s frame is UNITLESS: SfM cannot know how '
+        + 'big anything is. Measure the object\u2019s longest dimension once with a '
+        + 'rule and enter it here, and the mesh is scaled so its longest bounding-box '
+        + 'side matches. 0 leaves it unitless. Needed for collision checking or any '
+        + 'other metric use.')));
   // Seed cloud: 'auto' uses the latest project cloud; any other entry pins the
   // splat to that exact cloud — e.g. an edited one.
   const seedSel = el('select', {}, el('option', { value: '' }, 'seed cloud: auto'));
@@ -811,6 +886,18 @@ export function initLidarPanel() {
     // Seed cloud applies to splats and meshes (both reconstruct from a cloud);
     // the trained-quality panel is splat-only; voxel is point-cloud-only.
     pSeed.style.display = (type === 'splat' || type === 'mesh') ? 'flex' : 'none';
+    // Both jobs run SfM, so both need the reconstruction controls — but only
+    // a photo capture has them: the LiDAR branch never passes masking or a
+    // matcher, so showing these on a LiDAR scan would be a dead control.
+    // Unknown source (folder not probed yet) shows them rather than hiding a
+    // control the user came for.
+    const photo = scanSource !== 'lidar_bag';
+    const recon = photo && (type === 'splat' || type === 'mesh');
+    pRecon.style.display = recon ? 'block' : 'none';
+    hRecon.style.display = recon ? 'block' : 'none';
+    const meshOpts = photo && type === 'mesh';
+    pMesh.style.display = meshOpts ? 'block' : 'none';
+    hMesh.style.display = meshOpts ? 'block' : 'none';
     pTrained.style.display = type === 'splat' ? 'block' : 'none';
     pVoxel.style.display = type === 'pointcloud' ? 'flex' : 'none';
     pMono.style.display = type === 'pointcloud' ? 'flex' : 'none';
@@ -998,11 +1085,29 @@ export function initLidarPanel() {
           ...(turntableCb.checked ? { turntable: true } : {}),
           ...((maskSubjectCb.checked || turntableCb.checked) && maskClassesInput.value.trim()
               ? { mask_classes: maskClassesInput.value.trim() } : {}),
+          ...(maskRegionInput.value.trim()
+              ? { mask_region: maskRegionInput.value.trim() } : {}),
+          ...(matchingSel.value !== 'auto' ? { matching: matchingSel.value } : {}),
           ...(seedSel.value ? { pointcloud: seedSel.value } : {}) }
       : type === 'mesh'
       // Surface-mesh defaults land the champion recipe (outlier-clean + Taubin
       // smooth); a chosen seed pins which cloud it reconstructs from.
       ? { depth: 10, smooth: 15, density_quantile: 0.03,
+          // The mesh job reconstructs the capture itself when it has to, so it
+          // needs every option SfM takes — without these a mesh on a fresh
+          // turntable capture would solve as an ordinary walk-around and fold.
+          ...(forceSfmCb.checked ? { force_sfm: true } : {}),
+          ...(maskSubjectCb.checked ? { mask_subject: true } : {}),
+          ...(turntableCb.checked ? { turntable: true } : {}),
+          ...((maskSubjectCb.checked || turntableCb.checked) && maskClassesInput.value.trim()
+              ? { mask_classes: maskClassesInput.value.trim() } : {}),
+          ...(maskRegionInput.value.trim()
+              ? { mask_region: maskRegionInput.value.trim() } : {}),
+          ...(matchingSel.value !== 'auto' ? { matching: matchingSel.value } : {}),
+          dense_max_image_size: parseInt(denseSizeInput.value) || 1600,
+          ...(decimateInput.value !== '' ? { decimate: parseInt(decimateInput.value) || 0 } : {}),
+          ...(parseFloat(scaleLongestInput.value) > 0
+              ? { scale_longest: parseFloat(scaleLongestInput.value) } : {}),
           ...(seedSel.value ? { pointcloud: seedSel.value } : {}) }
       : type === 'ingest'
       ? { max_edge: parseInt(edgeInput.value) || 2400,
@@ -1615,6 +1720,10 @@ export function initLidarPanel() {
         + 'reconstruction. ingest = prepare a phone-camera capture (photo folder or '
         + 'video) for photogrammetry; run it once, then choose splat.', 'Output type')),
     pSeed,
+    hRecon,
+    pRecon,
+    hMesh,
+    pMesh,
     pTrained,
     pVoxel,
     pMono,
@@ -1644,6 +1753,9 @@ export function initLidarPanel() {
       cap: capInput.value, dropBlurry: dropInput.value, undistortScale: usInput.value,
       anisoCap: anisoInput.value, patchSize: patchInput.value, depthLoss: depthInput.value,
       sfm: sfmInput.value,
+      maskRegion: maskRegionInput.value, matching: matchingSel.value,
+      denseSize: denseSizeInput.value, decimate: decimateInput.value,
+      scaleLongest: scaleLongestInput.value,
       editOp: editOp.value, factor: facInput.value,
       sorNb: sorNb.value, sorStd: sorStd.value,
       cropInvert: invCb.checked, regionLimit: regionCb.checked,
@@ -1661,6 +1773,9 @@ export function initLidarPanel() {
     setVal(capInput, 'cap'); setVal(dropInput, 'dropBlurry'); setVal(usInput, 'undistortScale');
     setVal(anisoInput, 'anisoCap'); setVal(patchInput, 'patchSize');
     setVal(depthInput, 'depthLoss'); setVal(sfmInput, 'sfm');
+    setVal(maskRegionInput, 'maskRegion'); setVal(matchingSel, 'matching');
+    setVal(denseSizeInput, 'denseSize'); setVal(decimateInput, 'decimate');
+    setVal(scaleLongestInput, 'scaleLongest');
     if (s.quality != null) qName.textContent = (QUALITY[parseInt(s.quality) - 1] || {}).name || '';
     setVal(editOp, 'editOp'); setVal(facInput, 'factor');
     setVal(sorNb, 'sorNb'); setVal(sorStd, 'sorStd');
