@@ -512,7 +512,33 @@ export function initLidarPanel() {
     if (sp.project) projectInput.value = sp.project;
     if (sp.scan) scanInput.value = sp.scan;
   } catch { /* ignore */ }
-  const typeSel = el('select', {}, ...['splat', 'pointcloud', 'mesh', 'ingest'].map(t => el('option', { value: t }, t)));
+  // What KIND of capture this scan is. The two branches share almost nothing:
+  // a LiDAR scan has no subject to segment and no photogrammetry to run, while
+  // a phone capture has no LiDAR bag, no calibration and no metric scale. Every
+  // control below belongs to one branch or the other, and the wrong branch's
+  // controls are silently ignored by the backend — so the panel offers only
+  // what the chosen capture can actually use.
+  // The two branches are different workflows, not variations on one, so the
+  // heading says which is selected rather than always claiming LiDAR.
+  const headTitle = el('span', {}, 'LiDAR Workflow');
+  const captureSel = el('select', {},
+    el('option', { value: 'lidar' }, 'capture: LiDAR scan'),
+    el('option', { value: 'photo' }, 'capture: Photo / camera'));
+  const typeSel = el('select', {});
+  // Output kinds each capture supports. 'ingest' prepares photos and has no
+  // LiDAR meaning; 'pointcloud' fuses a LiDAR bag and has no photo meaning
+  // (a phone capture's cloud comes out of the reconstruction instead).
+  const TYPES = {
+    lidar: [['pointcloud', 'pointcloud'], ['splat', 'splat'], ['mesh', 'mesh']],
+    photo: [['ingest', 'ingest (prepare photos)'], ['splat', 'splat'], ['mesh', 'mesh']],
+  };
+  const syncTypes = () => {
+    const want = TYPES[captureSel.value] || TYPES.lidar;
+    const cur = typeSel.value;
+    typeSel.replaceChildren(...want.map(([v, t]) => el('option', { value: v }, t)));
+    typeSel.value = want.some(([v]) => v === cur) ? cur : want[0][0];
+  };
+  syncTypes();
   const voxelInput = el('input', { type: 'number', step: '0.005', min: '0.005', value: '0.01' });
   // voxel is used only by the point-cloud job (splats are always GPU-trained).
   const lblVoxel = el('label', { class: 'muted', style: 'flex:1' }, 'voxel',
@@ -576,6 +602,12 @@ export function initLidarPanel() {
       const r = await api('/api/scan/validate', { path: scan });
       videoInfo = ((r.contents || {}).images || {}).video_info || null;
       scanSource = (r.contents || {}).source || null;
+      // Detected kind wins: the folder is the ground truth, and a user who
+      // picked the wrong one would otherwise get a job that cannot run.
+      if (scanSource === 'lidar_bag' || scanSource === 'image_set') {
+        captureSel.value = scanSource === 'lidar_bag' ? 'lidar' : 'photo';
+        syncTypes();
+      }
     } catch { videoInfo = null; scanSource = null; }
     fpsEstimate();
     showGen();
@@ -703,6 +735,18 @@ export function initLidarPanel() {
   qSlider.addEventListener('input', () => applyQuality(parseInt(qSlider.value)));
   const qLbl = (t, inp, info) =>
     el('label', { class: 'muted', style: 'flex:1' }, t, infoIcon(info, t), inp);
+  // LiDAR-only: the prior is anchored to the LiDAR cloud, so a phone
+  // capture has nothing for it to anchor to.
+  const rowDepthPrior = el('div', { class: 'row' },
+      qLbl('depth prior', depthInput,
+        'Weight of a monocular depth prior (Depth Anything V2, anchored to the LiDAR '
+        + 'cloud) pulling rendered depth toward the prediction — slightly crisper fine '
+        + 'detail. 0 = off; the ultra preset sets 0.05. WARNING: expect a much longer '
+        + 'run — the priors are computed per frame before training starts (~6 h for a '
+        + '780-frame full-res scan on an RTX 3090, plus a ~30 GB temporary cache on the '
+        + 'frame-cache disk); training itself adds the usual ~3 h after that. Needs the '
+        + "'transformers' package in the training interpreter; the first use downloads "
+        + 'the ~1.3 GB model.'));
   const pTrained = el('div', {},
     el('div', { class: 'row', style: 'align-items:center' },
       el('span', { class: 'muted', style: 'min-width:52px' }, 'quality'), qSlider, qName,
@@ -745,16 +789,9 @@ export function initLidarPanel() {
         + 'bounding GPU memory — but each step then only teaches the splats under the crop, '
         + 'so a 30k-step run at full resolution does ~10× less photometric work and comes out '
         + 'soft. 0 renders full frames (sharpest; auto-falls back to patches only if a step '
-        + 'runs out of GPU memory). Not changed by the quality slider.'),
-      qLbl('depth prior', depthInput,
-        'Weight of a monocular depth prior (Depth Anything V2, anchored to the LiDAR '
-        + 'cloud) pulling rendered depth toward the prediction — slightly crisper fine '
-        + 'detail. 0 = off; the ultra preset sets 0.05. WARNING: expect a much longer '
-        + 'run — the priors are computed per frame before training starts (~6 h for a '
-        + '780-frame full-res scan on an RTX 3090, plus a ~30 GB temporary cache on the '
-        + 'frame-cache disk); training itself adds the usual ~3 h after that. Needs the '
-        + "'transformers' package in the training interpreter; the first use downloads "
-        + 'the ~1.3 GB model.')),
+        + 'runs out of GPU memory). Not changed by the quality slider.')),
+    rowDepthPrior,
+
     el('div', { class: 'row', style: 'align-items:center' },
       el('label', { class: 'muted', style: 'flex:1;display:flex;align-items:center;gap:6px;white-space:nowrap' },
         forceSfmCb, 'force SfM regeneration'),
@@ -891,7 +928,8 @@ export function initLidarPanel() {
     // matcher, so showing these on a LiDAR scan would be a dead control.
     // Unknown source (folder not probed yet) shows them rather than hiding a
     // control the user came for.
-    const photo = scanSource !== 'lidar_bag';
+    const photo = captureSel.value === 'photo';
+    headTitle.textContent = photo ? 'Photogrammetry Workflow' : 'LiDAR Workflow';
     const recon = photo && (type === 'splat' || type === 'mesh');
     pRecon.style.display = recon ? 'block' : 'none';
     hRecon.style.display = recon ? 'block' : 'none';
@@ -899,12 +937,17 @@ export function initLidarPanel() {
     pMesh.style.display = meshOpts ? 'block' : 'none';
     hMesh.style.display = meshOpts ? 'block' : 'none';
     pTrained.style.display = type === 'splat' ? 'block' : 'none';
-    pVoxel.style.display = type === 'pointcloud' ? 'flex' : 'none';
-    pMono.style.display = type === 'pointcloud' ? 'flex' : 'none';
-    pHandle.style.display = type === 'pointcloud' ? 'flex' : 'none';
-    pIngest.style.display = type === 'ingest' ? 'block' : 'none';
+    const lidarCloud = !photo && type === 'pointcloud';
+    pVoxel.style.display = lidarCloud ? 'flex' : 'none';
+    pMono.style.display = lidarCloud ? 'flex' : 'none';
+    pHandle.style.display = lidarCloud ? 'flex' : 'none';
+    pIngest.style.display = (photo && type === 'ingest') ? 'block' : 'none';
+    // The depth prior is anchored to the LiDAR cloud, so it has nothing to
+    // anchor to on a phone capture.
+    rowDepthPrior.style.display = photo ? 'none' : 'flex';
     if (type === 'ingest') refreshVideoInfo();
   };
+  captureSel.addEventListener('change', () => { syncTypes(); showGen(); });
   typeSel.addEventListener('change', showGen);
   showGen();
   const barMsg = el('span', { class: 'ls-bar-msg' }, 'Starting…');
@@ -1714,6 +1757,14 @@ export function initLidarPanel() {
     el('h4', {}, 'Generate'),
     el('div', { class: 'muted' }, 'Scan folder (raw bags):'),
     el('div', { class: 'row' }, scanInput, scanBrowse),
+    el('div', { class: 'row', style: 'align-items:center' }, captureSel,
+      infoIcon('Which kind of capture this scan is. The two branches share almost '
+        + 'nothing: a LiDAR scan has a bag, a calibration and metric scale, and no '
+        + 'subject to segment; a phone capture has photos, needs photogrammetry to '
+        + 'recover its poses, and comes out UNITLESS. Choosing here hides the controls '
+        + 'and output kinds the other branch cannot use \u2014 they were previously '
+        + 'offered on both and silently ignored by one. Picking a scan folder sets this '
+        + 'automatically from what the folder actually contains.', 'Capture')),
     el('div', { class: 'row', style: 'align-items:center' }, typeSel,
       infoIcon('Output kind. splat = photoreal GPU-trained Gaussians (uses the quality '
         + 'slider below); pointcloud = raw coloured LiDAR points; mesh = surface '
@@ -1753,6 +1804,7 @@ export function initLidarPanel() {
       cap: capInput.value, dropBlurry: dropInput.value, undistortScale: usInput.value,
       anisoCap: anisoInput.value, patchSize: patchInput.value, depthLoss: depthInput.value,
       sfm: sfmInput.value,
+      capture: captureSel.value,
       maskRegion: maskRegionInput.value, matching: matchingSel.value,
       denseSize: denseSizeInput.value, decimate: decimateInput.value,
       scaleLongest: scaleLongestInput.value,
@@ -1773,6 +1825,7 @@ export function initLidarPanel() {
     setVal(capInput, 'cap'); setVal(dropInput, 'dropBlurry'); setVal(usInput, 'undistortScale');
     setVal(anisoInput, 'anisoCap'); setVal(patchInput, 'patchSize');
     setVal(depthInput, 'depthLoss'); setVal(sfmInput, 'sfm');
+    setVal(captureSel, 'capture'); syncTypes();
     setVal(maskRegionInput, 'maskRegion'); setVal(matchingSel, 'matching');
     setVal(denseSizeInput, 'denseSize'); setVal(decimateInput, 'decimate');
     setVal(scaleLongestInput, 'scaleLongest');
@@ -1803,7 +1856,7 @@ export function initLidarPanel() {
     const hidden = panel.style.display === 'none';
     panel.style.display = hidden ? 'block' : 'none';
     arrow.textContent = hidden ? '▾' : '▸';
-  } }, el('span', {}, 'LiDAR Workflow'), arrow);
+  } }, headTitle, arrow);
 
   const host = document.getElementById('panel') || document.body;
   host.insertBefore(panel, host.firstChild);
