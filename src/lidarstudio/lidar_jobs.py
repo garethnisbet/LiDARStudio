@@ -1036,10 +1036,13 @@ async def _job_mesh(project_path, scan_path, options, queue, job=None):
         has_splat = bool(
             sorted(splat_dir.glob(f"splat_{ts}*.ply")) if splat_dir.exists() else []
         )
+        # force_sfm has to win outright. It used to be consulted only on the
+        # stale branch, so once a sparse model existed the box did nothing —
+        # and a capture whose reconstruction is simply WRONG (rather than
+        # missing) is exactly when the user reaches for it.
+        force = bool(options.get("force_sfm"))
         stale = sfm_poses.exists() and not sparse_dir.is_dir()
-        if not sfm_poses.exists() or (
-            stale and (not has_splat or options.get("force_sfm"))
-        ):
+        if force or not sfm_poses.exists() or (stale and not has_splat):
             await queue.put(
                 {
                     "event": "log",
@@ -1057,7 +1060,7 @@ async def _job_mesh(project_path, scan_path, options, queue, job=None):
                 proj, scan, ts, contents, options, queue, job, True, "Meshing"
             ) is None:
                 return
-        elif stale and has_splat:
+        elif stale and has_splat:  # can't do stereo, but the splat can mesh
             await queue.put(
                 {
                     "event": "log",

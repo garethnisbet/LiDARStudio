@@ -228,3 +228,15 @@ def test_mesh_job_requires_ingest_first(tmp_path):
     events = _run_mesh(tmp_path / "proj", roll)
     errors = [e["message"] for e in events if e["event"] == "error"]
     assert errors and "has not been ingested" in errors[0]
+
+
+def test_force_sfm_rebuilds_even_when_a_sparse_model_exists(capture):
+    """It used to be consulted only when the sparse model was MISSING, so once
+    one existed the box did nothing — and a reconstruction that is wrong rather
+    than absent is exactly when it gets ticked."""
+    project, scan, ts = capture
+    (project / "sfm" / f"sfm_viewmats_{ts}_sparse").mkdir()
+
+    events = _run_mesh(project, scan, {"force_sfm": True})
+    msgs = [e.get("message", "") for e in events]
+    assert any("running SfM now" in m or "rebuilt" in m for m in msgs), msgs
