@@ -63,6 +63,27 @@ def _is_loopback_peer(remote) -> bool:
 
 
 @web.middleware
+async def no_cache_app_assets_mw(request, handler):
+    """Stop the browser serving stale front-end code.
+
+    The app's own HTML/JS/CSS change every time the server is restarted with new
+    code, and aiohttp's static handler sets no cache headers of its own — so a
+    returning browser happily reuses whatever it already has. That produced an
+    hour of debugging against a lidar.js the page was not running: the file on
+    disk had the fix, the tab did not, and "restart the server" fixed nothing
+    the user could see.
+
+    node_modules is deliberately left cacheable: it is large, and it only
+    changes when dependencies do.
+    """
+    resp = await handler(request)
+    path = request.path
+    if path == "/" or path.startswith("/js/") or path.endswith((".css", ".html")):
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return resp
+
+
+@web.middleware
 async def local_fs_api_guard_mw(request, handler):
     """Keep the LiDAR /api/* endpoints loopback-only unless --allow-remote-fs.
 
@@ -134,7 +155,8 @@ async def root_asset_handler(request):
 
 def create_app(allow_remote_fs=False):
     app = web.Application(
-        middlewares=[local_fs_api_guard_mw, cross_origin_isolation_mw],
+        middlewares=[no_cache_app_assets_mw, local_fs_api_guard_mw,
+                     cross_origin_isolation_mw],
         # Uploading a browser-imported cloud/splat for server-side editing
         # (POST /api/edit/import) sends the whole .ply as the request body;
         # trained splats run to 1-1.5 GB, so lift aiohttp's 1 MB default. This

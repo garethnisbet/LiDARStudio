@@ -806,6 +806,24 @@ export function initLidarPanel() {
         + 'runs out of GPU memory). Not changed by the quality slider.')),
     rowDepthPrior,
 
+
+    el('div', { class: 'row', style: 'align-items:center' },
+      el('label', { class: 'muted', style: 'flex:1' }, 'SfM poses', sfmInput),
+      infoIcon('Camera poses from Structure-from-Motion (COLMAP/GLOMAP, aligned to the '
+        + 'LiDAR frame). The single biggest quality lever (~+4 dB, walls-to-parity) — it '
+        + 'corrects per-frame camera drift. Leave empty for automatic handling: an '
+        + 'already-generated project pose file is reused, and a full-resolution '
+        + '(downscale 1) run generates one first if missing — a CPU-only step of an hour '
+        + 'or two, done once per scan and stored in the project’s sfm/ folder. '
+        + 'Downscale 2+ without a pose file uses the LiDAR-odometry poses. A path entered '
+        + 'here overrides all of that.', 'SfM poses')));
+  // Reconstruction controls: these drive SfM, which BOTH the splat job and the
+  // mesh job now run — a mesh on a fresh capture reconstructs it itself rather
+  // than making the user train a splat for the side effect. They lived in the
+  // splat-only panel until then, which meant a mesh could not be told its
+  // capture was a turntable, and so could not get fold-proof matching.
+  const hRecon = el('h4', { style: 'margin:10px 0 4px' }, 'Reconstruction (photo captures)');
+  const pRecon = el('div', {},
     el('div', { class: 'row', style: 'align-items:center' },
       el('label', { class: 'muted', style: 'flex:1;display:flex;align-items:center;gap:6px;white-space:nowrap' },
         forceSfmCb, 'force SfM regeneration'),
@@ -833,24 +851,6 @@ export function initLidarPanel() {
         + '— tick “force SfM regeneration” above as well if this scan '
         + 'already has one. Needs torchvision in the SfM interpreter.',
         'Mask to subject')),
-
-    el('div', { class: 'row', style: 'align-items:center' },
-      el('label', { class: 'muted', style: 'flex:1' }, 'SfM poses', sfmInput),
-      infoIcon('Camera poses from Structure-from-Motion (COLMAP/GLOMAP, aligned to the '
-        + 'LiDAR frame). The single biggest quality lever (~+4 dB, walls-to-parity) — it '
-        + 'corrects per-frame camera drift. Leave empty for automatic handling: an '
-        + 'already-generated project pose file is reused, and a full-resolution '
-        + '(downscale 1) run generates one first if missing — a CPU-only step of an hour '
-        + 'or two, done once per scan and stored in the project’s sfm/ folder. '
-        + 'Downscale 2+ without a pose file uses the LiDAR-odometry poses. A path entered '
-        + 'here overrides all of that.', 'SfM poses')));
-  // Reconstruction controls: these drive SfM, which BOTH the splat job and the
-  // mesh job now run — a mesh on a fresh capture reconstructs it itself rather
-  // than making the user train a splat for the side effect. They lived in the
-  // splat-only panel until then, which meant a mesh could not be told its
-  // capture was a turntable, and so could not get fold-proof matching.
-  const hRecon = el('h4', { style: 'margin:10px 0 4px' }, 'Reconstruction (photo captures)');
-  const pRecon = el('div', {},
     el('div', { class: 'row', style: 'align-items:center' },
       el('label', { class: 'muted', style: 'flex:1;display:flex;align-items:center;gap:6px;white-space:nowrap' },
         turntableCb, 'turntable'),
@@ -964,6 +964,10 @@ export function initLidarPanel() {
   captureSel.addEventListener('change', () => { syncTypes(); showGen(); });
   typeSel.addEventListener('change', showGen);
   showGen();
+  // The scan path is restored from localStorage while the controls are being
+  // built, which fires no 'change' event — so probe it once here or the panel
+  // opens on the wrong branch for every returning user.
+  refreshVideoInfo();
   const barMsg = el('span', { class: 'ls-bar-msg' }, 'Starting…');
   const barPct = el('span', { class: 'ls-bar-pct' }, '');
   const barLabel = el('div', { id: 'ls-bar-label' }, barMsg, barPct);
@@ -1850,6 +1854,11 @@ export function initLidarPanel() {
     if (typeof s.regionLimit === 'boolean') regionCb.checked = s.regionLimit;
     if (typeof s.showOutside === 'boolean') { visModeOutside = s.showOutside; updateVisLabels(); pushVisClip(); }
     showOp(); showGen();
+    // Probe the RESTORED scan folder. The auto-detect hangs off scanInput's
+    // 'change' event, which only fires on a manual edit — so without this the
+    // panel opens on whatever capture kind was last saved, and a photogrammetry
+    // project greets the user with "LiDAR Workflow" and pointcloud controls.
+    refreshVideoInfo();
     return true;
   }
   saveWfBtn.onclick = () => {
