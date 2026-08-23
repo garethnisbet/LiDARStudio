@@ -275,3 +275,17 @@ def test_a_window_wider_than_the_capture_is_just_exhaustive(tmp_path):
 def test_a_window_that_yields_no_pairs_is_refused(tmp_path):
     with pytest.raises(SystemExit, match="no pairs"):
         process_sfm.build_ordered_pairs(["0000.jpg"], 5, tmp_path / "p.txt")
+
+
+def test_a_turntable_capture_defaults_to_ordered_matching():
+    """The GUI exposes no matcher control, so the default is the only lever —
+    and on a turntable the fold is the characteristic failure. Measured on the
+    House capture: exhaustive 172.8 deg with a 171 deg backward jump, ordered
+    410.8 deg clean."""
+    assert process_sfm.choose_matching(219, turntable=True) == "ordered"
+    assert process_sfm.choose_matching(50, turntable=True) == "ordered"
+
+
+def test_a_non_turntable_capture_keeps_the_size_based_choice():
+    assert process_sfm.choose_matching(50) == "exhaustive"
+    assert process_sfm.choose_matching(500) == "sequential"

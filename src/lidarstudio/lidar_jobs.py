@@ -1010,24 +1010,54 @@ async def _job_mesh(project_path, scan_path, options, queue, job=None):
 
     if image_set:
         sfm_poses = proj / "sfm" / f"sfm_viewmats_{ts}.npz"
-        if not sfm_poses.exists():
-            # Run it here rather than sending the user to train a splat first.
-            # The mesh comes from dense stereo now, so a splat would be hours
-            # of work for a side effect — SfM is what this actually needs.
+        # Dense stereo needs the sparse model too, and reconstructions made
+        # before it was kept have only the npz. Both cases are the same job:
+        # run the reconstruction, rather than telling the user to do it. The
+        # mesh comes from dense stereo now, so sending them off to train a
+        # splat would be hours of GPU for a side effect.
+        sparse_dir = sfm_poses.parent / (sfm_poses.stem + "_sparse")
+        # Rebuilding is expensive AND destructive — it replaces the poses a
+        # trained splat was fitted against — so it is reserved for the case
+        # that would otherwise dead-end: no sparse model for stereo AND no
+        # splat to fall back on. A capture that still has its splat keeps the
+        # fast route unless --force-sfm asks for the better one.
+        splat_dir = proj / "splats"
+        has_splat = bool(
+            sorted(splat_dir.glob(f"splat_{ts}*.ply")) if splat_dir.exists() else []
+        )
+        stale = sfm_poses.exists() and not sparse_dir.is_dir()
+        if not sfm_poses.exists() or (
+            stale and (not has_splat or options.get("force_sfm"))
+        ):
             await queue.put(
                 {
                     "event": "log",
                     "message": (
                         f"No reconstruction for '{ts}' yet — running SfM now. "
-                        "It is a one-off per capture, and the splat job "
-                        "reuses the same result."
-                    ),
+                        if not sfm_poses.exists() else
+                        f"The reconstruction for '{ts}' predates dense stereo "
+                        "and has no sparse model, so it is being rebuilt "
+                        "(this REPLACES the existing poses). "
+                    ) + "It is a one-off per capture, and the splat job "
+                    "reuses the same result."
                 }
             )
             if await _run_image_set_sfm(
-                proj, scan, ts, contents, options, queue, job, False, "Meshing"
+                proj, scan, ts, contents, options, queue, job, True, "Meshing"
             ) is None:
                 return
+        elif stale and has_splat:
+            await queue.put(
+                {
+                    "event": "log",
+                    "message": (
+                        "This reconstruction predates dense stereo, so the "
+                        "mesh will come from the splat's points. Re-run the "
+                        "reconstruction (or tick 'rebuild') for the sharper "
+                        "MVS route."
+                    ),
+                }
+            )
         if seed_p:
             cloud_file = seed_p
         else:

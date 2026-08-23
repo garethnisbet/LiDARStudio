@@ -169,8 +169,19 @@ def camera_prior(scan: Path, camera: str):
     return "SIMPLE_RADIAL", None
 
 
-def choose_matching(n_images: int) -> str:
+def choose_matching(n_images: int, turntable: bool = False) -> str:
     """Pick a matching strategy.
+
+    A TURNTABLE capture takes 'ordered' regardless of size. It is ordered video
+    by definition, and the fold is its characteristic failure — a symmetric
+    subject lets the mapper place a view of the back at the front's angle, and
+    no amount of feature evidence can rule that out. Restricting matches to a
+    frame window makes that structurally impossible. Measured on a plywood
+    model house, same footage: exhaustive returned 172.8 deg of a full turn
+    with a 171 deg backward jump, ordered returned 410.8 deg cleanly, with a
+    tighter single-axis fit (rms_rot 0.32 vs 2.78 deg) and 5.7x less matching.
+    The cost is that the turn's ends never meet, so the arc drifts rather than
+    closing — much the cheaper error, and what the single-axis fit regularises.
 
     Exhaustive matching is affordable below a few hundred images (it is
     quadratic in image count) and strictly stronger than sequential, because it
@@ -188,6 +199,8 @@ def choose_matching(n_images: int) -> str:
     which reaches distant frames through the quadratic overlap and leans on the
     loop-closure pass (stage D) to join the ends.
     """
+    if turntable:
+        return "ordered"
     return "exhaustive" if n_images < 300 else "sequential"
 
 
@@ -1896,7 +1909,7 @@ def main():
     refine = params is None
     strategy = args.matching
     if strategy == "auto":
-        strategy = choose_matching(n_frames)
+        strategy = choose_matching(n_frames, bool(args.turntable))
         if image_set:
             log(f"capture is {'ordered' if _capture_is_ordered(scan) else 'unordered'}; "
                 f"matching {strategy} ({n_frames} frames)")

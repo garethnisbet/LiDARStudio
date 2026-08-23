@@ -174,13 +174,30 @@ def test_splat_export_is_reused_when_fresh_and_rebuilt_when_stale(capture):
     assert cloud.stat().st_mtime_ns != stamp
 
 
-def test_mesh_job_without_a_splat_says_to_train_one(capture):
+def test_no_splat_and_no_sparse_model_rebuilds_rather_than_dead_ending(capture):
+    """The case that used to strand a user: an npz too old to carry a sparse
+    model, so stereo cannot run, and no splat to fall back on either. Rebuild
+    it — that is the only route to a mesh, and telling them to train a splat
+    would be hours of GPU for a side effect."""
     project, scan, ts = capture
     (project / "splats" / f"splat_{ts}.ply").unlink()
 
     events = _run_mesh(project, scan)
-    errors = [e["message"] for e in events if e["event"] == "error"]
-    assert errors and "train one first" in errors[0]
+    msgs = [e.get("message", "") for e in events]
+    assert any("predates dense stereo" in m for m in msgs), msgs
+    assert not any("train one first" in m for m in msgs)
+
+
+def test_an_existing_splat_is_not_thrown_away_for_a_rebuild(capture):
+    """Rebuilding replaces the poses the splat was fitted against and costs
+    hours, so a capture that can still mesh the fast way does."""
+    project, scan, ts = capture  # fixture has a splat, npz, but no sparse model
+
+    events = _run_mesh(project, scan, {"depth": 6, "smooth": 5})
+    msgs = [e.get("message", "") for e in events]
+    assert any("mesh will come from the splat's points" in m for m in msgs), msgs
+    assert not any("running SfM now" in m for m in msgs)
+    assert not [e for e in events if e["event"] == "error"], events
 
 
 def test_mesh_job_runs_sfm_itself_when_there_are_no_poses(capture):
