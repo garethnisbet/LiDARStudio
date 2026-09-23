@@ -203,28 +203,34 @@ def _dynamic_mask_png(img_bgr, K, viewmat, box, canon_pts=None):
 
 
 def _frame_cache_root(explicit=None, need_bytes=0):
-    """Pick a directory on a real disk with room for the frame cache. The default
-    temp dir is often small (or tmpfs = RAM, which would defeat the purpose), so
-    prefer an explicit dir / $LIDARSTUDIO_FRAME_CACHE, then the biggest-free of a
-    few real-disk candidates. Never a Dropbox-synced path (would trigger a sync)."""
-    cands = [explicit, os.environ.get("LIDARSTUDIO_FRAME_CACHE")]
-    cands += ["/FastDrive", tempfile.gettempdir(), str(Path.home())]
-    usable = []
-    for c in cands:
-        if not c or not os.path.isdir(c) or not os.access(c, os.W_OK):
-            continue
-        if "dropbox" in c.lower():
-            continue
-        try:
-            free = shutil.disk_usage(c).free
-        except OSError:
-            continue
-        if c in (explicit, os.environ.get("LIDARSTUDIO_FRAME_CACHE")) and free > need_bytes:
-            return c  # honour an explicit choice that fits
-        usable.append((free, c))
-    if not usable:
-        return tempfile.gettempdir()
-    return max(usable)[1]  # most free space
+    """The directory the frame/depth caches go in: the explicit dir, else
+    $LIDARSTUDIO_FRAME_CACHE. Never the system temp dir — /tmp is often small
+    (or tmpfs = RAM, which would defeat the purpose), so callers point this at
+    the project's cache/ subfolder. Created if missing, and marked
+    Dropbox-ignored so a project inside a synced folder doesn't upload GBs of
+    throwaway frames."""
+    root = explicit or os.environ.get("LIDARSTUDIO_FRAME_CACHE")
+    if not root:
+        raise ValueError(
+            "no frame cache dir: pass --frame-cache-dir or set "
+            "$LIDARSTUDIO_FRAME_CACHE"
+        )
+    os.makedirs(root, exist_ok=True)
+    try:
+        os.setxattr(root, "user.com.dropbox.ignored", b"1")
+    except (AttributeError, OSError):
+        pass  # no xattr support (non-Linux / filesystem) — harmless
+    try:
+        free = shutil.disk_usage(root).free
+        if need_bytes and free < need_bytes:
+            print(
+                f"  WARNING: cache dir {root} has {free / 1e9:.1f} GB free, "
+                f"needs ~{need_bytes / 1e9:.1f} GB",
+                flush=True,
+            )
+    except OSError:
+        pass
+    return root
 
 
 def _image_set_intrinsics(sfm_poses):
@@ -1702,8 +1708,9 @@ def main():
     p.add_argument(
         "--frame-cache-dir",
         default=None,
-        help="directory for the --memmap-frames cache (default: auto-pick a real "
-        "disk with the most free space; honours $LIDARSTUDIO_FRAME_CACHE).",
+        help="directory for the --memmap-frames / depth-prior caches (default: "
+        "$LIDARSTUDIO_FRAME_CACHE, else a cache/ subfolder of the project the "
+        "--output lives in).",
     )
     p.add_argument(
         "--patch-size",
@@ -1889,6 +1896,10 @@ def main():
 
     scan = Path(args.scan)
     out = Path(args.output)
+    if not args.frame_cache_dir and not os.environ.get("LIDARSTUDIO_FRAME_CACHE"):
+        # <project>/splats/splat_x.ply → <project>/cache
+        proj = out.parent.parent if out.parent.name == "splats" else out.parent
+        args.frame_cache_dir = str(proj / "cache")
     pc = Path(args.pointcloud) if args.pointcloud else None
     out.parent.mkdir(parents=True, exist_ok=True)
 

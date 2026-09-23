@@ -2006,6 +2006,9 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
         # On-disk frame cache: the undistorted uint8 frames can exceed host RAM
         # at downscale-1 / high undistort-scale; memmap them so RSS stays flat.
         "--memmap-frames",
+        # Frame + depth caches live in the project, never the system /tmp.
+        "--frame-cache-dir",
+        str(proj / "cache"),
     ]
     if sfm_poses:
         cmd += ["--sfm-poses", sfm_poses]
