@@ -17,7 +17,7 @@ uv sync                                  # create .venv and install lidarstudio 
 uv run lidarstudio                       # start the server
 ```
 
-Generation needs the pipeline extra (`uv sync --extra pipeline` — open3d, kiss-icp, rosbags, OpenCV, scipy; the trained-splat mode additionally needs CUDA + torch + gsplat). Editing/serving alone needs no extras.
+Generation needs the pipeline extra (`uv sync --extra pipeline` — Open3D (point-cloud processing), kiss-icp, rosbags, OpenCV, scipy; the trained-splat mode additionally needs CUDA + torch + gsplat). Editing/serving alone needs no extras.
 
 Open `http://localhost:8080` and use the **LiDAR Workflow** panel.
 
