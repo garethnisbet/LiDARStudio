@@ -361,3 +361,59 @@ def test_an_explicit_mask_subject_still_refuses(frames, tmp_path):
             frames, tmp_path / "masks", required=True,
             detector=lambda p: [("dog", 0.99, _blob())],
         )
+
+
+def _seen_on(names, label="clock"):
+    """A detector that finds ``label`` only on the named frames.
+
+    This is what an unnameable subject actually looks like to COCO: not
+    silence, but a confident detection on the FACES that happen to resemble
+    something it knows — so the hits arrive in an arc, not scattered.
+    """
+    return lambda p: (
+        [(label, 0.99, _blob())] if p.name in names else []
+    )
+
+
+def test_a_class_seen_on_a_minority_of_frames_is_not_the_subject(
+    frames, tmp_path, capsys
+):
+    """The plywood house: Mask R-CNN read its round gable window as a 'clock'
+    on the two gable faces and nothing on the sides, winning the vote with
+    3/12. Masking then fired on those arcs alone, thinning the dense cloud
+    everywhere else — worse than not masking, which solved 219/219 frames over
+    410.8 deg against 192/199 over 382.6 deg."""
+    got = process_sfm.build_subject_masks(
+        frames, tmp_path / "masks", required=False,
+        detector=_seen_on({"0000.jpg"}),
+    )
+    assert got is None, "a one-in-five class must not become the subject"
+    out = capsys.readouterr().out
+    assert "being solved UNMASKED" in out
+    assert "'clock'" in out and "1/5" in out, \
+        "the warning must name the class and its share, not just say 'none'"
+    assert not (tmp_path / "masks").exists()
+
+
+def test_a_minority_class_refuses_when_masking_was_asked_for(frames, tmp_path):
+    """--mask-subject is explicit, so it fails loudly rather than degrading —
+    and says which class fell short, since --mask-classes is the fix."""
+    with pytest.raises(SystemExit, match="'clock'"):
+        process_sfm.build_subject_masks(
+            frames, tmp_path / "masks", required=True,
+            detector=_seen_on({"0000.jpg"}),
+        )
+
+
+def test_a_class_carrying_most_of_the_capture_is_still_the_subject(
+    frames, tmp_path
+):
+    """The threshold must not reject a real subject that the detector merely
+    misses on a frame or two — the mug turntable voted 12/12, and 3/5 clears
+    MASK_VOTE_SHARE with room to spare."""
+    missing = process_sfm.build_subject_masks(
+        frames, tmp_path / "masks", dilate=0,
+        detector=_seen_on({"0000.jpg", "0001.jpg", "0002.jpg"}),
+    )
+    assert missing == 2, "the two frames it missed stay all-pass"
+    assert (tmp_path / "masks" / "0000.jpg.png").exists()

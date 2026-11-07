@@ -89,6 +89,20 @@ SUBJECT_CLASSES = (
 )
 MASK_SCORE = 0.5  # instance-segmentation confidence floor
 MASK_VOTE_FRAMES = 12  # frames sampled to choose the subject class
+# Share of the sampled frames the winning class must carry to BE the subject.
+# A plurality is not enough: a subject COCO cannot name still draws stray
+# detections, and the ones it draws are angularly clustered, because what
+# fooled the detector is one FACE rather than the object. On the plywood-house
+# turntable Mask R-CNN read the round gable window as a 'clock' (0.69-0.79 on
+# the two gable faces, nothing on the sides) and won with 3/12. Masking then
+# fired on the gable arcs alone: 76% of frames got an all-pass mask, 21% a real
+# one, and 7 were blacked out almost entirely. Coverage that is uneven AROUND
+# THE ROTATION is worse than no masking at all, since it thins the dense cloud
+# on the arcs it skips — the same capture solved unmasked registered 219/219
+# frames over 410.8 deg, against 192/199 over 382.6 deg under those masks. A
+# subject the detector can really see is visible from every angle and clears
+# this easily: the mug turntable voted 12/12.
+MASK_VOTE_SHARE = 0.5
 
 # How far the single-axis turntable model may miss the solved poses before the
 # capture is called "not a turntable". A jittered synthetic turntable fits to
@@ -384,7 +398,21 @@ def build_subject_masks(images_dir: Path, mask_dir: Path, classes=None,
                     best, best_score = label, score
             if best:
                 votes[best] = votes.get(best, 0) + 1
-        if not votes:
+        sampled = min(len(frames), MASK_VOTE_FRAMES)
+        winner = max(votes, key=votes.get) if votes else None
+        if not votes or votes[winner] < MASK_VOTE_SHARE * sampled:
+            # Why the vote failed, phrased for whoever has to act on it: an
+            # outright miss and a class that scraped a plurality need
+            # different fixes, and "no recognisable subject" would be a lie
+            # about the second.
+            why = (
+                f"no recognisable subject to mask (looked for: "
+                f"{', '.join(SUBJECT_CLASSES)})"
+                if not votes else
+                f"no subject recognisable across the capture — '{winner}' led "
+                f"the vote but carried only {votes[winner]}/{sampled} sampled "
+                f"frames, which is one FACE of something rather than a subject"
+            )
             if not required:
                 # --turntable IMPLIES masking rather than asking for it, and a
                 # subject COCO cannot name is not a reason to refuse the run:
@@ -392,8 +420,7 @@ def build_subject_masks(images_dir: Path, mask_dir: Path, classes=None,
                 # frames and a 228 deg turn against 162 and 43 deg for the same
                 # capture masked to a fixed region. Say so and carry on.
                 print(
-                    "WARNING: no recognisable subject to mask (looked for: "
-                    f"{', '.join(SUBJECT_CLASSES)}), so this turntable is "
+                    f"WARNING: {why}, so this turntable is "
                     "being solved UNMASKED. That is often fine, and on a "
                     "manual turntable it is often BETTER: the platter "
                     "co-rotates with the subject, so its texture is signal. "
@@ -410,14 +437,12 @@ def build_subject_masks(images_dir: Path, mask_dir: Path, classes=None,
                     pass
                 return None
             raise SystemExit(
-                "--mask-subject found no recognisable subject in this capture "
-                f"(looked for: {', '.join(SUBJECT_CLASSES)}). Pass "
+                f"--mask-subject found {why}. Pass "
                 "--mask-classes with the COCO class name of the subject, "
                 "--mask-region with a box around it, or drop --mask-subject."
             )
-        wanted = {max(votes, key=votes.get)}
-        log(f"masking subject class '{next(iter(wanted))}' "
-            f"({votes[next(iter(wanted))]}/{min(len(frames), MASK_VOTE_FRAMES)} votes)")
+        wanted = {winner}
+        log(f"masking subject class '{winner}' ({votes[winner]}/{sampled} votes)")
 
     kernel = np.ones((dilate, dilate), np.uint8) if dilate > 0 else None
     kept, missing = [], 0
