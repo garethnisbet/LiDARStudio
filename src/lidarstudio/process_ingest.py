@@ -228,6 +228,37 @@ def _iter_stills(files):
         yield i * 1_000_000, _load_still(p), p.name, focal, ts
 
 
+def blurry_drops(scores, frac: float) -> set:
+    """Indices of the frames the sharpness filter removes: the bottom ``frac``
+    by sharpness, except that no two NEIGHBOURING frames are ever both dropped.
+
+    Blur is not spread evenly through a capture. It bunches up where the
+    camera moves fastest, and that is usually a doorway or a turn, which is
+    exactly where consecutive frames are the only thing linking one part of
+    the scene to the next. A plain quantile cut removes the whole stretch. On
+    the Clinic walk-through it deleted 8 frames in a row (2 s of video) at the
+    doorway into the room, the room frames then had zero matches to the
+    hallway, and SfM kept the hallway alone: 203/262 frames, room missing.
+    Keeping every other frame of a blurry run keeps the chain intact, while
+    still thinning the blur out of training.
+    """
+    import numpy as np
+
+    scores = np.asarray(scores, dtype=float)
+    if frac <= 0 or len(scores) == 0:
+        return set()
+    cut = float(np.quantile(scores, frac))
+    dropped = set()
+    # Blurriest first, so a run keeps its sharper half.
+    for i in np.argsort(scores, kind="stable"):
+        i = int(i)
+        if scores[i] >= cut:
+            break
+        if (i - 1) not in dropped and (i + 1) not in dropped:
+            dropped.add(i)
+    return dropped
+
+
 def ingest(src: Path, out_dir: Path, max_edge: int, fps: float, drop_blurry: float):
     import cv2
     import numpy as np
@@ -297,7 +328,8 @@ def ingest(src: Path, out_dir: Path, max_edge: int, fps: float, drop_blurry: flo
     if drop_blurry > 0 and len(rows) > REC_FRAMES:
         scores = np.array([float(r["sharpness"]) for r in rows])
         cut = float(np.quantile(scores, drop_blurry))
-        keep = [r for r in rows if float(r["sharpness"]) >= cut]
+        dropped = blurry_drops(scores, drop_blurry)
+        keep = [r for i, r in enumerate(rows) if i not in dropped]
         if len(keep) >= REC_FRAMES:
             kept_names = {r["name"] for r in keep}
             for r in rows:

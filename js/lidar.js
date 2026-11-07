@@ -984,6 +984,12 @@ export function initLidarPanel() {
       } catch (e) { console.error('copy failed', e); }
     } }, '📋');
   const logWrap = el('div', { id: 'ls-log-wrap' }, logBox, logCopyBtn);
+  // WARNING lines from the job, kept in view for the rest of the run: in the
+  // scrolling log a warning from the pose solve is buried by the time a long
+  // training run finishes, which is exactly when it matters.
+  const warnBox = el('div', { style: 'display:none; margin-top:6px; padding:6px 8px; '
+    + 'border:1px solid #a87b1e; border-radius:4px; background:#3a2c0e; color:#f3d48a; '
+    + 'font-size:11px; white-space:pre-wrap; max-height:180px; overflow-y:auto' });
   const genBtn = el('button', { class: 'act' }, 'Generate');
   // Stop button: interrupts the running job (shown only while one runs).
   const stopBtn = el('button', { class: 'act', style: 'display:none;background:#a33' }, 'Stop');
@@ -1020,6 +1026,10 @@ export function initLidarPanel() {
       barMsg.textContent = msg;
       logWrap.style.display = 'block';
       logBox.textContent = msg + '\n' + logBox.textContent;
+      if (/^\s*WARNING:/.test(msg)) {
+        warnBox.style.display = 'block';
+        warnBox.textContent += (warnBox.textContent ? '\n\n' : '') + msg.trim();
+      }
     }
   };
   // Reset the bar to a clean indeterminate state at the start of a new job.
@@ -1027,6 +1037,7 @@ export function initLidarPanel() {
     lastPct = null;
     barFill.style.width = '0%'; barFill.classList.remove('indeterminate');
     barPct.textContent = ''; barMsg.textContent = 'Starting…';
+    warnBox.textContent = ''; warnBox.style.display = 'none';
   };
 
   // ── Bag media viewer: one large closable floating panel over the main
@@ -1798,7 +1809,7 @@ export function initLidarPanel() {
     pMono,
     pHandle,
     pIngest,
-    genBtn, stopBtn, barLabel, barWrap, logWrap,
+    genBtn, stopBtn, barLabel, barWrap, warnBox, logWrap,
     el('h4', {}, 'Scan photos'),
     pPhotos,
     el('h4', {}, 'LiDAR sweeps'),

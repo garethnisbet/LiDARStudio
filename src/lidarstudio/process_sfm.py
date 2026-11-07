@@ -803,6 +803,237 @@ def run_mapping(db: Path, images_dir: Path, sparse_dir: Path, label: str,
     return best
 
 
+# A solve that registers less than this share of the frames has fragmented:
+# the mapper built several pieces and run_mapping kept only the largest.
+FRAGMENTED_FRAC = 0.95
+# A mapper that registers less than this share of its rival's frames is not a
+# candidate, however consistent: a small easy subset always scores well.
+MIN_COVERAGE_VS_RIVAL = 0.8
+# Below this gap in median rotation error the two solves are equally good,
+# and the one that registered more frames wins.
+ROT_TIE_DEG = 0.25
+
+
+def two_view_rotation_pairs(db: Path, max_pairs: int = 1500,
+                            min_inliers: int = 50, seed: int = 0):
+    """Sample matched pairs from the database for :func:`rotation_disagreement`:
+    ``[(name_a, name_b, keypoints_a, keypoints_b)]`` holding each pair's
+    geometrically verified inlier matches.
+
+    These are the raw evidence BOTH mappers were given, so they can referee
+    between them. COLMAP does not store relative poses in this database, so
+    the rotation is re-estimated per pair from these points.
+    """
+    import random
+    import sqlite3
+
+    import numpy as np
+
+    con = sqlite3.connect(str(db))
+    try:
+        names = dict(con.execute("SELECT image_id, name FROM images"))
+        kps = {
+            i: np.frombuffer(d, np.float32).reshape(r, c)[:, :2]
+            for i, r, c, d in con.execute(
+                "SELECT image_id, rows, cols, data FROM keypoints")
+        }
+        rows = list(con.execute(
+            "SELECT pair_id, rows, data FROM two_view_geometries "
+            "WHERE rows >= ?", (min_inliers,)))
+    finally:
+        con.close()
+    random.Random(seed).shuffle(rows)
+    big = 2147483647  # COLMAP's pair_id = id1 * big + id2
+    out = []
+    for pid, n, data in rows[:max_pairs]:
+        a, b = pid // big, pid % big
+        m = np.frombuffer(data, np.uint32).reshape(n, 2)
+        out.append((names[a], names[b], kps[a][m[:, 0]], kps[b][m[:, 1]]))
+    return out
+
+
+def rotation_disagreement(rec, pairs):
+    """Median angle (deg) between each pair's relative rotation in ``rec`` and
+    the one its own matches give on their own, over the pairs ``rec`` registered
+    both frames of. Returns ``(median_deg, n_pairs)``, or ``(inf, 0)``.
+
+    Reprojection error cannot tell a bent solve from a straight one: on the
+    Clinic walk-through incremental mapping scored 0.93 px and GLOMAP 0.80 px,
+    yet their camera paths differed by 17-87 deg. Pairwise rotations can. There
+    GLOMAP agreed with them to 0.5 deg median, while incremental disagreed by
+    5 deg for its main piece and 16 deg for a second piece that had also solved
+    a wrong focal length (1024 px against ~730).
+    """
+    import cv2
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
+    cam = next(iter(rec.cameras.values()))
+    rot = {}
+    for img in rec.images.values():
+        rot[img.name] = Rotation.from_matrix(img.cam_from_world().rotation.matrix())
+    thresh = 1.0 / float(cam.params[0])  # 1 px, in normalised coordinates
+    errs = []
+    for na, nb, ka, kb in pairs:
+        if na not in rot or nb not in rot:
+            continue
+        pa = np.asarray(cam.cam_from_img(ka.astype(np.float64)))
+        pb = np.asarray(cam.cam_from_img(kb.astype(np.float64)))
+        E, mask = cv2.findEssentialMat(pa, pb, np.eye(3), cv2.RANSAC, 0.999, thresh)
+        if E is None or E.shape != (3, 3):
+            continue
+        n_in, R, _, _ = cv2.recoverPose(E, pa, pb, np.eye(3), mask=mask)
+        if n_in < 30:
+            continue
+        solved = rot[nb] * rot[na].inv()
+        errs.append(np.degrees((solved.inv() * Rotation.from_matrix(R)).magnitude()))
+    if not errs:
+        return float("inf"), 0
+    return float(np.median(errs)), len(errs)
+
+
+def pick_solve(candidates):
+    """Choose between ``[(label, n_registered, median_rot_err_deg)]``: the most
+    rotation-consistent solve among those that registered a fair share of the
+    frames; when two are within ROT_TIE_DEG, the one with more frames.
+    Returns the chosen label."""
+    most = max(n for _, n, _ in candidates)
+    fair = [c for c in candidates if c[1] >= MIN_COVERAGE_VS_RIVAL * most]
+    best_err = min(e for _, _, e in fair)
+    close = [c for c in fair if c[2] <= best_err + ROT_TIE_DEG]
+    return max(close, key=lambda c: (c[1], -c[2]))[0]
+
+
+# A point in an ordered capture whose matches across it fall below this share
+# of the capture's median is a weak link. Measured as the summed inliers of
+# every verified pair that straddles the point: the Clinic doorway fell to
+# 0.03-2.7% of the median at 4 and 10 fps (blurry, near-pure-rotation pan past
+# a white door), while four good captures — CupPhotos, two House turntable
+# videos, a 334-frame walk-around — never dropped below 7.7%, and that only at
+# their very ends.
+WEAK_LINK_FRAC = 0.04
+# The first and last cuts are thin by construction (one side holds a single
+# frame), so a weak link there costs a few frames, not a misaligned half.
+WEAK_LINK_EDGE_FRAC = 0.02
+
+
+def bridge_strength(db: Path):
+    """For an ORDERED capture: ``(names, strength)`` where ``strength[c]`` is
+    the summed verified inliers of every pair with one frame at or before
+    ``names[c]`` and the other after it — how firmly the capture's two halves
+    either side of that point are tied together."""
+    import sqlite3
+
+    import numpy as np
+
+    con = sqlite3.connect(str(db))
+    try:
+        by_id = dict(con.execute("SELECT image_id, name FROM images"))
+        rows = list(con.execute(
+            "SELECT pair_id, rows FROM two_view_geometries WHERE rows > 0"))
+    finally:
+        con.close()
+    names = sorted(by_id.values())
+    pos = {n: i for i, n in enumerate(names)}
+    big = 2147483647  # COLMAP's pair_id = id1 * big + id2
+    diff = np.zeros(len(names) + 1)
+    for pid, n in rows:
+        i, j = sorted((pos[by_id[pid // big]], pos[by_id[pid % big]]))
+        diff[i] += n
+        diff[j] -= n
+    return names, np.cumsum(diff)[: max(len(names) - 1, 0)]
+
+
+def weak_links(names, strength, frac: float = WEAK_LINK_FRAC,
+               edge_frac: float = WEAK_LINK_EDGE_FRAC):
+    """Runs of weak cuts as ``[(last name before, first name after,
+    weakest share of the median)]``, ignoring the capture's ends."""
+    import numpy as np
+
+    s = np.asarray(strength, dtype=float)
+    if len(s) < 10:
+        return []
+    med = float(np.median(s))
+    if med <= 0:
+        return []
+    edge = max(3, int(edge_frac * len(names)))
+    weak = [c for c in range(edge, len(s) - edge) if s[c] < frac * med]
+    out = []
+    for c in weak:
+        if out and c == out[-1][1] + 1:
+            out[-1][1] = c
+        else:
+            out.append([c, c])
+    return [
+        (names[a], names[b + 1], float(s[a:b + 1].min() / med)) for a, b in out
+    ]
+
+
+def warn_weak_links(db: Path):
+    """Warn about the points where an ordered capture barely holds together.
+
+    Whichever mapper runs, the parts either side of such a point are tied by
+    a handful of matches. The solve then either drops one part or places it
+    at the wrong angle, and nothing in its own statistics shows it. On Clinic
+    GLOMAP registered every frame at a clean 0.8 px reprojection error, yet
+    the room sat 45 deg off the only link to the hallway. Returns the links.
+    """
+    names, strength = bridge_strength(db)
+    links = weak_links(names, strength)
+    for before, after, share in links:
+        print(
+            f"WARNING: frames {before} → {after} are barely connected "
+            f"({share:.1%} of the capture's typical overlap). The parts of the "
+            "scene either side of this point may be MISALIGNED (rotated or "
+            "shifted relative to each other) or missing. This is a capture "
+            "problem, so no solver can fix it: usually a fast pan, motion "
+            "blur or a blank surface filling the frame. Re-shoot that stretch "
+            "slowly, stepping through rather than turning on the spot, and "
+            "keep textured detail in view.",
+            flush=True,
+        )
+    if names and not links:
+        log("capture continuity: no weak links")
+    return links
+
+
+def _try_other_mapper(rec, db, images_dir, ws, refine, args, n_frames):
+    """A fragmented pass 1: solve again with the other mapper and keep
+    whichever agrees better with the pairwise rotations. Sets ``args.mapper``
+    to the winner, so pass 2 uses it too.
+
+    Fragmenting is the signature of incremental mapping drifting: it grows the
+    model one frame at a time, a bent path stops accepting new frames, and the
+    rest of the capture starts a second model that run_mapping then discards.
+    On the Clinic walk-through it kept 249 of 291 frames, while GLOMAP placed
+    all 291 and agreed with the pairwise evidence ten times better. Neither
+    mapper wins everywhere (on CupPhotos GLOMAP was the one that failed), so
+    this measures rather than assumes.
+    """
+    other = "glomap" if args.mapper == "incremental" else "incremental"
+    log(f"pass 1 registered {rec.num_reg_images()}/{n_frames} frames — "
+        f"fragmented; trying {other} as well")
+    progress(45, f"SfM poses: fragmented — trying {other} mapping…")
+    alt = run_mapping(db, images_dir, ws / "sparse_alt", f"pass 1 ({other})",
+                      refine, other)
+    if alt is None:
+        return rec
+    progress(52, "SfM poses: comparing the two solves…")
+    pairs = two_view_rotation_pairs(db)
+    scored = []
+    for label, r in ((args.mapper, rec), (other, alt)):
+        err, n = rotation_disagreement(r, pairs)
+        log(f"{label}: {r.num_reg_images()}/{n_frames} frames, median "
+            f"rotation disagreement {err:.2f} deg over {n} pairs")
+        scored.append((label, r.num_reg_images(), err))
+    chosen = pick_solve(scored)
+    log(f"keeping the {chosen} solve")
+    if chosen == other:
+        args.mapper = other
+        return alt
+    return rec
+
+
 def poses_from_rec(rec):
     """name → (R world→cam 3x3, camera centre 3), plus the bundle-adjusted
     camera params and the model name they belong to."""
@@ -2007,10 +2238,15 @@ def main():
         args.no_loop_closure = True
     extract_and_match(db, images_dir, model, params, strategy, args.vocab_tree,
                       mask_dir, args.match_window)
+    if image_set and _capture_is_ordered(scan):
+        warn_weak_links(db)
 
     progress(38, "SfM poses: mapping (pass 1)…")
     rec = run_mapping(db, images_dir, ws / "sparse", "pass 1", refine,
                       args.mapper)
+    if (rec is not None and image_set and not args.turntable
+            and rec.num_reg_images() < FRAGMENTED_FRAC * n_frames):
+        rec = _try_other_mapper(rec, db, images_dir, ws, refine, args, n_frames)
     if rec is None:
         print("ERROR: SfM produced no reconstruction", flush=True)
         return 1
