@@ -198,6 +198,31 @@ LOST_OVERLAP = 0.2       # below this survival the view has jumped (a cut, a whi
 # The 4 fps sampling that solved House well was ~7.5 frames.
 PARALLAX_RATIO = 0.1
 SHARP_TOL = 0.9          # "as sharp as the best" for picking within a step
+# Blank frames: a plain wall, a lens cap, a ceiling. goodFeaturesToTrack's
+# quality is RELATIVE to the strongest corner in the frame, so on a blank wall
+# it still returns 400 "corners", which are sensor noise. Two absolute tests,
+# calibrated on the 1179-frame Clinic walk-through (2026-11-08):
+#  - FAST at contrast 20 found 0 corners on 39 frames, where SIFT averaged 4
+#    features (3 had none, which crashed the SfM referee). With 1-4 FAST
+#    corners SIFT already averaged 99, which is enough to match.
+#  - min-eigenvalue corner strength peaked at ~1e-4 on blank frames and
+#    reached 0.05+ on textured ones, so 1e-3 separates them cleanly.
+# A frame is blank only when BOTH agree. Alone, FAST also flagged a frame SIFT
+# found 185 features in, and it misses clean, hard-edged texture. Together
+# they flagged 40 frames, with SIFT at most 53 and a median of 4.5.
+BLANK_FAST_CONTRAST = 20
+BLANK_MIN_CORNERS = 2
+MIN_CORNER_EIG = 1e-3
+
+
+def is_blank(gray) -> bool:
+    """True when a small grey frame has too little detail for SfM to use."""
+    import cv2
+
+    fast = cv2.FastFeatureDetector_create(BLANK_FAST_CONTRAST)
+    if len(fast.detect(gray)) >= BLANK_MIN_CORNERS:
+        return False
+    return float(cv2.cornerMinEigenVal(gray, 3).max()) < MIN_CORNER_EIG
 
 
 class _Tracker:
@@ -211,8 +236,17 @@ class _Tracker:
         pts = cv2.goodFeaturesToTrack(
             key_gray, maxCorners=400, qualityLevel=0.01, minDistance=8,
         )
-        self.key = (pts.reshape(-1, 2) if pts is not None
-                    else np.zeros((0, 2), np.float32))
+        pts = (pts.reshape(-1, 2) if pts is not None
+               else np.zeros((0, 2), np.float32))
+        if len(pts):
+            # Drop noise "corners" (see MIN_CORNER_EIG): tracking them reports
+            # motion and lost tracks that have nothing to do with the camera.
+            eig = cv2.cornerMinEigenVal(key_gray, 3)
+            xy = np.round(pts).astype(int)
+            xy[:, 0] = xy[:, 0].clip(0, key_gray.shape[1] - 1)
+            xy[:, 1] = xy[:, 1].clip(0, key_gray.shape[0] - 1)
+            pts = pts[eig[xy[:, 1], xy[:, 0]] >= MIN_CORNER_EIG]
+        self.key = pts
         self.cur = self.key.copy()
         self.n0 = len(self.key)
 
@@ -263,7 +297,8 @@ class _Tracker:
         return float(np.median(d)) / edge, len(self.cur) / max(1, self.n0), par
 
 
-def select_keyframes(frames, spacing=0.05, min_overlap=0.6, max_gap=None):
+def select_keyframes(frames, spacing=0.05, min_overlap=0.6, max_gap=None,
+                     stats=None):
     """Choose which frames of a sequence to keep. Returns sorted indices.
 
     ``frames`` is an iterable of ``(gray, sharpness)`` in capture order, with
@@ -282,9 +317,17 @@ def select_keyframes(frames, spacing=0.05, min_overlap=0.6, max_gap=None):
 
     When tracking is lost in one step (a cut, a whip-pan), the frame just
     before the jump is kept as well as the one after it, so whatever overlap
-    there is survives for the matcher. On a featureless view (a blank wall)
-    the motion can't be measured, so a frame is kept every ``max_gap`` frames
-    instead of none at all.
+    there is survives for the matcher.
+
+    BLANK frames (``is_blank``: a plain wall) are never kept. SfM can't find
+    features in them, so they add nothing and can break later stages. The last
+    textured frame before a blank stretch and the first one after it are kept,
+    so whatever overlap there is across the stretch survives. A view with
+    SOME detail but too little to track is different: its motion can't be
+    measured, so a frame is kept every ``max_gap`` frames instead of none.
+
+    ``stats``, if given, is a dict that receives ``blank``, the number of blank
+    frames skipped.
     """
     from collections import deque
 
@@ -295,6 +338,7 @@ def select_keyframes(frames, spacing=0.05, min_overlap=0.6, max_gap=None):
     window = []                # (index, gray, sharp, motion) since the keyframe
     last = None                # final (index, motion) seen, for the tail rule
     n = 0
+    blank = 0
 
     def pull():
         nonlocal n
@@ -321,6 +365,15 @@ def select_keyframes(frames, spacing=0.05, min_overlap=0.6, max_gap=None):
         if f is None:
             break
         i, gray, sharp = f
+        if is_blank(gray):
+            blank += 1
+            if trk is not None:
+                # Entering a blank stretch: the latest textured frame is the
+                # bridge to whatever comes after it.
+                if window:
+                    kept.append(window[-1][0])
+                trk, window, last = None, [], None
+            continue
         if trk is None:
             rekey(i, gray, [])
             continue
@@ -366,9 +419,12 @@ def select_keyframes(frames, spacing=0.05, min_overlap=0.6, max_gap=None):
                   window[best_k + 1:] + [(i, gray, sharp, motion)])
         last = None
 
+    if stats is not None:
+        stats["blank"] = blank
     # The tail: the final frame finishes the capture's coverage. Keep it if
     # the view moved meaningfully since the last kept frame.
-    if last is not None and last[0] != kept[-1] and last[1] >= 0.25 * spacing:
+    if (kept and last is not None and last[0] != kept[-1]
+            and last[1] >= 0.25 * spacing):
         kept.append(last[0])
     return sorted(set(kept))
 
@@ -420,14 +476,24 @@ def plan_video(video: Path, spacing: float, min_overlap: float):
         finally:
             cap.release()
 
-    # Featureless stretch: fall back to ~2 frames a second rather than none.
+    # Too little detail to track: fall back to ~2 frames a second, not none.
     max_gap = max(1, int(round(CANDIDATE_FPS / 2)))
-    picks = select_keyframes(grays(), spacing, min_overlap, max_gap=max_gap)
+    stats = {}
+    picks = select_keyframes(grays(), spacing, min_overlap, max_gap=max_gap,
+                             stats=stats)
     frames = [index[k] for k in picks]
     log(f"video {video.name}: {native:.1f} fps native, {len(index)} candidates "
         f"(every {stride}), kept {len(frames)} at {spacing:.0%} spacing "
         f"(≈{len(frames) / max(1e-9, (total or 1) / max(native, 1e-9)):.1f}/s on average)")
-    return frames, len(index)
+    if stats.get("blank"):
+        log(f"skipped {stats['blank']} blank candidate frame(s) "
+            "(no detail SfM could use: a plain wall, a covered lens)")
+    if not frames:
+        raise SystemExit(
+            f"ERROR: no frame of {video.name} has enough detail to reconstruct "
+            "— it looks blank throughout (lens covered, or a plain surface)"
+        )
+    return frames, len(index), stats.get("blank", 0)
 
 
 def _iter_video(video: Path, fps: float = 0.0, frames=None):
@@ -534,10 +600,10 @@ def ingest(src: Path, out_dir: Path, max_edge: int, fps: float, drop_blurry: flo
         log(f"source: video {files[0].name}")
         if select == "motion":
             progress(2, "Ingest: choosing frames by how much the view changes…")
-            chosen, n_cand = plan_video(files[0], spacing, min_overlap)
+            chosen, n_cand, n_blank = plan_video(files[0], spacing, min_overlap)
             selection = {"mode": "motion", "spacing": spacing,
                          "min_overlap": min_overlap, "candidates": n_cand,
-                         "kept": len(chosen)}
+                         "blank_skipped": n_blank, "kept": len(chosen)}
             frames_iter = _iter_video(files[0], frames=chosen)
             total = len(chosen)
         else:

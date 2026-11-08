@@ -152,7 +152,7 @@ camera roll may be read-only:
 
 Steps:
 
-1. **Decode** — HEIC via `pillow-heif`; video via cv2. Video frames are chosen by view change, not at a fixed rate: a cheap first pass tracks features from the last kept frame and keeps a new one once the view has shifted by `--spacing` (5% of the frame by default), once parallax reaches a tenth of that, or once too few features remain. It keeps the latest near-sharpest frame in each step. A second pass writes only those frames. `--select fixed --fps N` keeps the old behaviour.
+1. **Decode** — HEIC via `pillow-heif`; video via cv2. Video frames are chosen by view change, not at a fixed rate: a cheap first pass tracks features from the last kept frame and keeps a new one once the view has shifted by `--spacing` (5% of the frame by default), once parallax reaches a tenth of that, or once too few features remain. It keeps the latest near-sharpest frame in each step. A second pass writes only those frames. `--select fixed --fps N` keeps the old behaviour.  Blank frames (a plain wall: fewer than 2 FAST corners and no corner above min-eigenvalue 1e-3) are never kept; the textured frames on either side are kept as bridges.
 2. **Apply EXIF orientation** — `cv2.imread` silently ignores it, which would otherwise
    feed SfM a set of images with inconsistent rotation.
 3. **Downscale** to a max long edge (~2000–3000 px). 48 MP phone stills add nothing to
