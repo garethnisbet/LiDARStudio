@@ -560,14 +560,36 @@ export function initLidarPanel() {
   const spacingOut = el('span', { class: 'muted', style: 'min-width:112px;text-align:right' }, '5%');
   const spacingHint = el('div', { class: 'muted', style: 'font-size:11px;margin:2px 0 6px' }, '');
   let videoInfo = null;   // {native_fps, frames, duration_s} of the scan's video
+  // The older fixed-rate sampling stays selectable: on some captures (the 11-08
+  // Clinic walk-through) it gave the better result.
+  const selectSel = el('select', {},
+    el('option', { value: 'motion' }, 'by view change'),
+    el('option', { value: 'fixed' }, 'fixed rate (fps)'));
+  const fpsInput = el('input', { type: 'number', step: '0.5', min: '0.5', max: '30', value: '4' });
+  let spacingLabel, spacingRow, fpsLabel;   // assigned where the panel is built
   // 'image_set' | 'lidar_bag' | null. Several controls are capture-specific and
   // are silently IGNORED by the other branch — subject masking has no meaning
   // for a LiDAR room scan, and calibration/colour-range none for a phone — so
   // the panel hides what cannot apply rather than offering a dead control.
   let scanSource = null;
   const spacingHintUpdate = () => {
+    const fixed = selectSel.value === 'fixed';
+    if (spacingLabel) {
+      spacingLabel.style.display = fixed ? 'none' : '';
+      spacingRow.style.display = fixed ? 'none' : '';
+      fpsLabel.style.display = fixed ? '' : 'none';
+    }
     const sp = parseFloat(spacingInput.value) || 5;
     spacingOut.textContent = `${sp}% of frame`;
+    if (fixed) {
+      const fps = parseFloat(fpsInput.value) || 4;
+      spacingHint.textContent = videoInfo
+        ? `${videoInfo.duration_s}s clip @ ${Math.round(videoInfo.native_fps)} fps `
+          + `\u2014 about ${Math.round(videoInfo.duration_s * fps)} frames at ${fps} fps.`
+        : 'No video found in the scan folder \u2014 the rate applies only to video '
+          + 'captures; every photo in a folder is kept.';
+      return;
+    }
     if (!videoInfo) {
       spacingHint.textContent = 'No video found in the scan folder \u2014 spacing applies '
         + 'only to video captures; every photo in a folder is kept.';
@@ -582,6 +604,8 @@ export function initLidarPanel() {
   spacingSlider.addEventListener('input', () => { spacingInput.value = spacingSlider.value; spacingHintUpdate(); });
   spacingInput.addEventListener('input', () => { spacingSlider.value = spacingInput.value; spacingHintUpdate(); });
   blurInput.addEventListener('input', spacingHintUpdate);
+  selectSel.addEventListener('change', spacingHintUpdate);
+  fpsInput.addEventListener('input', spacingHintUpdate);
   // Re-probe whenever the folder changes or the panel is opened on it; a folder
   // that isn't a phone capture just leaves the estimate blank.
   // showGen() re-probes when the type is 'ingest', and this now calls showGen()
@@ -623,7 +647,7 @@ export function initLidarPanel() {
           + '48 MP phone stills add nothing to reconstruction accuracy and dominate '
           + 'matching time and memory; 2000-3000 px is the useful range.', 'Max edge'),
         edgeInput),
-      el('label', { class: 'muted', style: 'flex:1' }, 'frame spacing %',
+      spacingLabel = el('label', { class: 'muted', style: 'flex:1' }, 'frame spacing %',
         infoIcon('Video frames are chosen by how much the view changes, not at a fixed '
           + 'rate. Ingest tracks features from the last kept frame and keeps a new one '
           + 'once the picture has shifted by this % of its width, or the parallax that '
@@ -632,8 +656,20 @@ export function initLidarPanel() {
           + 'Standing still adds nothing, and fast or close-up motion gets frames packed '
           + 'tighter. Smaller = more frames: lower it if SfM loses track, raise it if '
           + 'reconstruction is slow. 5% suits most captures.', 'Frame spacing'),
-        spacingInput)),
-    el('div', { class: 'row', style: 'align-items:center' }, spacingSlider, spacingOut),
+        spacingInput),
+      fpsLabel = el('label', { class: 'muted', style: 'flex:1;display:none' }, 'fps',
+        infoIcon('Fixed-rate sampling keeps this many video frames per second, '
+          + 'whatever the camera is doing. It is the older method: more frames '
+          + 'while standing still, fewer through fast moves. 4 fps was the default.',
+          'Frame rate'),
+        fpsInput)),
+    el('div', { class: 'row' },
+      el('label', { class: 'muted', style: 'flex:1' }, 'frame selection',
+        infoIcon('How video frames are chosen. By view change (the default) keeps '
+          + 'a frame each time the picture has moved enough. Fixed rate keeps a '
+          + 'set number per second, the older method.', 'Frame selection'),
+        selectSel)),
+    spacingRow = el('div', { class: 'row', style: 'align-items:center' }, spacingSlider, spacingOut),
     spacingHint,
     el('div', { class: 'row' },
       el('label', { class: 'muted', style: 'flex:1' }, 'drop blurry',
@@ -1175,6 +1211,8 @@ export function initLidarPanel() {
       : type === 'ingest'
       ? { max_edge: parseInt(edgeInput.value) || 2400,
           spacing: (parseFloat(spacingInput.value) || 5) / 100,
+          select: selectSel.value,
+          fps: parseFloat(fpsInput.value) || 4,
           // 0 is a real value (keep every frame), so don't use `||` here.
           drop_blurry: Number.isNaN(parseFloat(blurInput.value)) ? 0.1 : parseFloat(blurInput.value) }
       : { voxel_size: parseFloat(voxelInput.value), mono: monoCheck.checked,
