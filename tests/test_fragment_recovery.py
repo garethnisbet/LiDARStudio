@@ -127,3 +127,37 @@ def test_a_weak_run_is_reported_once():
     strength = [100.0] * 49
     strength[20] = strength[21] = strength[22] = 1.0
     assert process_sfm.weak_links(names, strength) == [("0020.jpg", "0023.jpg", 0.01)]
+
+
+def test_rotation_pairs_skip_a_frame_with_no_keypoints(tmp_path):
+    """SIFT stores a featureless frame as rows=0 with a NULL blob. Reading it
+    used to crash the mapper referee (TypeError on np.frombuffer(None))."""
+    import sqlite3
+
+    import numpy as np
+
+    db = tmp_path / "d.db"
+    con = sqlite3.connect(str(db))
+    con.execute("CREATE TABLE images (image_id INTEGER, name TEXT)")
+    con.execute("CREATE TABLE keypoints (image_id INTEGER, rows INTEGER, "
+                "cols INTEGER, data BLOB)")
+    con.execute("CREATE TABLE two_view_geometries (pair_id INTEGER, "
+                "rows INTEGER, data BLOB)")
+    con.executemany("INSERT INTO images VALUES (?, ?)",
+                    [(1, "0000.jpg"), (2, "0001.jpg"), (3, "0002.jpg")])
+    kp = np.random.default_rng(0).random((80, 6)).astype(np.float32)
+    con.execute("INSERT INTO keypoints VALUES (1, 80, 6, ?)", (kp.tobytes(),))
+    con.execute("INSERT INTO keypoints VALUES (2, 80, 6, ?)", (kp.tobytes(),))
+    con.execute("INSERT INTO keypoints VALUES (3, 0, 6, NULL)")
+    m = np.stack([np.arange(60), np.arange(60)], 1).astype(np.uint32)
+    big = 2147483647
+    con.execute("INSERT INTO two_view_geometries VALUES (?, 60, ?)",
+                (1 * big + 2, m.tobytes()))
+    con.execute("INSERT INTO two_view_geometries VALUES (?, 60, NULL)",
+                (2 * big + 3,))
+    con.commit()
+    con.close()
+
+    pairs = process_sfm.two_view_rotation_pairs(db)
+    assert [(a, b) for a, b, _, _ in pairs] == [("0000.jpg", "0001.jpg")]
+    assert pairs[0][2].shape == (60, 2)

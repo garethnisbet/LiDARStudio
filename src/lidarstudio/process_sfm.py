@@ -832,10 +832,13 @@ def two_view_rotation_pairs(db: Path, max_pairs: int = 1500,
     con = sqlite3.connect(str(db))
     try:
         names = dict(con.execute("SELECT image_id, name FROM images"))
+        # A frame SIFT found nothing in (a blank wall, a black frame) is stored
+        # with rows = 0 and a NULL blob. It can't be in any pair, so skip it.
         kps = {
             i: np.frombuffer(d, np.float32).reshape(r, c)[:, :2]
             for i, r, c, d in con.execute(
                 "SELECT image_id, rows, cols, data FROM keypoints")
+            if d is not None and r
         }
         rows = list(con.execute(
             "SELECT pair_id, rows, data FROM two_view_geometries "
@@ -847,6 +850,8 @@ def two_view_rotation_pairs(db: Path, max_pairs: int = 1500,
     out = []
     for pid, n, data in rows[:max_pairs]:
         a, b = pid // big, pid % big
+        if data is None or a not in kps or b not in kps:
+            continue
         m = np.frombuffer(data, np.uint32).reshape(n, 2)
         out.append((names[a], names[b], kps[a][m[:, 0]], kps[b][m[:, 1]]))
     return out
