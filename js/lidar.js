@@ -549,50 +549,39 @@ export function initLidarPanel() {
   // ── Phone photogrammetry: 'ingest' normalizes a photo folder or video into
   // the project before the slow reconstruction stages run. ──
   const edgeInput = el('input', { type: 'number', step: '200', min: '800', max: '8000', value: '2400' });
-  const fpsInput = el('input', { type: 'number', step: '0.5', min: '0.5', max: '30', value: '4' });
+  // Frame spacing, in percent of the frame: ingest keeps a new video frame each
+  // time the view has shifted this much (or shown this much parallax / 10).
+  const spacingInput = el('input', { type: 'number', step: '0.5', min: '1', max: '20', value: '5' });
   const blurInput = el('input', { type: 'number', step: '0.05', min: '0', max: '0.5', value: '0.1' });
-  // Video frame rate. The number that actually matters is the FRAME COUNT the
-  // rate produces, and that depends on the clip: ingest keeps every
-  // round(native_fps / fps)-th frame. So the slider is paired with a live
-  // estimate read from the scan folder's video (probed by /api/scan/validate),
-  // which is the difference between picking a rate and picking a result.
-  const fpsSlider = el('input', { type: 'range', min: '0.5', max: '30', step: '0.5', value: '4', style: 'flex:1' });
-  const fpsOut = el('span', { class: 'muted', style: 'min-width:112px;text-align:right' }, '4 fps');
-  const fpsHint = el('div', { class: 'muted', style: 'font-size:11px;margin:2px 0 6px' }, '');
+  // Smart frame selection. The count depends on how the camera moved, so it
+  // can't be predicted here. The hint gives the clip's length and the ceiling
+  // instead (selection looks at no more than 15 frames a second).
+  const spacingSlider = el('input', { type: 'range', min: '1', max: '20', step: '0.5', value: '5', style: 'flex:1' });
+  const spacingOut = el('span', { class: 'muted', style: 'min-width:112px;text-align:right' }, '5%');
+  const spacingHint = el('div', { class: 'muted', style: 'font-size:11px;margin:2px 0 6px' }, '');
   let videoInfo = null;   // {native_fps, frames, duration_s} of the scan's video
   // 'image_set' | 'lidar_bag' | null. Several controls are capture-specific and
   // are silently IGNORED by the other branch — subject masking has no meaning
   // for a LiDAR room scan, and calibration/colour-range none for a phone — so
   // the panel hides what cannot apply rather than offering a dead control.
   let scanSource = null;
-  const ordinal = (n) => {
-    const suffix = (n % 100 >= 11 && n % 100 <= 13) ? 'th'
-      : ({ 1: 'st', 2: 'nd', 3: 'rd' })[n % 10] || 'th';
-    return n + suffix;
-  };
-  const fpsEstimate = () => {
-    const fps = parseFloat(fpsInput.value) || 4;
+  const spacingHintUpdate = () => {
+    const sp = parseFloat(spacingInput.value) || 5;
+    spacingOut.textContent = `${sp}% of frame`;
     if (!videoInfo) {
-      fpsOut.textContent = fps + ' fps';
-      fpsHint.textContent = 'No video found in the scan folder — this rate applies '
-        + 'only to video captures.';
+      spacingHint.textContent = 'No video found in the scan folder \u2014 spacing applies '
+        + 'only to video captures; every photo in a folder is kept.';
       return;
     }
-    const step = Math.max(1, Math.round(videoInfo.native_fps / fps));
-    const decoded = Math.ceil(videoInfo.frames / step);
-    // Mirror the ingest filter: it only thins a set that is already above the
-    // 20-frame floor, and never takes it below that.
-    const drop = Math.min(0.9, Math.max(0, parseFloat(blurInput.value) || 0));
-    const kept = decoded > 20 ? Math.max(20, Math.round(decoded * (1 - drop))) : decoded;
-    fpsOut.textContent = `${fps} fps \u00b7 \u2248${kept} frames`;
-    fpsHint.textContent = `every ${step === 1 ? '' : ordinal(step) + ' '}frame of `
-      + `${videoInfo.frames} (${videoInfo.duration_s}s @ ${Math.round(videoInfo.native_fps)} fps)`
-      + (kept < 20 ? ' \u2014 below the 20 SfM needs' : kept < 150
-        ? ' \u2014 thin; 150-400 reconstructs far better' : '');
+    const stride = Math.max(1, Math.round(videoInfo.native_fps / 15));
+    const ceiling = Math.ceil(videoInfo.frames / stride);
+    spacingHint.textContent = `${videoInfo.duration_s}s clip @ ${Math.round(videoInfo.native_fps)} fps `
+      + `\u2014 at most ${ceiling} frames. Still moments add none; fast swings and `
+      + 'close orbits get more.';
   };
-  fpsSlider.addEventListener('input', () => { fpsInput.value = fpsSlider.value; fpsEstimate(); });
-  fpsInput.addEventListener('input', () => { fpsSlider.value = fpsInput.value; fpsEstimate(); });
-  blurInput.addEventListener('input', fpsEstimate);
+  spacingSlider.addEventListener('input', () => { spacingInput.value = spacingSlider.value; spacingHintUpdate(); });
+  spacingInput.addEventListener('input', () => { spacingSlider.value = spacingInput.value; spacingHintUpdate(); });
+  blurInput.addEventListener('input', spacingHintUpdate);
   // Re-probe whenever the folder changes or the panel is opened on it; a folder
   // that isn't a phone capture just leaves the estimate blank.
   // showGen() re-probes when the type is 'ingest', and this now calls showGen()
@@ -611,7 +600,7 @@ export function initLidarPanel() {
   };
   const probeScan = async () => {
     const scan = scanInput.value.trim();
-    if (!scan) { videoInfo = null; fpsEstimate(); return; }
+    if (!scan) { videoInfo = null; spacingHintUpdate(); return; }
     try {
       const r = await api('/api/scan/validate', { path: scan });
       videoInfo = ((r.contents || {}).images || {}).video_info || null;
@@ -623,7 +612,7 @@ export function initLidarPanel() {
         syncTypes();
       }
     } catch { videoInfo = null; scanSource = null; }
-    fpsEstimate();
+    spacingHintUpdate();
     showGen();
   };
   scanInput.addEventListener('change', refreshVideoInfo);
@@ -634,16 +623,18 @@ export function initLidarPanel() {
           + '48 MP phone stills add nothing to reconstruction accuracy and dominate '
           + 'matching time and memory; 2000-3000 px is the useful range.', 'Max edge'),
         edgeInput),
-      el('label', { class: 'muted', style: 'flex:1' }, 'video fps',
-        infoIcon('Frames per second sampled from a video capture. Ingest keeps every '
-          + 'round(native fps / this)-th frame, so the frame count depends on the clip '
-          + '\u2014 the slider shows what you will actually get. 4 fps on a slow walk '
-          + 'gives dense overlap; raise it if you moved quickly, lower it if the '
-          + 'reconstruction is taking too long. SfM needs 20 frames at an absolute '
-          + 'minimum and reconstructs well from 150-400.', 'Video fps'),
-        fpsInput)),
-    el('div', { class: 'row', style: 'align-items:center' }, fpsSlider, fpsOut),
-    fpsHint,
+      el('label', { class: 'muted', style: 'flex:1' }, 'frame spacing %',
+        infoIcon('Video frames are chosen by how much the view changes, not at a fixed '
+          + 'rate. Ingest tracks features from the last kept frame and keeps a new one '
+          + 'once the picture has shifted by this % of its width, or the parallax that '
+          + 'triangulation needs reaches a tenth of that (an orbit round an object), or '
+          + 'too many features have left view. It keeps the sharpest frame in each step. '
+          + 'Standing still adds nothing, and fast or close-up motion gets frames packed '
+          + 'tighter. Smaller = more frames: lower it if SfM loses track, raise it if '
+          + 'reconstruction is slow. 5% suits most captures.', 'Frame spacing'),
+        spacingInput)),
+    el('div', { class: 'row', style: 'align-items:center' }, spacingSlider, spacingOut),
+    spacingHint,
     el('div', { class: 'row' },
       el('label', { class: 'muted', style: 'flex:1' }, 'drop blurry',
         infoIcon('Fraction of the blurriest frames to discard, by Laplacian-variance '
@@ -1183,7 +1174,7 @@ export function initLidarPanel() {
           ...(seedSel.value ? { pointcloud: seedSel.value } : {}) }
       : type === 'ingest'
       ? { max_edge: parseInt(edgeInput.value) || 2400,
-          fps: parseFloat(fpsInput.value) || 4,
+          spacing: (parseFloat(spacingInput.value) || 5) / 100,
           // 0 is a real value (keep every frame), so don't use `||` here.
           drop_blurry: Number.isNaN(parseFloat(blurInput.value)) ? 0.1 : parseFloat(blurInput.value) }
       : { voxel_size: parseFloat(voxelInput.value), mono: monoCheck.checked,

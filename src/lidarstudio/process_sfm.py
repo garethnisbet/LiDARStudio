@@ -1810,7 +1810,7 @@ def report_turntable(viewmats, snap: bool):
                "that stretch of the subject will come out holed while the "
                "rest is clean")
             + " even though it was photographed. "
-            + ("Shoot for longer, or raise --fps at ingest."
+            + ("Shoot for longer, or lower the frame spacing at ingest."
                if even else
                "Turn more slowly and STEADILY — a motorised turntable removes "
                "this failure entirely."),

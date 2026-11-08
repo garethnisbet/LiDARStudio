@@ -157,9 +157,9 @@ _video_probe: dict = {}
 def _video_info(path: Path) -> dict | None:
     """Native frame rate, frame count and duration of a capture video.
 
-    The ingest sampler takes every ``round(native_fps / fps)``-th frame, so
-    without these numbers a frame-rate control is guesswork — this is what lets
-    the UI say how many frames a given rate will actually produce.
+    Ingest picks frames by how much the view changes, so the count can't be
+    known in advance. These numbers let the UI show the clip's length and the
+    ceiling the selector works under.
 
     Opening a container costs milliseconds, but ``_scan_contents`` runs on every
     validate and every job start, so results are cached by file identity;
@@ -1452,6 +1452,12 @@ async def _job_ingest(project_path, scan_path, options, queue, job=None):
         str(out_dir),
         "--max-edge",
         str(int(options.get("max_edge", 2400))),
+        # Video frames are chosen by how much the view changes ('motion'); a
+        # fixed rate is still accepted for a caller that sends one.
+        "--select",
+        "fixed" if options.get("select") == "fixed" else "motion",
+        "--spacing",
+        str(float(options.get("spacing", 0.05))),
         "--fps",
         str(float(options.get("fps", 4.0))),
         "--drop-blurry",
