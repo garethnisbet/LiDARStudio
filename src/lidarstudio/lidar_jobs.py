@@ -1767,6 +1767,20 @@ async def _run_image_set_sfm(proj: Path, scan: Path, ts: str, contents,
     return canonical
 
 
+def _not_a_scan(scan: Path) -> str:
+    """Why ``scan`` can't be trained from, naming the scans inside it when it
+    is a project folder (the usual mix-up)."""
+    inner = sorted(p for p in (scan / "scans").glob("*") if p.is_dir()) \
+        if (scan / "scans").is_dir() else []
+    msg = (f"'{scan}' is not a scan: it holds neither LiDAR bag files nor "
+           "photos or a video.")
+    if inner:
+        msg += (" It looks like a PROJECT folder. Put it in the project field, "
+                "and in the scan field the capture itself, e.g. "
+                + " or ".join(f"'{p}'" for p in inner[:3]) + ".")
+    return msg
+
+
 async def _job_splat(project_path, scan_path, options, queue, job=None):
     job = job if job is not None else {}
     proj = Path(project_path)
@@ -1788,6 +1802,12 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
     # reads normalized frames and a manifest, not a camera roll. Resolve the
     # scan onto its ingested form, and say so plainly if that has not been run.
     image_set = contents.get("source") == "image_set"
+    if not image_set and not contents.get("valid"):
+        # Without this a folder that is neither (often the PROJECT folder)
+        # fell through to the LiDAR branch and failed on a missing trajectory
+        # sidecar, which says nothing about the real problem.
+        await queue.put({"event": "error", "message": _not_a_scan(scan)})
+        return
     if image_set:
         ing = _ingest_dir(proj, scan)
         if not (ing / "manifest.csv").exists():

@@ -194,3 +194,10 @@ def test_jump_at_a_piece_start_does_not_recut_the_gap_before_it():
     # Without the piece it would cut inside the gap.
     assert process_sfm.jump_cuts(names, strength,
                                  [_jump(names[48], names[49])]) != []
+
+
+def test_a_project_folder_in_the_scan_field_is_named_as_such(tmp_path):
+    (tmp_path / "scans" / "Clinic" / "images").mkdir(parents=True)
+    msg = lidar_jobs._not_a_scan(tmp_path)
+    assert "PROJECT folder" in msg and str(tmp_path / "scans" / "Clinic") in msg
+    assert "PROJECT" not in lidar_jobs._not_a_scan(tmp_path / "scans")
