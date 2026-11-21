@@ -189,7 +189,13 @@ def _load_still(path: Path):
 # kept frame and keeps a new one once the view has moved far enough.
 
 SELECT_EDGE = 480        # px, long edge of the grey copy the selector tracks on
-CANDIDATE_FPS = 15.0     # selection looks at no more frames than this per second
+# Selection looks at no more frames than this per second. It is the ceiling on
+# how DENSE the frames can get where the view changes fastest (a whip-pan, a
+# turn through a doorway), so it is the native rate of a phone video: at 15
+# the selector could keep at most every other frame exactly where SfM needed
+# all of them. A still or slow stretch still keeps few, so the frame count
+# barely moves; only the decode of pass 1 gets longer.
+CANDIDATE_FPS = 30.0
 MIN_TRACKS = 25          # fewer corners than this: tracking can't be trusted
 LOST_OVERLAP = 0.2       # below this survival the view has jumped (a cut, a whip-pan)
 # Parallax trigger, as a fraction of the spacing. Measured on the real captures:
@@ -213,6 +219,17 @@ SHARP_TOL = 0.9          # "as sharp as the best" for picking within a step
 BLANK_FAST_CONTRAST = 20
 BLANK_MIN_CORNERS = 2
 MIN_CORNER_EIG = 1e-3
+# The tracker's own cut is lower. Blank frames never reach it (is_blank skips
+# them), and at 1e-3 it threw away the real but weak corners of low-texture
+# views: on Clinic those keyframes fell from ~46 corners to ~18, under
+# MIN_TRACKS, so the selector stopped measuring motion exactly where it was
+# hardest. At 3e-4 the 52-frame Clinic blank wall still gives at most 4.
+TRACK_MIN_EIG = 3e-4
+# With too few corners to track, keep a frame this often (a fifth of a second).
+# These are the hardest stretches for SfM, so they get MORE frames than a
+# fixed 4 fps, not fewer: the old half-second fallback left links 0.53 s
+# apart, and on Clinic links that long failed 41-73% of the time.
+FALLBACK_FPS = 5.0
 
 
 def is_blank(gray) -> bool:
@@ -239,13 +256,13 @@ class _Tracker:
         pts = (pts.reshape(-1, 2) if pts is not None
                else np.zeros((0, 2), np.float32))
         if len(pts):
-            # Drop noise "corners" (see MIN_CORNER_EIG): tracking them reports
+            # Drop noise "corners" (see TRACK_MIN_EIG): tracking them reports
             # motion and lost tracks that have nothing to do with the camera.
             eig = cv2.cornerMinEigenVal(key_gray, 3)
             xy = np.round(pts).astype(int)
             xy[:, 0] = xy[:, 0].clip(0, key_gray.shape[1] - 1)
             xy[:, 1] = xy[:, 1].clip(0, key_gray.shape[0] - 1)
-            pts = pts[eig[xy[:, 1], xy[:, 0]] >= MIN_CORNER_EIG]
+            pts = pts[eig[xy[:, 1], xy[:, 0]] >= TRACK_MIN_EIG]
         self.key = pts
         self.cur = self.key.copy()
         self.n0 = len(self.key)
@@ -476,8 +493,8 @@ def plan_video(video: Path, spacing: float, min_overlap: float):
         finally:
             cap.release()
 
-    # Too little detail to track: fall back to ~2 frames a second, not none.
-    max_gap = max(1, int(round(CANDIDATE_FPS / 2)))
+    # Too little detail to track: fall back to a dense steady rate, not none.
+    max_gap = max(1, int(round(CANDIDATE_FPS / FALLBACK_FPS)))
     stats = {}
     picks = select_keyframes(grays(), spacing, min_overlap, max_gap=max_gap,
                              stats=stats)
@@ -662,7 +679,17 @@ def ingest(src: Path, out_dir: Path, max_edge: int, fps: float, drop_blurry: flo
     # photo teaches soft edges everywhere it is sampled. Dropping them leaves
     # NUMBERING GAPS on purpose — the NNNN index stays a faithful temporal
     # index, which is what build_loop_pairs reads it as.
+    #
+    # Not after motion selection. The selector already picks the sharpest frame
+    # of each step, and a global cut on Laplacian variance scores low TEXTURE
+    # as blur, so it thins the low-texture stretches the selector has already
+    # left sparse. On Clinic it removed the middle frame of 26 of the 59 weak
+    # links, turning half-second gaps into one-second ones.
     warnings = []
+    if selection and selection["mode"] == "motion" and drop_blurry > 0:
+        log("sharpness filter: skipped (frames were chosen by view change, "
+            "which already picks the sharpest of each step)")
+        drop_blurry = 0.0
     if drop_blurry > 0 and len(rows) > REC_FRAMES:
         scores = np.array([float(r["sharpness"]) for r in rows])
         cut = float(np.quantile(scores, drop_blurry))

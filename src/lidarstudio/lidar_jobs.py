@@ -518,6 +518,94 @@ async def scan_validate_handler(request):
 # ── Processing jobs ────────────────────────────────────────────────────────────
 
 
+def _join_database(npz: Path) -> Path | None:
+    """The kept matches of the capture a piece's poses came from:
+    ``sfm_viewmats_X_part2.npz`` → ``sfm_viewmats_X_database.db`` (or, from a
+    run that kept its workspace, ``work_X/database.db``)."""
+    base = re.sub(r"_part\d+$", "", npz.stem)
+    for cand in (npz.with_name(f"{base}_database.db"),
+                 npz.parent / f"work_{base.removeprefix('sfm_viewmats_')}"
+                 / "database.db"):
+        if cand.exists():
+            return cand
+    return None
+
+
+async def _job_refine_join(project_path, options, queue, job):
+    """Tighten a hand-made join of a capture's pieces (process_join.py) and
+    report each piece's refined placement plus the joined poses and cloud a
+    single splat trains on."""
+    from lidarstudio import pieces
+
+    items = options.get("items") or []
+    if len(items) < 2:
+        await queue.put({"event": "error",
+                         "message": "Refining a join needs at least two pieces."})
+        return
+    spec_pieces = []
+    for it in items:
+        npz = pieces.poses_for_object(it.get("path") or "")
+        if npz is None:
+            await queue.put({"event": "error", "message": (
+                f"{Path(it.get('path') or '?').name} is not a piece of a "
+                "photo reconstruction (no poses file found for it), so its "
+                "join cannot be refined.")})
+            return
+        spec_pieces.append({"poses": str(npz), "matrix": it.get("matrix"),
+                            "id": it.get("id")})
+    if len({p["poses"] for p in spec_pieces}) != len(spec_pieces):
+        await queue.put({"event": "error",
+                         "message": "Two of the objects come from the same piece."})
+        return
+    first = Path(spec_pieces[0]["poses"])
+    db = _join_database(first)
+    if db is None:
+        await queue.put({"event": "error", "message": (
+            "The matches of this capture were not kept, so the join cannot be "
+            "refined. Re-run the reconstruction with 'Force SfM' (a capture "
+            "that splits now keeps them), then try again.")})
+        return
+    sfm_py = await asyncio.to_thread(_sfm_python, False)
+    if sfm_py is None:
+        await queue.put({"event": "error",
+                         "message": "Refining a join needs pycolmap."})
+        return
+    base = re.sub(r"_part\d+$", "", first.stem).removeprefix("sfm_viewmats_")
+    sfm_dir = first.parent
+    proj = sfm_dir.parent
+    out_npz = sfm_dir / f"sfm_viewmats_{base}_refined.npz"
+    out_cloud = proj / "pointclouds" / f"pointcloud_{base}_refined.ply"
+    spec_file = sfm_dir / f"join_{base}_spec.json"
+    placements = sfm_dir / f"join_{base}_placements.json"
+    spec_file.write_text(json.dumps({"database": str(db), "pieces": spec_pieces}))
+    placements.unlink(missing_ok=True)
+    proc = await asyncio.create_subprocess_exec(
+        sfm_py, str(ROOT / "process_join.py"), "--spec", str(spec_file),
+        "--output", str(out_npz), "--cloud-output", str(out_cloud),
+        "--placements", str(placements),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    job["proc"] = proc
+    if job.get("cancelled"):
+        proc.terminate()
+    rc, err = await _stream_proc(proc, queue)
+    job["proc"] = None
+    if job.get("cancelled"):
+        await queue.put({"event": "cancelled", "message": "Refining stopped."})
+        return
+    if rc != 0 or not out_npz.exists() or not placements.exists():
+        await queue.put({"event": "error",
+                         "message": err or f"process_join.py exited with code {rc}"})
+        return
+    await queue.put({"event": "progress", "percent": 100, "message": "Complete!"})
+    await queue.put({
+        "event": "result", "type": "join",
+        "poses": str(out_npz), "cloud": str(out_cloud),
+        "filename": out_cloud.name,
+        "placements": json.loads(placements.read_text())["pieces"],
+    })
+
+
 async def process_start_handler(request):
     """POST /api/process/start — launch a background processing job."""
     data = await request.json()
@@ -526,9 +614,10 @@ async def process_start_handler(request):
     scan_path = data.get("scan_path")
     options = data.get("options", {})
 
-    if job_type not in ("pointcloud", "splat", "mesh", "ingest"):
+    if job_type not in ("pointcloud", "splat", "mesh", "ingest", "refine_join"):
         return web.json_response(
-            {"error": "type must be 'pointcloud', 'splat', 'mesh' or 'ingest'"},
+            {"error": "type must be 'pointcloud', 'splat', 'mesh', 'ingest' "
+             "or 'refine_join'"},
             status=400,
         )
     if not project_path or not scan_path:
@@ -555,6 +644,8 @@ async def _run_job(job_id, job_type, project_path, scan_path, options):
             await _job_mesh(project_path, scan_path, options, queue, job)
         elif job_type == "ingest":
             await _job_ingest(project_path, scan_path, options, queue, job)
+        elif job_type == "refine_join":
+            await _job_refine_join(project_path, options, queue, job)
         else:
             await _job_splat(project_path, scan_path, options, queue, job)
     except Exception as exc:
@@ -632,6 +723,73 @@ def _pointcloud_cmd(scan, contents, output_file, voxel, mono=False, keep_self_vi
     return cmd
 
 
+async def _photo_pointcloud(proj: Path, scan: Path, options, queue, job):
+    """The point cloud of a phone capture: the reconstruction's own points.
+
+    There is no range data, so the cloud is what SfM triangulated. It is the
+    same reconstruction the splat trains on (solved once, reused by both),
+    and a capture that fell apart gives one cloud per piece, each in its own
+    frame, for the user to place by hand.
+    """
+    ing = _ingest_dir(proj, scan)
+    if not (ing / "manifest.csv").exists():
+        await queue.put(
+            {
+                "event": "error",
+                "message": (
+                    f"'{scan.name}' is a phone capture that has not been "
+                    "ingested yet. Run the 'ingest' job on it first."
+                ),
+            }
+        )
+        return
+    contents = _scan_contents(ing)
+    ts = ing.name
+    canonical = proj / "sfm" / f"sfm_viewmats_{ts}.npz"
+    cloud = proj / "pointclouds" / f"pointcloud_{ts}.ply"
+    force_sfm = bool(options.get("force_sfm"))
+    if force_sfm or not canonical.exists() or not cloud.exists():
+        if await _run_image_set_sfm(
+            proj, ing, ts, contents, options, queue, job, force_sfm,
+            "Point cloud generation",
+        ) is None:
+            return
+    else:
+        await queue.put(
+            {
+                "event": "log",
+                "message": f"Reusing the existing reconstruction: {canonical.name}",
+            }
+        )
+    if not cloud.exists():
+        await queue.put(
+            {
+                "event": "error",
+                "message": f"The reconstruction produced no cloud ({cloud.name}).",
+            }
+        )
+        return
+    clouds = [cloud] + [
+        p for p in (cloud.with_name(f"{cloud.stem}_part{q.stem.rsplit('_part', 1)[1]}.ply")
+                    for q in _largest_parts(_sfm_parts(canonical),
+                                            int(options.get("max_pieces") or 0)))
+        if p.exists()
+    ]
+    await queue.put({"event": "progress", "percent": 100, "message": "Complete!"})
+    for i, c in enumerate(clouds):
+        await queue.put(
+            {
+                "event": "result",
+                "type": "pointcloud",
+                "path": str(c),
+                "filename": c.name,
+                "size_mb": round(c.stat().st_size / 1_048_576, 1),
+                "piece": i,
+                "pieces": len(clouds),
+            }
+        )
+
+
 async def _job_pointcloud(project_path, scan_path, options, queue, job=None):
     job = job if job is not None else {}
     proj = Path(project_path)
@@ -647,17 +805,7 @@ async def _job_pointcloud(project_path, scan_path, options, queue, job=None):
     )
 
     if contents.get("source") == "image_set":
-        await queue.put(
-            {
-                "event": "error",
-                "message": (
-                    "This is a phone capture, not a LiDAR scan — there is no "
-                    "range data to build a point cloud from. Run 'ingest' and "
-                    "then 'splat'; the splat job builds its own seed cloud "
-                    "from the photos."
-                ),
-            }
-        )
+        await _photo_pointcloud(proj, scan, options, queue, job)
         return
     if not contents.get("valid"):
         await queue.put(
@@ -1588,6 +1736,10 @@ async def _run_image_set_sfm(proj: Path, scan: Path, ts: str, contents,
             sfm_cmd += ["--mask-region", str(options["mask_region"])]
         elif options.get("mask_classes"):
             sfm_cmd += ["--mask-classes", str(options["mask_classes"])]
+    # How many pieces of a capture that falls apart to reconstruct (largest
+    # first); 0 = all.
+    if int(options.get("max_pieces") or 0) > 0:
+        sfm_cmd += ["--max-pieces", str(int(options["max_pieces"]))]
     proc = await asyncio.create_subprocess_exec(
         *sfm_cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -2094,51 +2246,148 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
     # expandable_segments cuts CUDA fragmentation, which is what tips heavy
     # (downscale-1 / 6M) runs into OOM on smaller-VRAM cards.
     splat_env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=splat_env,
-        )
-    except FileNotFoundError:
-        await queue.put(
-            {
-                "event": "error",
-                "message": "process_splat.py not found — see the stub script.",
-            }
-        )
-        return
 
-    # Register the process so a /cancel can kill it; honour a cancel that raced in.
-    job["proc"] = proc
-    if job.get("cancelled"):
-        proc.terminate()
+    # A capture that fell apart at a blank stretch was solved as separate
+    # pieces (process_sfm writes them beside the main poses as _part<k>);
+    # each trains into its own splat, in its own frame.
+    split_parts = (_sfm_parts(canonical)
+                   if image_set and sfm_poses == str(canonical) else [])
+    # The reconstruction may hold more pieces than this run should train (it
+    # was solved with a higher limit): train the largest, the main one first.
+    split_parts = _largest_parts(split_parts, int(options.get("max_pieces") or 0))
+    n_pieces = 1 + len(split_parts)
 
-    rc, err = await _stream_proc(proc, queue)
-    job["proc"] = None
+    async def _train(cmd, output_file, piece=0) -> bool:
+        """Run one training; report its result. False = stop the job."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=splat_env,
+            )
+        except FileNotFoundError:
+            await queue.put(
+                {
+                    "event": "error",
+                    "message": "process_splat.py not found — see the stub script.",
+                }
+            )
+            return False
 
-    if job.get("cancelled"):
-        await queue.put({"event": "cancelled", "message": "Splat generation stopped."})
-    elif rc == 0 and output_file.exists():
-        size_mb = round(output_file.stat().st_size / 1_048_576, 1)
-        await queue.put({"event": "progress", "percent": 100, "message": "Complete!"})
-        await queue.put(
-            {
-                "event": "result",
-                "type": "splat",
-                "path": str(output_file),
-                "filename": output_file.name,
-                "size_mb": size_mb,
-            }
-        )
-    else:
+        # Register the process so a /cancel can kill it; honour a cancel that
+        # raced in.
+        job["proc"] = proc
+        if job.get("cancelled"):
+            proc.terminate()
+
+        rc, err = await _stream_proc(proc, queue)
+        job["proc"] = None
+
+        if job.get("cancelled"):
+            await queue.put(
+                {"event": "cancelled", "message": "Splat generation stopped."}
+            )
+            return False
+        if rc == 0 and output_file.exists():
+            size_mb = round(output_file.stat().st_size / 1_048_576, 1)
+            await queue.put(
+                {"event": "progress", "percent": 100, "message": "Complete!"}
+            )
+            await queue.put(
+                {
+                    "event": "result",
+                    "type": "splat",
+                    "path": str(output_file),
+                    "filename": output_file.name,
+                    "size_mb": size_mb,
+                    "piece": piece,
+                    "pieces": n_pieces,
+                }
+            )
+            return True
         await queue.put(
             {
                 "event": "error",
                 "message": err or f"process_splat.py exited with code {rc}",
             }
         )
+        return False
+
+    if not await _train(cmd, output_file):
+        return
+
+    for piece, part_poses in enumerate(split_parts, 1):
+        k = part_poses.stem.rsplit("_part", 1)[1]
+        part_seed = seed_cloud_path.with_name(
+            f"{seed_cloud_path.stem}_part{k}.ply")
+        if not part_seed.exists():
+            await queue.put(
+                {
+                    "event": "log",
+                    "message": f"WARNING: piece {k} has no seed cloud "
+                    f"({part_seed.name}); skipping its splat.",
+                }
+            )
+            continue
+        part_out = output_file.with_name(
+            f"{output_file.stem}_part{k}{output_file.suffix}")
+        await queue.put(
+            {
+                "event": "log",
+                "message": f"Training piece {k} of the capture as its own "
+                f"splat → {part_out.name}",
+            }
+        )
+        if not await _train(
+            _swap_args(cmd, {"--sfm-poses": str(part_poses),
+                             "--pointcloud": str(part_seed),
+                             "--output": str(part_out)}),
+            part_out,
+            piece,
+        ):
+            return
+
+
+def _largest_parts(parts, max_pieces: int):
+    """At most ``max_pieces - 1`` of ``parts`` (the main piece is the other
+    one), the most frames first, returned in capture order. 0 = all."""
+    if max_pieces <= 0 or len(parts) < max_pieces:
+        return list(parts)
+
+    def frames(p):
+        try:
+            import numpy as np
+
+            with np.load(p, allow_pickle=True) as d:
+                return len(d["names"])
+        except Exception:
+            return 0
+
+    keep = set(sorted(parts, key=frames, reverse=True)[: max_pieces - 1])
+    return [p for p in parts if p in keep]
+
+
+def _sfm_parts(canonical: Path):
+    """The separately solved pieces beside a poses file, in capture order."""
+    parts = []
+    for p in canonical.parent.glob(f"{canonical.stem}_part*.npz"):
+        k = p.stem.rsplit("_part", 1)[1]
+        if k.isdigit():
+            parts.append((int(k), p))
+    return [p for _, p in sorted(parts)]
+
+
+def _swap_args(cmd, values):
+    """A copy of ``cmd`` with each ``--flag value`` in ``values`` replaced
+    (or appended when absent)."""
+    out = list(cmd)
+    for flag, value in values.items():
+        if flag in out:
+            out[out.index(flag) + 1] = value
+        else:
+            out += [flag, value]
+    return out
 
 
 async def process_events_handler(request):
@@ -2793,6 +3042,77 @@ async def edit_save_as_handler(request):
         return web.json_response({"error": str(exc)}, status=500)
 
 
+def _join_piece_poses(pairs, out_path: Path) -> dict:
+    """When every combined object is a piece of one reconstruction, also write
+    the pieces' cameras, moved by the same placements, as one poses file, so a
+    single splat can train on the joined scene. Named to pair with the
+    combined file the way generated files pair with their poses:
+    ``pointclouds/pointcloud_X_joined.ply`` ↔ ``sfm/sfm_viewmats_X_joined.npz``.
+    Returns ``{joined_poses}`` or ``{joined_poses_note}`` saying why not."""
+    from lidarstudio import pieces
+
+    npzs = [pieces.poses_for_object(p) for p, _m in pairs]
+    if any(n is None for n in npzs):
+        return {"joined_poses_note": "no joined poses: not every object is a "
+                "piece of a photo reconstruction"}
+    if len(set(npzs)) != len(npzs):
+        return {"joined_poses_note": "no joined poses: two objects come from "
+                "the same piece"}
+    stem = pieces._sfm_stem(out_path.stem) or out_path.stem
+    proj = (out_path.parent.parent
+            if out_path.parent.name in ("pointclouds", "splats")
+            else npzs[0].parent.parent)
+    dest = proj / "sfm" / f"sfm_viewmats_{stem}.npz"
+    try:
+        r = pieces.join_poses([(n, m) for n, (_p, m) in zip(npzs, pairs)], dest)
+    except ValueError as exc:
+        return {"joined_poses_note": f"no joined poses: {exc}"}
+    return {"joined_poses": r["poses"], "joined_frames": r["frames"]}
+
+
+async def edit_combine_handler(request):
+    """POST /api/edit/combine — join several loaded clouds (or splats) into
+    one file, each baked at its in-scene placement.
+
+    Body: {items: [{path, matrix}], output}. ``matrix`` is the object's world
+    matrix, column-major 16. Used to export the separately solved pieces of a
+    capture as one scene after the user has placed them by hand.
+    """
+    data = await request.json()
+    items = data.get("items") or []
+    out = (data.get("output") or "").strip()
+    if len(items) < 2 or not out:
+        return web.json_response(
+            {"error": "need at least two objects and an output path"}, status=400)
+    out_path = Path(out)
+    if out_path.suffix.lower() != ".ply":
+        return web.json_response({"error": "output must be a .ply file"}, status=400)
+    pairs = []
+    for it in items:
+        src = Path((it.get("path") or "").strip())
+        if not src.name or not src.exists():
+            return web.json_response(
+                {"error": f"source not found: {src}"}, status=404)
+        if src.resolve() == out_path.resolve():
+            return web.json_response(
+                {"error": "the output would overwrite one of the inputs"},
+                status=400)
+        pairs.append((str(src), it.get("matrix")))
+    try:
+        from lidarstudio import edit_ops
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, edit_ops.combine, pairs, str(out_path))
+        result.update(await loop.run_in_executor(
+            None, _join_piece_poses, pairs, out_path))
+        return web.json_response(result)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
 async def splat_export_cloud_handler(request):
     """POST /api/splat/export_cloud — save a splat's gaussian centres as a
     refined coloured point cloud.
@@ -2874,6 +3194,7 @@ def register_routes(app: web.Application) -> None:
     app.router.add_post("/api/edit/import", edit_import_handler)
     app.router.add_post("/api/edit/recolour", edit_recolour_handler)
     app.router.add_post("/api/edit/save_as", edit_save_as_handler)
+    app.router.add_post("/api/edit/combine", edit_combine_handler)
     app.router.add_post("/api/splat/export_cloud", splat_export_cloud_handler)
     app.router.add_post("/api/browse", browse_handler)
     app.router.add_post("/api/browse/dir", browse_dir_handler)

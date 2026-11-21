@@ -151,6 +151,69 @@ def apply_edit(in_path, out_path, op, params):
     }
 
 
+def combine(items, out_path):
+    """Join several clouds, or several splats, into one file, each baked at
+    its in-scene placement.
+
+    ``items`` is ``[(path, matrix)]`` with ``matrix`` the object's world
+    matrix as 16 column-major numbers (None = leave as stored). This is how the
+    separately solved pieces of a capture become one scene once the user has
+    moved them into place. All items must be the same kind. Splats must share
+    their field layout (same spherical-harmonic degree), which pieces trained
+    with the same settings do.
+    """
+    import open3d as o3d
+
+    if len(items) < 2:
+        raise ValueError("pick at least two objects to combine")
+    loaded = []
+    for path, matrix in items:
+        _pts, kind, obj = _load(path)
+        M = (None if matrix is None
+             else np.asarray(matrix, float).reshape(4, 4).T)
+        loaded.append((Path(path).name, kind, obj, M))
+    kinds = {k for _n, k, _o, _m in loaded}
+    if len(kinds) > 1:
+        raise ValueError("can't combine clouds and splats into one file; "
+                         "combine each kind separately")
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    if kinds == {"splat"}:
+        layout = loaded[0][2].dtype
+        for name, _k, obj, _m in loaded[1:]:
+            if obj.dtype.names != layout.names:
+                raise ValueError(
+                    f"{name} stores different splat fields from "
+                    f"{loaded[0][0]} (a different colour detail level); "
+                    "re-train it with the same settings to combine them")
+        parts = [(splat_io.transform_splat(obj, M) if M is not None else obj)
+                 .astype(layout) for _n, _k, obj, M in loaded]
+        out = np.concatenate(parts)
+        splat_io.save_splat(out_path, out)
+        return {"kind": "splat", "count": int(len(out)),
+                "pieces": len(items), "output": str(out_path)}
+    pts, cols, nrm = [], [], []
+    any_col = any(o.has_colors() for _n, _k, o, _m in loaded)
+    all_nrm = all(o.has_normals() for _n, _k, o, _m in loaded)
+    for _n, _k, obj, M in loaded:
+        if M is not None:
+            obj.transform(M)
+        p = np.asarray(obj.points)
+        pts.append(p)
+        cols.append(np.asarray(obj.colors) if obj.has_colors()
+                    else np.full((len(p), 3), 0.6))
+        if all_nrm:
+            nrm.append(np.asarray(obj.normals))
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.vstack(pts))
+    if any_col:
+        pcd.colors = o3d.utility.Vector3dVector(np.vstack(cols))
+    if all_nrm:
+        pcd.normals = o3d.utility.Vector3dVector(np.vstack(nrm))
+    cloud_ops.save(pcd, str(out_path))
+    return {"kind": "cloud", "count": int(len(pcd.points)),
+            "pieces": len(items), "output": str(out_path)}
+
+
 def splat_to_cloud(in_path, out_path, min_opacity=0.05):
     """Export a trained splat's gaussian centres as a plain coloured point cloud.
 

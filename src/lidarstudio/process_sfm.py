@@ -42,7 +42,9 @@ a ~900-frame 20 MP scan takes on the order of an hour or two.
 
 import argparse
 import csv
+import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -119,6 +121,11 @@ MAX_TT_ROT_RESIDUAL = 3.0  # degrees
 
 
 def progress(pct: int, msg: str):
+    # A separately solved piece of the capture runs as a child of the main
+    # solve and shares its progress bar, so it says which piece it is.
+    label = os.environ.get("LIDARSTUDIO_SFM_PART")
+    if label:
+        msg = f"{label}: {msg}"
     print(f"PROGRESS:{pct}:{msg}", flush=True)
 
 
@@ -729,7 +736,8 @@ def extract_and_match(db: Path, images_dir: Path, model: str, params,
 
 
 def run_mapping(db: Path, images_dir: Path, sparse_dir: Path, label: str,
-                refine_intrinsics: bool = False, mapper: str = "incremental"):
+                refine_intrinsics: bool = False, mapper: str = "incremental",
+                image_names=None):
     """Map the matched database; returns the best reconstruction (most
     registered images) or None. Whichever mapper runs, the other is the
     fallback if it produces nothing.
@@ -750,14 +758,20 @@ def run_mapping(db: Path, images_dir: Path, sparse_dir: Path, label: str,
     calibration is ground truth and refining it would drift away from the model
     the cloud was coloured with — and ON for phone captures, where the EXIF
     focal length is only a starting guess.
+
+    ``image_names`` limits the solve to those frames (one piece of a capture
+    split at a broken link); None solves every frame in the database.
     """
     import pycolmap
 
     sparse_dir.mkdir(parents=True, exist_ok=True)
+    subset = sorted(image_names) if image_names else None
 
     def _incremental():
         log(f"{label}: incremental mapping…")
         iopts = pycolmap.IncrementalPipelineOptions()
+        if subset:
+            iopts.image_names = subset
         if refine_intrinsics:
             iopts.ba_refine_focal_length = True
             iopts.ba_refine_extra_params = True
@@ -769,6 +783,8 @@ def run_mapping(db: Path, images_dir: Path, sparse_dir: Path, label: str,
     def _glomap():
         log(f"{label}: global mapping (GLOMAP)…")
         gopts = pycolmap.GlobalPipelineOptions()
+        if subset:
+            gopts.image_names = subset
         if refine_intrinsics:
             ba = gopts.mapper.bundle_adjustment
             ba.refine_focal_length = True
@@ -1002,7 +1018,307 @@ def warn_weak_links(db: Path):
     return links
 
 
-def _try_other_mapper(rec, db, images_dir, ws, refine, args, n_frames):
+# A step between consecutive frames of an ordered capture is a JUMP when the
+# camera moved more than this many times both the capture's median step and
+# its median speed. Both, because a long step over a long time gap (frames
+# skipped as blank) is fine, and a fast step over a tiny one is noise.
+# Calibrated 2026-11-08: good walk-throughs, orbits and LiDAR scans peak at
+# 1-7x; the 11-08 Clinic solve, which glued its pieces together wrongly while
+# registering 98.6% of frames, hit 10-146x at every break.
+POSE_JUMP_X = 12.0
+# A turn this large between consecutive frames, this fast, is a flip, not a pan.
+# Good captures peak at 48 deg; the Clinic solve flipped 76 and 179 deg.
+POSE_FLIP_DEG = 60.0
+POSE_FLIP_DEG_PER_S = 120.0
+
+
+def pose_jumps(names, viewmats, ts_ns):
+    """Steps where the solved camera path of an ordered capture teleports.
+
+    Returns ``[(before, after, step_x, turn_deg)]`` in capture order, with a
+    lone misplaced frame (a jump in and a jump straight back out) reported once
+    as ``(frame, frame, ...)``. ``step_x`` is the step over the median step.
+    """
+    import numpy as np
+
+    if len(names) < 10:
+        return []
+    order = np.argsort(np.asarray(ts_ns, dtype=np.int64), kind="stable")
+    names = [names[i] for i in order]
+    V = np.asarray(viewmats, dtype=float)[order]
+    t = np.asarray(ts_ns, dtype=float)[order] / 1e9
+    R = V[:, :3, :3]
+    C = -np.einsum("nji,nj->ni", R, V[:, :3, 3])
+    step = np.linalg.norm(np.diff(C, axis=0), axis=1)
+    dt = np.diff(t)
+    pos = dt[dt > 0]
+    if len(pos) == 0:
+        return []
+    # Equal timestamps (stills shot in a burst) get a floor rather than a /0.
+    dt = np.maximum(dt, 0.1 * float(np.median(pos)))
+    cos = (np.einsum("nij,nij->n", R[1:], R[:-1]) - 1) / 2
+    turn = np.degrees(np.arccos(np.clip(cos, -1, 1)))
+    med_step = float(np.median(step))
+    med_speed = float(np.median(step / dt))
+    if med_step <= 0 or med_speed <= 0:
+        return []
+    step_x = step / med_step
+    jump = (np.minimum(step_x, step / dt / med_speed) > POSE_JUMP_X) | (
+        (turn > POSE_FLIP_DEG) & (turn / dt > POSE_FLIP_DEG_PER_S))
+    out, i = [], 0
+    while i < len(jump):
+        if not jump[i]:
+            i += 1
+            continue
+        # In and straight back out, with its neighbours agreeing: one bad frame.
+        if (i + 1 < len(jump) and jump[i + 1]
+                # Two steps apart, so twice the allowance.
+                and np.linalg.norm(C[i + 2] - C[i]) / med_step
+                <= 2 * POSE_JUMP_X):
+            out.append((names[i + 1], names[i + 1], float(step_x[i]),
+                        float(turn[i])))
+            i += 2
+            continue
+        out.append((names[i], names[i + 1], float(step_x[i]), float(turn[i])))
+        i += 1
+    return out
+
+
+def warn_pose_jumps(names, viewmats, ts_by_name):
+    """Warn when the solved path of an ordered capture teleports.
+
+    A solve can register nearly every frame and still be wrong: on the 11-08
+    Clinic video incremental mapping placed 1037 of 1052 frames, so neither the
+    fragmentation fallback nor the registration floor fired, yet it had glued
+    the walk-through together from pieces at the wrong angles (the camera
+    "moved" 12 m in a quarter second and flipped 179 deg). Training a splat on
+    that wastes the whole run. Returns the jumps.
+    """
+    jumps = pose_jumps(list(names), viewmats, [ts_by_name[n] for n in names])
+    if not jumps:
+        log("camera path: no jumps")
+        return jumps
+    where = ", ".join(
+        f"{a} (misplaced)" if a == b else f"{a} → {b}"
+        for a, b, _, _ in jumps[:8]
+    ) + (f" and {len(jumps) - 8} more" if len(jumps) > 8 else "")
+    worst = max(jumps, key=lambda j: j[2])
+    print(
+        f"WARNING: the solved camera path JUMPS at {len(jumps)} point(s): "
+        f"{where}. Between neighbouring frames the camera moves up to "
+        f"{worst[2]:.0f}x its usual step or flips up to "
+        f"{max(j[3] for j in jumps):.0f} deg, which a handheld capture cannot "
+        "do. The reconstruction has joined parts of the scene at the WRONG "
+        "position or angle, so a splat or mesh trained on it will be smeared "
+        "or doubled. This is usually a capture problem at those frames: a "
+        "blank wall, motion blur or a fast pan. Re-shoot those stretches "
+        "slowly with textured detail in view.",
+        flush=True,
+    )
+    return jumps
+
+
+# A cut in an ordered capture whose straddling matches fall below this share of
+# the median is BROKEN, not just weak: nothing ties the two sides together, so
+# no solver can place one relative to the other. On the 11-08 Clinic video 18
+# frames of blank wall (1:02-1:07) left 0 matches across; mapping both sides
+# together either dropped the first minute (old ingest) or glued it on at the
+# wrong place and angle (new ingest), which smeared the splat. Weak-but-real
+# links (0.5-4%) are left joined and only warned about.
+BROKEN_LINK_FRAC = 0.005
+# A piece needs this many frames, and this share of the capture, to be solved
+# and trained on its own. Fewer is a stray clump, not a usable splat.
+MIN_PART_FRAMES = 30
+MIN_PART_FRAC = 0.05
+
+
+def capture_pieces(names, strength, frac: float = BROKEN_LINK_FRAC):
+    """Split an ordered capture at its broken links.
+
+    Returns lists of frame names in capture order. The frames inside a broken
+    stretch (the blank wall itself) belong to neither side and are left out.
+    A capture with no broken link comes back as one piece.
+    """
+    links = weak_links(names, strength, frac=frac)
+    if not links:
+        return [list(names)]
+    pos = {n: i for i, n in enumerate(names)}
+    pieces, start = [], 0
+    for before, after, _ in links:
+        pieces.append(list(names[start:pos[before] + 1]))
+        start = pos[after]
+    pieces.append(list(names[start:]))
+    return [p for p in pieces if p]
+
+
+def keep_pieces(pieces, n_frames):
+    """The main piece (most frames) and the others big enough to stand alone,
+    as ``(main, [(number, frames)])``. The extra pieces are numbered 1, 2, ...
+    in capture order; the main piece keeps the capture's own name."""
+    main = max(pieces, key=len)
+    floor = max(MIN_PART_FRAMES, MIN_PART_FRAC * n_frames)
+    big = [p for p in pieces if p is not main and len(p) >= floor]
+    big.sort(key=lambda p: p[0])
+    return main, list(enumerate(big, 1))
+
+
+# A jump in the solved path is cut only where it sits on a weak link, within
+# this many frames of it. A jump with strong matches across it is something
+# else (a single misplaced frame, a fast step), and cutting a well-tied
+# capture would only throw away a correct join.
+JUMP_CUT_REACH = 5
+# How many times the main piece may be split again after a solve. Each round
+# re-solves it, so this caps the cost of a capture that keeps breaking.
+MAX_SPLIT_ROUNDS = 3
+
+
+def jump_cuts(names, strength, jumps, piece=None,
+              frac: float = WEAK_LINK_FRAC, reach: int = JUMP_CUT_REACH):
+    """Where to cut a solved capture that jumps at a weak link.
+
+    ``names``/``strength`` are ``bridge_strength`` over the whole capture,
+    ``jumps`` is ``pose_jumps`` of the solve. A solve can register nearly
+    every frame and still be wrong: on the 11-08 Clinic video 72 real but
+    stray matches across a blank wall glued the first minute on 14 deg off.
+    The symptom is the camera path teleporting, and the cause is a weak link
+    (under ``frac`` of the median) right there. Returns the cut indices
+    (cut ``c`` lies between ``names[c]`` and ``names[c + 1]``), one per jump
+    that has such a link, at the weakest cut within ``reach`` frames.
+
+    With ``piece`` (the frames being solved) only cuts with a frame of the
+    piece on both sides count. A jump right at the start of a piece points
+    back at the gap the piece was already cut from, and "cutting" there again
+    changes nothing but costs a whole re-solve (the 11-21 Clinic run did it
+    twice).
+    """
+    import numpy as np
+
+    s = np.asarray(strength, dtype=float)
+    if len(s) < 10:
+        return []
+    med = float(np.median(s))
+    if med <= 0:
+        return []
+    pos = {n: i for i, n in enumerate(names)}
+    inside = None
+    if piece is not None:
+        member = set(piece)
+        first, last = pos.get(piece[0], 0), pos.get(piece[-1], len(s))
+        inside = np.array([first <= c < last and names[c] in member
+                           and names[c + 1] in member
+                           for c in range(len(s))])
+    cuts = set()
+    for a, b, _x, _turn in jumps:
+        if a not in pos or b not in pos:
+            continue
+        lo = max(0, pos[a] - reach)
+        hi = min(len(s) - 1, pos[b] + reach - 1)
+        if hi < lo:
+            continue
+        win = s[lo:hi + 1].copy()
+        if inside is not None:
+            win[~inside[lo:hi + 1]] = np.inf
+        if not np.isfinite(win).any():
+            continue
+        c = lo + int(np.argmin(win))
+        if s[c] < frac * med:
+            cuts.add(c)
+    return sorted(cuts)
+
+
+def split_piece(piece, names, cuts):
+    """Split ``piece`` (frame names in capture order) at the cut indices of
+    ``names``. Pieces that end up empty are dropped."""
+    after = {names[c] for c in cuts}
+    out, cur = [], []
+    for n in piece:
+        cur.append(n)
+        if n in after:
+            out.append(cur)
+            cur = []
+    if cur:
+        out.append(cur)
+    return [p for p in out if p]
+
+
+def unregistered_runs(piece, registered, floor):
+    """Stretches of ``piece`` the solve left out, at least ``floor`` frames
+    long, as frame-name lists in capture order. A mapper that fragments keeps
+    only its biggest model, so a stretch it could not tie to the rest drops
+    out silently. Solved on its own, it is still a usable part of the scene.
+    Short gaps (a few blurred frames) are ignored: they are inside the main
+    piece, not beside it."""
+    reg = set(registered)
+    out, cur = [], []
+    for n in piece:
+        if n in reg:
+            if len(cur) >= floor:
+                out.append(cur)
+            cur = []
+        else:
+            cur.append(n)
+    if len(cur) >= floor:
+        out.append(cur)
+    return out
+
+
+def part_path(path: Path, k: int) -> Path:
+    """``sfm_viewmats_X.npz`` → ``sfm_viewmats_X_part<k>.npz``."""
+    return path.with_name(f"{path.stem}_part{k}{path.suffix}")
+
+
+def database_path(path: Path) -> Path:
+    """Where a split capture's matches are kept: ``sfm_viewmats_X.npz`` →
+    ``sfm_viewmats_X_database.db``."""
+    return path.with_name(f"{path.stem}_database.db")
+
+
+def clear_parts(path: Path):
+    """Delete the pieces a previous solve left beside ``path``, so a re-run
+    that no longer splits never trains a stale piece."""
+    for old in path.parent.glob(f"{path.stem}_part*"):
+        if old.is_dir():
+            shutil.rmtree(old, ignore_errors=True)
+        else:
+            old.unlink(missing_ok=True)
+
+
+def solve_parts(parts, args, db, ws, output, n_frames):
+    """Solve each extra piece in its own run of this script, reusing the
+    matched database, and write it beside the main result as ``_part<k>``.
+    Returns the parts written."""
+    done = []
+    for k, frames in parts:
+        frames_file = ws / f"part{k}_frames.txt"
+        frames_file.write_text("\n".join(frames) + "\n")
+        cmd = [
+            sys.executable, str(Path(__file__).resolve()),
+            "--scan", args.scan,
+            "--output", str(part_path(output, k)),
+            "--workspace", str(ws / f"part{k}"),
+            "--database", str(db),
+            "--frames", str(frames_file),
+            "--mapper", args.mapper_requested,
+            "--camera", args.camera,
+        ]
+        if args.cloud_output:
+            cmd += ["--cloud-output", str(part_path(Path(args.cloud_output), k))]
+        if args.no_loop_closure:
+            cmd.append("--no-loop-closure")
+        log(f"solving piece {k} on its own ({len(frames)} frames, "
+            f"{frames[0]} → {frames[-1]})")
+        env = {**os.environ, "LIDARSTUDIO_SFM_PART": f"Piece {k}"}
+        rc = subprocess.run(cmd, env=env).returncode
+        if rc == 0 and part_path(output, k).exists():
+            done.append(k)
+        else:
+            print(f"WARNING: piece {k} ({frames[0]} → {frames[-1]}) could "
+                  "not be solved on its own; it is left out.", flush=True)
+    return done
+
+
+def _try_other_mapper(rec, db, images_dir, ws, refine, args, n_frames,
+                      image_names=None):
     """A fragmented pass 1: solve again with the other mapper and keep
     whichever agrees better with the pairwise rotations. Sets ``args.mapper``
     to the winner, so pass 2 uses it too.
@@ -1020,7 +1336,7 @@ def _try_other_mapper(rec, db, images_dir, ws, refine, args, n_frames):
         f"fragmented; trying {other} as well")
     progress(45, f"SfM poses: fragmented — trying {other} mapping…")
     alt = run_mapping(db, images_dir, ws / "sparse_alt", f"pass 1 ({other})",
-                      refine, other)
+                      refine, other, image_names)
     if alt is None:
         return rec
     progress(52, "SfM poses: comparing the two solves…")
@@ -1047,6 +1363,9 @@ def poses_from_rec(rec):
 
     out = {}
     for img in rec.images.values():
+        # A model can hold images without a pose (a deregistered frame).
+        if not img.has_pose:
+            continue
         p = img.cam_from_world()
         q, t = p.rotation.quat, p.translation  # quat is x,y,z,w (scipy order)
         R = Rotation.from_quat(q).as_matrix()
@@ -2060,6 +2379,25 @@ def main():
     )
     p.add_argument("--camera", default="front")
     p.add_argument(
+        "--max-pieces",
+        type=int,
+        default=0,
+        help="when the capture falls apart, solve only this many pieces, "
+        "the largest first (0 = all of them)",
+    )
+    p.add_argument(
+        "--database",
+        default=None,
+        help="reuse this already-matched COLMAP database instead of "
+        "extracting and matching (used to solve one piece of a split capture)",
+    )
+    p.add_argument(
+        "--frames",
+        default=None,
+        help="text file of image names: solve only these frames (one piece "
+        "of a split capture)",
+    )
+    p.add_argument(
         "--cam-time-offset",
         type=float,
         default=-0.025,
@@ -2078,6 +2416,9 @@ def main():
         help="fail if SfM registers fewer than this fraction of frames",
     )
     args = p.parse_args()
+    # The fallback may switch args.mapper mid-run; pieces start from the
+    # mapper that was asked for, not the one the main piece ended on.
+    args.mapper_requested = args.mapper
 
     # Parsed up front: a malformed region should cost nothing, not surface an
     # hour into a run. Mutually exclusive with --mask-classes because they are
@@ -2142,6 +2483,9 @@ def main():
         ts_by_name = {
             n: k for n, k in ts_by_name.items() if (images_dir / n).exists()
         }
+        if args.frames:
+            keep = set(Path(args.frames).read_text().split())
+            ts_by_name = {n: k for n, k in ts_by_name.items() if n in keep}
         n_frames = len(ts_by_name)
         if n_frames < MIN_FRAMES:
             print(
@@ -2188,8 +2532,8 @@ def main():
 
     # A database left by an interrupted run may be partial (matching half
     # done) — start clean; the extracted JPEGs above are reused as-is.
-    db = ws / "database.db"
-    if db.exists():
+    db = Path(args.database) if args.database else ws / "database.db"
+    if not args.database and db.exists():
         db.unlink()
     model, params = camera_prior(scan, args.camera)
     # An uncalibrated phone lens must be solved for; a factory-calibrated
@@ -2241,81 +2585,202 @@ def main():
         log("ordered matching: loop closure disabled (it would re-add the "
             "long-range pairs the fold needs)")
         args.no_loop_closure = True
-    extract_and_match(db, images_dir, model, params, strategy, args.vocab_tree,
-                      mask_dir, args.match_window)
-    if image_set and _capture_is_ordered(scan):
-        warn_weak_links(db)
+    subset = None
+    ordered = image_set and _capture_is_ordered(scan)
+    # A capture that falls apart is solved as separate pieces, each written
+    # beside the main result as _part<k> and trained into its own splat.
+    # Masked and turntable captures are one object, solved whole, and a
+    # piece being solved on its own (--database) is not split again.
+    splittable = ordered and not args.turntable and mask_dir is None
+    pieces = None
+    link_names, link_strength = [], []
+    if args.database:
+        # One piece of a split capture: the parent already matched everything.
+        subset = sorted(ts_by_name)
+        splittable = False
+    else:
+        if image_set:
+            clear_parts(output)
+            database_path(output).unlink(missing_ok=True)
+            if args.cloud_output:
+                clear_parts(Path(args.cloud_output))
+        extract_and_match(db, images_dir, model, params, strategy,
+                          args.vocab_tree, mask_dir, args.match_window)
+        if ordered:
+            warn_weak_links(db)
+        if splittable:
+            link_names, link_strength = bridge_strength(db)
+            pieces = capture_pieces(link_names, link_strength)
+            if len(pieces) <= 1:
+                pieces = None
+            else:
+                log(f"the capture falls apart into {len(pieces)} stretches "
+                    "that share no matches at all (a blank wall or a blurred "
+                    "pan between them); solving them separately")
+    all_ts = dict(ts_by_name)
 
-    progress(38, "SfM poses: mapping (pass 1)…")
-    rec = run_mapping(db, images_dir, ws / "sparse", "pass 1", refine,
-                      args.mapper)
-    if (rec is not None and image_set and not args.turntable
-            and rec.num_reg_images() < FRAGMENTED_FRAC * n_frames):
-        rec = _try_other_mapper(rec, db, images_dir, ws, refine, args, n_frames)
-    if rec is None:
-        print("ERROR: SfM produced no reconstruction", flush=True)
-        return 1
-    min_reg = max(20, int(args.min_registered_frac * n_frames))
-    if rec.num_reg_images() < min_reg:
-        hint = (
-            "Re-shoot with more overlap: move slowly, keep 70%+ overlap "
-            "between consecutive frames, and avoid blank walls and glare."
-            if image_set
-            else "Use downscale 2 (odometry poses) for this scan."
-        )
+    def solve(subset, ts_by_name, n_frames):
+        """Map ``subset`` (None = every frame) through pass 1 and, unless
+        disabled, the loop-closed pass 2. Returns ``(rec, sfm, cam_params,
+        cam_model, names, viewmats, stats)``, or an exit code after
+        reporting why it failed."""
+        progress(38, "SfM poses: mapping (pass 1)…")
+        rec = run_mapping(db, images_dir, ws / "sparse", "pass 1", refine,
+                          args.mapper, subset)
+        if (rec is not None and image_set and not args.turntable
+                and rec.num_reg_images() < FRAGMENTED_FRAC * n_frames):
+            rec = _try_other_mapper(rec, db, images_dir, ws, refine, args,
+                                    n_frames, subset)
+        if rec is None:
+            print("ERROR: SfM produced no reconstruction", flush=True)
+            return 1
+        min_reg = max(20, int(args.min_registered_frac * n_frames))
+        if rec.num_reg_images() < min_reg:
+            hint = (
+                "Re-shoot with more overlap: move slowly, keep 70%+ overlap "
+                "between consecutive frames, and avoid blank walls and glare."
+                if image_set
+                else "Use downscale 2 (odometry poses) for this scan."
+            )
+            print(
+                f"ERROR: SfM registered only {rec.num_reg_images()}/{n_frames} "
+                f"frames — not enough texture/overlap for reliable poses. {hint}",
+                flush=True,
+            )
+            return 1
+
+        if image_set:
+            # No stage C: there is no LiDAR trajectory to align to, so the
+            # poses stay in the SfM's own frame — unitless and unlevelled,
+            # which the viewer shows as a sideways scene at arbitrary size.
+            # That is expected here, and is what the scale/level phase
+            # addresses.
+            progress(55, "SfM poses: building viewmats (no LiDAR alignment)…")
+            sfm, cam_params, cam_model = poses_from_rec(rec)
+            names, viewmats, stats = viewmats_from_sfm(sfm, ts_by_name)
+        else:
+            calib = ppc.load_calibration(scan / "calibration", args.camera)
+            T = calib["T"].astype(np.float64)
+
+            progress(55, "SfM poses: aligning to the LiDAR trajectory…")
+            sfm, cam_params, cam_model = poses_from_rec(rec)
+            names, viewmats, stats = align_to_lidar(
+                sfm, ts_by_name, Path(args.traj), T, args.cam_time_offset
+            )
+
+        if not args.no_loop_closure:
+            progress(60, "SfM poses: matching loop-closure pairs…")
+            pairs_path = ws / "pairs_loop.txt"
+            # LiDAR-aligned poses are metric, so the campaign's 2 m radius applies
+            # literally; an image set's frame is unitless and derives its own.
+            loop_radius = None if image_set else MAX_DIST_M
+            if build_loop_pairs(names, viewmats, pairs_path, loop_radius) > 0:
+                db_loop = ws / "database_loop.db"
+                shutil.copy2(db, db_loop)
+                match_loop_pairs(db_loop, pairs_path)
+                progress(68, "SfM poses: mapping (pass 2, loop-closed)…")
+                rec2 = run_mapping(
+                    db_loop, images_dir, ws / "sparse_loop", "pass 2", refine,
+                    args.mapper, subset
+                )
+                # A weaker pass-2 model means the added matches hurt — keep pass 1.
+                if rec2 is not None and rec2.num_reg_images() >= rec.num_reg_images():
+                    progress(88, "SfM poses: final alignment…")
+                    rec = rec2
+                    sfm, cam_params, cam_model = poses_from_rec(rec2)
+                    if image_set:
+                        names, viewmats, stats = viewmats_from_sfm(sfm, ts_by_name)
+                    else:
+                        names, viewmats, stats = align_to_lidar(
+                            sfm, ts_by_name, Path(args.traj), T, args.cam_time_offset
+                        )
+                else:
+                    log("pass 2 weaker than pass 1 — keeping pass-1 poses")
+
+        return rec, sfm, cam_params, cam_model, names, viewmats, stats
+
+    # Solve the main piece. A solve that jumps at a weak link has glued two
+    # pieces together wrongly: cut there and solve the main piece again.
+    # Stretches the solve could not place at all become pieces of their own.
+    parts = []
+    loose = []      # unplaced stretches, kept out of every later main piece
+    n_all = len(all_ts)
+    floor = max(MIN_PART_FRAMES, MIN_PART_FRAC * n_all)
+    for rnd in range(MAX_SPLIT_ROUNDS + 1):
+        if pieces and len(pieces) > 1:
+            main_piece, parts = keep_pieces(pieces, n_all)
+            subset = main_piece
+            ts_by_name = {n: all_ts[n] for n in main_piece if n in all_ts}
+            n_frames = len(ts_by_name)
+        got = solve(subset, ts_by_name, n_frames)
+        if isinstance(got, int):
+            return got
+        rec, sfm, cam_params, cam_model, names, viewmats, stats = got
+        if not splittable:
+            break
+        piece = list(subset) if subset else sorted(all_ts)
+        new_loose = unregistered_runs(piece, names, floor)
+        cuts = []
+        if rnd < MAX_SPLIT_ROUNDS:
+            jumps = pose_jumps(list(names), viewmats,
+                               [ts_by_name[n] for n in names])
+            cuts = jump_cuts(link_names, link_strength, jumps, piece)
+        if new_loose:
+            log(f"{len(new_loose)} stretch(es) of the capture could not be "
+                "placed with the rest: "
+                + ", ".join(f"{r[0]} → {r[-1]} ({len(r)} frames)"
+                            for r in new_loose)
+                + "; each is solved on its own")
+            loose += new_loose
+        if not cuts:
+            if new_loose:
+                # The main solve stands. The stretches it left out join the
+                # other pieces without re-solving it, and the main piece stays
+                # the one just solved even if a left-out stretch is longer:
+                # its poses are the ones in hand.
+                gone = {n for r in new_loose for n in r}
+                others = [p for p in (pieces or []) if p is not subset]
+                subset = [n for n in piece if n not in gone]
+                floor_k = [p for p in others + new_loose if len(p) >= floor]
+                floor_k.sort(key=lambda p: p[0])
+                parts = list(enumerate(floor_k, 1))
+            break
+        log("the solved camera path jumps at "
+            + ", ".join(f"{link_names[c]} | {link_names[c + 1]}" for c in cuts)
+            + ", where only weak matches tie the capture together: those "
+            "joins are wrong, so the capture is cut there and the main piece "
+            "solved again")
+        gone = {n for r in loose for n in r}
+        others = [p for p in (pieces or []) if p is not subset]
+        kept = [n for n in piece if n not in gone]
+        split = split_piece(kept, link_names, cuts)
+        if len(split) < 2 and not new_loose:
+            break       # nothing actually changed: re-solving would repeat it
+        pieces = [p for p in others + split + new_loose if p]
+    if parts and args.max_pieces and len(parts) + 1 > args.max_pieces:
+        # The user asked for only the biggest few. Numbers stay those of the
+        # full split, so a later run that keeps more names them the same.
+        keep = sorted(parts, key=lambda kp: -len(kp[1]))[:args.max_pieces - 1]
+        skipped = [kp for kp in parts if kp not in keep]
+        log(f"keeping the {args.max_pieces} largest piece(s) as asked; "
+            "skipping " + ", ".join(f"piece {k} ({len(p)} frames)"
+                                    for k, p in skipped))
+        parts = sorted(keep)
+    if parts:
+        main_desc = f"{subset[0]} → {subset[-1]}, {len(subset)} frames"
         print(
-            f"ERROR: SfM registered only {rec.num_reg_images()}/{n_frames} "
-            f"frames — not enough texture/overlap for reliable poses. {hint}",
+            f"WARNING: the capture falls apart into {1 + len(parts)} pieces "
+            "that nothing ties together reliably (a blank wall, a blurred "
+            "pan or a fast turn between them), so no solver can place them "
+            "relative to each other. Each is solved and trained SEPARATELY, "
+            f"in its own position and scale: the main piece ({main_desc})"
+            + "".join(f", piece {k} ({p[0]} → {p[-1]}, {len(p)} frames)"
+                      for k, p in parts)
+            + ". Load them together and move each into place to join them "
+            "by hand, or re-shoot the gaps slowly with textured detail in "
+            "view to get one joined scene.",
             flush=True,
         )
-        return 1
-
-    if image_set:
-        # No stage C: there is no LiDAR trajectory to align to, so the poses
-        # stay in the SfM's own frame — unitless and unlevelled, which the
-        # viewer shows as a sideways scene at arbitrary size. That is expected
-        # here, and is what the scale/level phase addresses.
-        progress(55, "SfM poses: building viewmats (no LiDAR alignment)…")
-        sfm, cam_params, cam_model = poses_from_rec(rec)
-        names, viewmats, stats = viewmats_from_sfm(sfm, ts_by_name)
-    else:
-        calib = ppc.load_calibration(scan / "calibration", args.camera)
-        T = calib["T"].astype(np.float64)
-
-        progress(55, "SfM poses: aligning to the LiDAR trajectory…")
-        sfm, cam_params, cam_model = poses_from_rec(rec)
-        names, viewmats, stats = align_to_lidar(
-            sfm, ts_by_name, Path(args.traj), T, args.cam_time_offset
-        )
-
-    if not args.no_loop_closure:
-        progress(60, "SfM poses: matching loop-closure pairs…")
-        pairs_path = ws / "pairs_loop.txt"
-        # LiDAR-aligned poses are metric, so the campaign's 2 m radius applies
-        # literally; an image set's frame is unitless and derives its own.
-        loop_radius = None if image_set else MAX_DIST_M
-        if build_loop_pairs(names, viewmats, pairs_path, loop_radius) > 0:
-            db_loop = ws / "database_loop.db"
-            shutil.copy2(db, db_loop)
-            match_loop_pairs(db_loop, pairs_path)
-            progress(68, "SfM poses: mapping (pass 2, loop-closed)…")
-            rec2 = run_mapping(
-                db_loop, images_dir, ws / "sparse_loop", "pass 2", refine,
-                args.mapper
-            )
-            # A weaker pass-2 model means the added matches hurt — keep pass 1.
-            if rec2 is not None and rec2.num_reg_images() >= rec.num_reg_images():
-                progress(88, "SfM poses: final alignment…")
-                rec = rec2
-                sfm, cam_params, cam_model = poses_from_rec(rec2)
-                if image_set:
-                    names, viewmats, stats = viewmats_from_sfm(sfm, ts_by_name)
-                else:
-                    names, viewmats, stats = align_to_lidar(
-                        sfm, ts_by_name, Path(args.traj), T, args.cam_time_offset
-                    )
-            else:
-                log("pass 2 weaker than pass 1 — keeping pass-1 poses")
 
     # Coverage is judged on the FINAL poses (after any loop-closure pass), and
     # only for image sets: a LiDAR scan is a walkthrough, not an orbit.
@@ -2328,6 +2793,9 @@ def main():
         coverage = turntable_fit["span"]
     else:
         coverage = report_coverage(viewmats) if image_set else None
+        # A turntable is measured by its fit above; its camera is static.
+        if image_set and _capture_is_ordered(scan):
+            warn_pose_jumps(names, viewmats, ts_by_name)
 
     if image_set:
         # The reconstruction outlives the workspace, for the same reason the
@@ -2408,6 +2876,18 @@ def main():
         )
     tmp.rename(output)
     log(f"wrote {output} ({len(names)}/{n_frames} viewmats; {stats})")
+
+    if parts:
+        progress(95, f"SfM poses: solving {len(parts)} more piece(s)…")
+        done = solve_parts(parts, args, db, ws, output, n_frames)
+        log(f"pieces written: main + {', '.join(f'part{k}' for k in done) or 'none'}")
+        if done:
+            # Refining a hand-made join of the pieces (process_join.py) needs
+            # every match, including the stray ones across the gaps, and this
+            # database is the only place they exist.
+            keep = database_path(output)
+            shutil.copy2(db, keep)
+            log(f"matches kept for refining a join of the pieces → {keep.name}")
 
     if not args.keep_workspace:
         # An image set's frames live in the project, not the workspace — only

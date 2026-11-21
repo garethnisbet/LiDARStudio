@@ -254,6 +254,46 @@ def _image_set_intrinsics(sfm_poses):
     return model, params
 
 
+def _lens(cam_model, cam_params):
+    """``(K, dist)`` for an SfM-solved phone lens: the 3x3 intrinsics and
+    OpenCV's (k1, k2, p1, p2)."""
+    import numpy as np
+
+    cam_params = np.asarray(cam_params, dtype=np.float64).reshape(-1)
+    # SIMPLE_RADIAL is (f, cx, cy, k); RADIAL adds k2; PINHOLE is
+    # (fx, fy, cx, cy). Normalise all of them to a K plus OpenCV's
+    # (k1, k2, p1, p2) distortion vector.
+    if cam_model in ("SIMPLE_RADIAL", "RADIAL"):
+        f, cx, cy = cam_params[0], cam_params[1], cam_params[2]
+        fx = fy = f
+        ks = list(cam_params[3:])
+    elif cam_model == "SIMPLE_PINHOLE":
+        f, cx, cy = cam_params[0], cam_params[1], cam_params[2]
+        fx = fy = f
+        ks = []
+    elif cam_model == "PINHOLE":
+        fx, fy, cx, cy = cam_params[:4]
+        ks = []
+    elif cam_model == "OPENCV":
+        # COLMAP's OPENCV params are already (fx, fy, cx, cy, k1, k2, p1, p2).
+        fx, fy, cx, cy = cam_params[:4]
+        ks = list(cam_params[4:8])
+    else:
+        raise RuntimeError(
+            f"unsupported image-set camera model {cam_model!r} — expected "
+            "SIMPLE_RADIAL, RADIAL, PINHOLE or OPENCV"
+        )
+    K0 = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
+    # OpenCV's distCoeffs are (k1, k2, p1, p2) in that order. The radial
+    # models above contribute only k1 (and k2); their tangential terms do
+    # not exist, so they stay zero.
+    dist = np.zeros(4, dtype=np.float64)
+    for i, k in enumerate(ks[:4]):
+        dist[i] = float(k)
+    D = dist
+    return K0, dist
+
+
 def build_camera_frames(
     scan: Path,
     traj_path: Path,
@@ -317,37 +357,9 @@ def build_camera_frames(
                 "(run the SfM stage first)"
             )
         cam_model, cam_params = _image_set_intrinsics(sfm_poses)
-        # SIMPLE_RADIAL is (f, cx, cy, k); RADIAL adds k2; PINHOLE is
-        # (fx, fy, cx, cy). Normalise all of them to a K plus OpenCV's
-        # (k1, k2, p1, p2) distortion vector.
-        if cam_model in ("SIMPLE_RADIAL", "RADIAL"):
-            f, cx, cy = cam_params[0], cam_params[1], cam_params[2]
-            fx = fy = f
-            ks = list(cam_params[3:])
-        elif cam_model == "SIMPLE_PINHOLE":
-            f, cx, cy = cam_params[0], cam_params[1], cam_params[2]
-            fx = fy = f
-            ks = []
-        elif cam_model == "PINHOLE":
-            fx, fy, cx, cy = cam_params[:4]
-            ks = []
-        elif cam_model == "OPENCV":
-            # COLMAP's OPENCV params are already (fx, fy, cx, cy, k1, k2, p1, p2).
-            fx, fy, cx, cy = cam_params[:4]
-            ks = list(cam_params[4:8])
-        else:
-            raise RuntimeError(
-                f"unsupported image-set camera model {cam_model!r} — expected "
-                "SIMPLE_RADIAL, RADIAL, PINHOLE or OPENCV"
-            )
-        K0 = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
-        # OpenCV's distCoeffs are (k1, k2, p1, p2) in that order. The radial
-        # models above contribute only k1 (and k2); their tangential terms do
-        # not exist, so they stay zero.
-        dist = np.zeros(4, dtype=np.float64)
-        for i, k in enumerate(ks[:4]):
-            dist[i] = float(k)
-        D = dist
+        K0, D = _lens(cam_model, cam_params)
+        fx, fy, cx, cy = K0[0, 0], K0[1, 1], K0[0, 2], K0[1, 2]
+        dist = D
         T = np.eye(4)  # unused: the SfM viewmats are already world→cam
         print(
             f"  image set: {cam_model} f={fx:.1f} c=({cx:.1f},{cy:.1f}) "
@@ -397,7 +409,8 @@ def build_camera_frames(
 
     radial = D.reshape(4).astype(np.float64)
     Dk = radial.reshape(4, 1)
-    maps = None  # (map1, map2, K_pinhole), built once
+    maps = None  # (map1, map2, K_pinhole) for the current frame's lens
+    maps_by_lens = {}  # one undistortion map per distinct lens
     offset_ns = int(round(cam_time_offset * 1e9))
     diag = {"n": 0, "clamped": 0, "snap_err_ns": [], "gap_ns": []}
     sfm_vm = None
@@ -408,6 +421,18 @@ def build_camera_frames(
             for t, vm in zip(ext["bag_ts_ns"], ext["viewmats"])
         }
         print(f"  external SfM poses: {len(sfm_vm)} frames from {sfm_poses}", flush=True)
+        # Poses joined from separately solved pieces (pieces.join_poses) keep
+        # each piece's own lens, one row per frame.
+        lens_by_ts = None
+        if image_set and "frame_camera_params" in ext.files:
+            lens_by_ts = {
+                int(t): tuple(float(v) for v in row)
+                for t, row in zip(ext["bag_ts_ns"], ext["frame_camera_params"])
+            }
+            print(f"  per-frame lens: {len(set(lens_by_ts.values()))} distinct "
+                  "(one per joined piece)", flush=True)
+    else:
+        lens_by_ts = None
     # Per-frame subject masks from process_sfm.py --mask-subject/--turntable.
     # Keyed by the SAME join key as the poses (never by enumeration order), so
     # a frame dropped between the two runs cannot shift masks onto the wrong
@@ -449,7 +474,13 @@ def build_camera_frames(
             skipped += 1
             continue
         h, w = img.shape[:2]
-        K = K0.copy()
+        lens_key = lens_by_ts.get(int(ts)) if lens_by_ts else None
+        if lens_key is not None:
+            K_f, radial = _lens(cam_model, lens_key)
+            K = K_f.copy()
+        else:
+            K = K0.copy()
+        maps = maps_by_lens.get(lens_key)
         if downscale > 1:
             img = cv2.resize(
                 img, (w // downscale, h // downscale), interpolation=cv2.INTER_AREA
@@ -500,6 +531,7 @@ def build_camera_frames(
                     )
                     lens = "fisheye"
                 maps = (m1, m2, Kp)
+                maps_by_lens[lens_key] = maps
                 # Report the FOV actually produced: on the image_set path it
                 # comes from the solved focal length, not --undistort-fov.
                 fov_out = (
