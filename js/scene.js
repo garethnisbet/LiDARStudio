@@ -261,6 +261,19 @@ export function setFloorSize(radius) {
   gridPlane.geometry = new THREE.PlaneGeometry(ext * 2, ext * 2);
 }
 
+// View distance: the far clip plane of both cameras. The near plane follows
+// at far / 50000 so depth precision stays what it was at the 50 m default
+// (near 1 mm); a longer reach trades away the closest millimetres.
+export const NEAR_PER_FAR = 1 / 50000;
+export function setViewDistance(far) {
+  for (const cam of [State.camera, State.orthoCamera]) {
+    cam.far = far;
+    cam.near = far * NEAR_PER_FAR;
+    cam.updateProjectionMatrix();
+  }
+  State.requestRender();
+}
+
 // ============================================================
 // Navigation gizmo (Blender-style, Canvas 2D)
 // ============================================================

@@ -30,6 +30,11 @@
     <input type="range" id="floorSize" min="0.5" max="4" value="2" step="0.25" style="flex:1;">
     <span id="floorSizeVal" style="font-size:11px; color:#8cf; min-width:32px;">2 m</span>
   </div>
+  <div style="display:flex; align-items:center; gap:6px; margin-top:4px;" title="How far the view reaches: anything further from the camera than this is not drawn. A longer reach also pushes the nearest drawable distance out (reach / 50000), so keep it short for close-up work.">
+    <label style="font-size:11px; color:#889; white-space:nowrap;">View distance:</label>
+    <input type="range" id="viewDistance" min="1" max="4" value="1.699" step="0.01" style="flex:1;">
+    <span id="viewDistanceVal" style="font-size:11px; color:#8cf; min-width:32px;">50 m</span>
+  </div>
   <div style="display:flex; align-items:center; gap:6px; margin-top:4px;">
     <label style="font-size:11px; color:#889; white-space:nowrap;">Point size:</label>
     <input type="range" id="pointSize" min="0.5" max="200" value="3" step="0.5" style="flex:1;">

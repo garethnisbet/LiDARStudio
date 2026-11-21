@@ -16,7 +16,7 @@ import {
   navCanvas, NAV_AXES, navHitTest,
   navHovered, setNavHovered, renderNavGizmo,
   snapAnim, setSnapAnim, snapClock, easeNavSnap,
-  setFloorSize,
+  setFloorSize, setViewDistance,
 } from './scene.js';
 import {
   buildSceneMetadataForDB, buildSceneBuffersForDB, sceneBufferSignature,
@@ -284,6 +284,14 @@ document.getElementById('floorSize').addEventListener('input', (e) => {
   const r = parseFloat(e.target.value);
   document.getElementById('floorSizeVal').textContent = `${r} m`;
   setFloorSize(r);
+});
+
+// View distance slider: log scale, 10 m to 10 km (value = log10 metres)
+document.getElementById('viewDistance').addEventListener('input', (e) => {
+  const far = Math.pow(10, parseFloat(e.target.value));
+  const shown = far >= 1000 ? `${(far / 1000).toPrecision(2)} km` : `${far.toPrecision(2) * 1} m`;
+  document.getElementById('viewDistanceVal').textContent = shown;
+  setViewDistance(far);
 });
 
 // Point size slider (mm in the UI; PointsMaterial.size is world metres)
