@@ -690,20 +690,34 @@ def apply_pose(pose, xyz):
     return (pose[:3, :3] @ xyz.T).T + pose[:3, 3]
 
 
-def save_trajectory(cloud_path: Path, lidar_ts, poses):
+def save_trajectory(cloud_path: Path, lidar_ts, poses, odometry_tilt=None,
+                    sfm_poses=None):
     """
     Save the per-scan trajectory next to the cloud as ``<cloud>.traj.npz`` so the
     splat stage can derive camera poses (lidar pose ∘ lidar→camera extrinsic).
     Poses are already gravity-levelled, matching the saved cloud.
+
+    It also records how far the odometry tilted off gravity, so the app can
+    tell a cloud built from slipped odometry and rebuild it from the camera
+    poses; and, for a cloud placed from those poses, which pose file is in its
+    frame, so the splat trains against that one and not the original. The
+    sidecar travels with crop/recolour edits, and so does this.
     """
     import numpy as np
 
     p = Path(str(cloud_path) + ".traj.npz")
     p.parent.mkdir(parents=True, exist_ok=True)
+    extra = {}
+    if odometry_tilt is not None and np.isfinite(odometry_tilt):
+        extra["odometry_max_tilt_deg"] = np.float64(odometry_tilt)
+        extra["odometry_tilted"] = np.bool_(odometry_tilt > ODOMETRY_TILT_DEG)
+    if sfm_poses:
+        extra["sfm_poses"] = np.str_(str(sfm_poses))
     np.savez(
         p,
         ts=np.asarray(lidar_ts, dtype=np.int64),
         poses=np.asarray(poses, dtype=np.float64),
+        **extra,
     )
     return p
 
@@ -1188,11 +1202,13 @@ def main():
                 "--no-slam for a stationary/tripod gyro-only stack."
             ) from exc
 
+    odo_tilt = None
     if poses is not None and imu_ts is not None and len(imu_ts) > 1:
         ups = gravity_up(imu_ts, imu_a, lidar_timestamps)
         tilt = tilt_vs_gravity(poses, ups)
         if np.isfinite(tilt).any():
             worst = int(np.nanargmax(tilt))
+            odo_tilt = float(tilt[worst])
             t_s = (lidar_timestamps[worst] - lidar_timestamps[0]) / 1e9
             print(
                 f"  odometry tilt vs gravity: median {np.nanmedian(tilt):.1f}°, "
@@ -1204,8 +1220,8 @@ def main():
                     f"  WARNING: the odometry tilted {tilt[worst]:.0f}° off "
                     f"gravity around {t_s:.0f} s into the scan, so parts of "
                     "the cloud will be doubled or tilted against each other. "
-                    "Rebuild it with --sfm-poses (camera poses from the "
-                    "photos) once SfM has run.",
+                    "LiDAR Studio rebuilds it from the camera poses (SfM); "
+                    "on the command line, re-run with --sfm-poses.",
                     flush=True,
                 )
 
@@ -1257,6 +1273,7 @@ def main():
         rel = rel.with_name(rel.stem + "_relevelled.npz")
         np.savez(rel, viewmats=np.array(vm_new), **extra)
         print(f"  wrote matching splat poses: {rel}", flush=True)
+        relevelled = rel
         empty = np.zeros((0, 3), dtype=np.float32)
         for i, P in enumerate(placed):
             if P is None:
@@ -1269,6 +1286,7 @@ def main():
         poses_keep_idx = keep_idx
     else:
         poses_keep_idx = None
+        relevelled = None
 
     # Self-view filter: the handheld unit's own handle/mount (and the operator's
     # hand gripping it) sit at a FIXED position in the sensor frame, so every
@@ -1308,12 +1326,14 @@ def main():
             apply_pose(P, xyz) for P, xyz in zip(poses, all_xyz, strict=False)
         ]
         if poses_keep_idx is None:
-            save_trajectory(output, lidar_timestamps, poses)
+            save_trajectory(output, lidar_timestamps, poses, odometry_tilt=odo_tilt)
         else:
             save_trajectory(
                 output,
                 [lidar_timestamps[i] for i in poses_keep_idx],
                 [poses[i] for i in poses_keep_idx],
+                odometry_tilt=odo_tilt,
+                sfm_poses=relevelled,
             )
     elif imu_ts is not None and len(imu_ts) > 1:
         _, quats = integrate_orientation(imu_ts, imu_w, imu_a)

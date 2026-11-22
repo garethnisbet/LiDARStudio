@@ -696,7 +696,8 @@ async def _stream_proc(proc, queue):
     return proc.returncode, last_error
 
 
-def _pointcloud_cmd(scan, contents, output_file, voxel, mono=False, keep_self_view=False):
+def _pointcloud_cmd(scan, contents, output_file, voxel, mono=False, keep_self_view=False,
+                    sfm_poses=None):
     """Build the process_pointcloud.py argv for a scan."""
     cmd = [
         sys.executable,
@@ -720,6 +721,8 @@ def _pointcloud_cmd(scan, contents, output_file, voxel, mono=False, keep_self_vi
         cmd += ["--params", str(scan / "project_parameters.json")]
     if contents.get("calibration"):
         cmd += ["--calibration", str(scan / "calibration")]
+    if sfm_poses:
+        cmd += ["--sfm-poses", str(sfm_poses)]
     return cmd
 
 
@@ -821,8 +824,9 @@ async def _job_pointcloud(project_path, scan_path, options, queue, job=None):
     ts = stem.split("_", 1)[1] if "_" in stem else stem
     output_file = out_dir / f"pointcloud_{ts}.ply"
 
-    if await _run_lidar_pointcloud(
-        scan, contents, output_file, options, queue, job, "Point cloud generation"
+    if await _build_lidar_cloud(
+        proj, scan, contents, ts, output_file, options, queue, job,
+        "Point cloud generation",
     ):
         size_mb = round(output_file.stat().st_size / 1_048_576, 1)
         await queue.put({"event": "progress", "percent": 100, "message": "Complete!"})
@@ -838,7 +842,7 @@ async def _job_pointcloud(project_path, scan_path, options, queue, job=None):
 
 
 async def _run_lidar_pointcloud(scan, contents, output_file, options, queue, job,
-                                label):
+                                label, sfm_poses=None):
     """Run process_pointcloud.py for a LiDAR scan. True when the cloud was
     written; otherwise the cancel/error event has already been queued."""
     cmd = _pointcloud_cmd(
@@ -848,13 +852,15 @@ async def _run_lidar_pointcloud(scan, contents, output_file, options, queue, job
         options.get("voxel_size", 0.05),
         mono=bool(options.get("mono", False)),
         keep_self_view=bool(options.get("keep_self_view", False)),
+        sfm_poses=sfm_poses,
     )
 
     await queue.put(
         {
             "event": "progress",
             "percent": 5,
-            "message": "Launching process_pointcloud.py…",
+            "message": ("Placing the sweeps from the camera poses…" if sfm_poses
+                        else "Launching process_pointcloud.py…"),
         }
     )
 
@@ -892,6 +898,141 @@ async def _run_lidar_pointcloud(scan, contents, output_file, options, queue, job
         }
     )
     return False
+
+
+async def _run_lidar_sfm(proj, scan, ts, traj, options, queue, job, force, label):
+    """Solve the camera poses of a LiDAR scan with process_sfm.py, aligned to
+    the trajectory sidecar ``traj``, into ``<proj>/sfm/sfm_viewmats_<ts>.npz``.
+
+    Returns ``(path, None)`` on success; ``(None, message)`` on failure, for
+    the caller to report (or not); ``(None, None)`` when cancelled, with the
+    cancel event already queued.
+    """
+    canonical = proj / "sfm" / f"sfm_viewmats_{ts}.npz"
+    sfm_py = await asyncio.to_thread(_sfm_python)
+    if sfm_py is None:
+        return None, ("No Python with pycolmap was found to solve the camera "
+                      "poses (pip install pycolmap, or set "
+                      "$LIDARSTUDIO_SFM_PYTHON).")
+    await queue.put(
+        {
+            "event": "progress",
+            "percent": 1,
+            "message": (
+                (
+                    "Rebuilding the SfM poses from scratch"
+                    if force
+                    else "No SfM poses for this scan — generating them first"
+                )
+                + " (COLMAP + LiDAR alignment, CPU-bound, can take "
+                "an hour or two; reused by every later run)…"
+            ),
+        }
+    )
+    sfm_cmd = [
+        sfm_py,
+        str(ROOT / "process_sfm.py"),
+        "--scan",
+        str(scan),
+        "--traj",
+        str(traj),
+        "--output",
+        str(canonical),
+        "--workspace",
+        str(proj / "sfm" / f"work_{ts}"),
+        # Pinned, not left to the default. process_sfm defaults to
+        # incremental because it beat GLOMAP 90 deg to 60 on an
+        # AMBIGUOUS scene — a symmetric object against a textureless
+        # background. A LiDAR walkthrough is the opposite of that, it
+        # is what the champion npz was validated with under GLOMAP,
+        # and GLOMAP is also ~2x faster to map (165 frames in 54 s vs
+        # incremental's 102 s for 150), a gap that widens over a
+        # 900-frame scan. Changing this path needs its own evidence.
+        "--mapper",
+        str(options.get("mapper", "glomap")),
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *sfm_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    job["proc"] = proc
+    if job.get("cancelled"):
+        proc.terminate()
+    rc, err = await _stream_proc(proc, queue)
+    job["proc"] = None
+    if job.get("cancelled"):
+        await queue.put({"event": "cancelled", "message": f"{label} stopped."})
+        return None, None
+    if rc != 0 or not canonical.exists():
+        return None, err or f"SfM pose generation failed (exit code {rc})"
+    return canonical, None
+
+
+def _traj_meta(cloud):
+    """What process_pointcloud recorded in a cloud's trajectory sidecar about
+    how it was placed: ``odometry_tilted`` (bool), ``odometry_max_tilt_deg``,
+    and ``sfm_poses`` (the camera-pose file in the cloud's frame, for a cloud
+    placed from SfM). Empty for a cloud without a sidecar, or one built before
+    these were recorded."""
+    import numpy as np
+
+    from lidarstudio import edit_ops
+
+    traj = edit_ops._find_traj(cloud) if cloud else None
+    if traj is None:
+        return {}
+    try:
+        with np.load(traj) as z:
+            return {k: z[k].item() for k in
+                    ("odometry_tilted", "odometry_max_tilt_deg", "sfm_poses")
+                    if k in z.files}
+    except Exception:
+        return {}
+
+
+async def _build_lidar_cloud(proj, scan, contents, ts, output_file, options,
+                             queue, job, label):
+    """Build a LiDAR scan's cloud; if the odometry tilted off gravity, rebuild
+    it with every sweep placed from the SfM camera poses instead.
+
+    KISS-ICP can slip in roll/pitch mid-scan (2026-11-22 Clinic: 35° at
+    ~60 s, under every setting tried), which stacks the cloud as two copies
+    of the room tilted against each other. The photos still see it right,
+    so the camera poses place the sweeps; the odometry supplies only scale.
+    Solving them costs an hour or two the first time, which is why this runs
+    only when the check fires. True when a cloud was written.
+    """
+    if not await _run_lidar_pointcloud(scan, contents, output_file, options,
+                                       queue, job, label):
+        return False
+    meta = _traj_meta(output_file)
+    if not meta.get("odometry_tilted") or not options.get("sfm_fallback", True):
+        return True
+    deg = meta.get("odometry_max_tilt_deg", 0.0)
+    canonical = proj / "sfm" / f"sfm_viewmats_{ts}.npz"
+    await queue.put({"event": "log", "message": (
+        f"The LiDAR odometry tilted {deg:.0f}° off gravity during this scan, "
+        "so the cloud would come out as misaligned pieces. Rebuilding it with "
+        "each sweep placed from the camera poses (SfM) instead"
+        + (f", reusing {canonical.name}…" if canonical.exists() else
+           " — solving those first…"))})
+    if not canonical.exists():
+        traj = Path(str(output_file) + ".traj.npz")
+        got, err = await _run_lidar_sfm(proj, scan, ts, traj, options, queue,
+                                        job, False, label)
+        if got is None:
+            if err:
+                # The odometry cloud is still usable for a look; say so
+                # rather than fail the whole job.
+                await queue.put({"event": "log", "message": (
+                    f"WARNING: could not solve the camera poses ({err}), so "
+                    f"{output_file.name} is the odometry cloud and may be "
+                    "misaligned.")})
+                return True
+            return False
+    return await _run_lidar_pointcloud(scan, contents, output_file, options,
+                                       queue, job, label, sfm_poses=canonical)
 
 
 def _mesh_cmd(scan, contents, cloud_file, output_file, options, sfm_poses=None):
@@ -1927,9 +2068,9 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
             # spacing sets each gaussian's starting size, and 5 cm seeds are
             # ~20x the screen area per splat — the 2026-11-22 Clinic run
             # OOM'd at 3M splats where the 1 cm champion peaked at 9 GB.
-            if not await _run_lidar_pointcloud(
-                scan, contents, auto_cloud, {"voxel_size": 0.01}, queue, job,
-                "Splat generation",
+            if not await _build_lidar_cloud(
+                proj, scan, contents, ts, auto_cloud, {"voxel_size": 0.01},
+                queue, job, "Splat generation",
             ):
                 return
             pc_files = [auto_cloud]
@@ -2066,6 +2207,18 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
                 )
                 return
             pc_files = [seed_cloud_path]
+    elif not sfm_poses and not force_sfm and _placed_poses(pc_files):
+        # The seed was placed from the camera poses, which were rescaled and
+        # levelled to do it: only that copy is in the seed's frame. The
+        # original canonical npz is in the slipped odometry's frame.
+        sfm_poses = str(_placed_poses(pc_files))
+        await queue.put(
+            {
+                "event": "log",
+                "message": f"Using the poses the seed cloud was placed from: "
+                           f"{Path(sfm_poses).name}",
+            }
+        )
     elif not sfm_poses:
         if canonical.exists() and not force_sfm:
             sfm_poses = str(canonical)
@@ -2090,81 +2243,17 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
                     }
                 )
                 return
-            sfm_py = await asyncio.to_thread(_sfm_python)
-            if sfm_py is None:
-                await queue.put(
-                    {
-                        "event": "error",
-                        "message": (
-                            "Downscale 1 needs SfM poses, and no Python with "
-                            "pycolmap was found to generate them (pip install "
-                            "pycolmap, or set $LIDARSTUDIO_SFM_PYTHON). Either "
-                            "install it, set an SfM poses .npz in the quality "
-                            "panel, or use downscale 2+."
-                        ),
-                    }
-                )
-                return
-            await queue.put(
-                {
-                    "event": "progress",
-                    "percent": 1,
-                    "message": (
-                        (
-                            "Rebuilding the SfM poses from scratch"
-                            if force_sfm
-                            else "No SfM poses for this scan — generating them first"
-                        )
-                        + " (COLMAP + LiDAR alignment, CPU-bound, can take "
-                        "an hour or two; reused by every later run)…"
-                    ),
-                }
+            got, err = await _run_lidar_sfm(
+                proj, scan, ts, traj, options, queue, job, force_sfm,
+                "Splat generation",
             )
-            sfm_cmd = [
-                sfm_py,
-                str(ROOT / "process_sfm.py"),
-                "--scan",
-                str(scan),
-                "--traj",
-                str(traj),
-                "--output",
-                str(canonical),
-                "--workspace",
-                str(proj / "sfm" / f"work_{ts}"),
-                # Pinned, not left to the default. process_sfm defaults to
-                # incremental because it beat GLOMAP 90 deg to 60 on an
-                # AMBIGUOUS scene — a symmetric object against a textureless
-                # background. A LiDAR walkthrough is the opposite of that, it
-                # is what the champion npz was validated with under GLOMAP,
-                # and GLOMAP is also ~2x faster to map (165 frames in 54 s vs
-                # incremental's 102 s for 150), a gap that widens over a
-                # 900-frame scan. Changing this path needs its own evidence.
-                "--mapper",
-                str(options.get("mapper", "glomap")),
-            ]
-            proc = await asyncio.create_subprocess_exec(
-                *sfm_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            job["proc"] = proc
-            if job.get("cancelled"):
-                proc.terminate()
-            rc, err = await _stream_proc(proc, queue)
-            job["proc"] = None
-            if job.get("cancelled"):
-                await queue.put(
-                    {"event": "cancelled", "message": "Splat generation stopped."}
-                )
-                return
-            if rc != 0 or not canonical.exists():
-                await queue.put(
-                    {
-                        "event": "error",
-                        "message": err
-                        or f"SfM pose generation failed (exit code {rc})",
-                    }
-                )
+            if got is None:
+                if err:
+                    await queue.put({"event": "error", "message": (
+                        err if "pycolmap" not in err else
+                        "Downscale 1 needs SfM poses. " + err + " Either install "
+                        "it, set an SfM poses .npz in the quality panel, or use "
+                        "downscale 2+.")})
                 return
             sfm_poses = str(canonical)
 
@@ -2421,6 +2510,22 @@ def _largest_parts(parts, max_pieces: int):
 
     keep = set(sorted(parts, key=frames, reverse=True)[: max_pieces - 1])
     return [p for p in parts if p in keep]
+
+
+def _placed_poses(pc_files):
+    """The camera-pose file the seed cloud was placed from, if it was and the
+    file is still there; else None."""
+    rel = _traj_meta(pc_files[-1]).get("sfm_poses") if pc_files else None
+    if not rel or not Path(rel).exists():
+        return None
+    rel = Path(rel)
+    # A forced SfM re-run since then solved new poses aligned to this seed's
+    # own (SfM-placed) trajectory: those are the newer answer, so let the
+    # canonical file win.
+    canonical = rel.with_name(rel.stem.removesuffix("_relevelled") + ".npz")
+    if canonical.exists() and canonical.stat().st_mtime > rel.stat().st_mtime:
+        return None
+    return rel
 
 
 def _sfm_parts(canonical: Path):
