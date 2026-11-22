@@ -889,8 +889,9 @@ export function initLidarPanel() {
   // splat-only panel until then, which meant a mesh could not be told its
   // capture was a turntable, and so could not get fold-proof matching.
   const hRecon = el('h4', { style: 'margin:10px 0 4px' }, 'Reconstruction (photo captures)');
-  const pRecon = el('div', {},
-    el('div', { class: 'row', style: 'align-items:center' },
+  // Its own row, not part of pRecon: a LiDAR splat runs SfM too (downscale 1),
+  // and pRecon is photo-only, which hid this from the LiDAR workflow.
+  const pForceSfm = el('div', { class: 'row', style: 'align-items:center' },
       el('label', { class: 'muted', style: 'flex:1;display:flex;align-items:center;gap:6px;white-space:nowrap' },
         forceSfmCb, 'force SfM regeneration'),
       infoIcon('Throw away this scan\u2019s stored reconstruction and build it again '
@@ -901,7 +902,8 @@ export function initLidarPanel() {
         + 'again (tens of minutes for a phone capture, an hour or two for a LiDAR scan), '
         + 'and for a phone capture it rebuilds the seed cloud too, since poses and seed '
         + 'must come from the same reconstruction. Ignored if a poses path is set below.',
-        'Force SfM regeneration')),
+        'Force SfM regeneration'));
+  const pRecon = el('div', {},
     el('div', { class: 'row', style: 'align-items:center' },
       el('label', { class: 'muted', style: 'flex:1;display:flex;align-items:center;gap:6px;white-space:nowrap' },
         maskSubjectCb, 'mask to subject'),
@@ -1021,6 +1023,8 @@ export function initLidarPanel() {
     headTitle.textContent = photo ? 'Photogrammetry Workflow' : 'LiDAR Workflow';
     const recon = photo && (type === 'splat' || type === 'mesh' || type === 'pointcloud');
     pRecon.style.display = recon ? 'block' : 'none';
+    // LiDAR: only the splat job runs SfM (the mesh/cloud jobs never do).
+    pForceSfm.style.display = (recon || type === 'splat') ? 'flex' : 'none';
     hRecon.style.display = recon ? 'block' : 'none';
     const meshOpts = photo && type === 'mesh';
     pMesh.style.display = meshOpts ? 'block' : 'none';

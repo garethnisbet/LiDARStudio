@@ -528,6 +528,152 @@ def register_with_kiss(
     return poses
 
 
+# A handheld scanner sweeps at ~10 Hz, so a 0.5 m step between consecutive
+# sweeps is 5 m/s: walking pace is ~0.3-0.6 m/s. Steps that large are the
+# odometry losing track, not the operator moving.
+ODOMETRY_JUMP_M = 0.5
+
+# Settings retried when the defaults lose track. Found on the cramped Clinic
+# scan 20261122201854 (median return 1.4 m): the default 0.5 m map voxel
+# (max_range/100) is too coarse for walls that close, and the defaults jumped
+# 1220 times (2656 m of path in 170 s). These never jumped there (36 cm RMS vs
+# the SfM camera path). NOT the default: on the 20260527212832 champion scan
+# the 20 m range broke odometry (125 cm vs 5.7 cm).
+ODOMETRY_RESCUE = {"max_range": 20.0, "voxel_size": 0.15}
+
+
+def odometry_jumps(poses, max_step=ODOMETRY_JUMP_M):
+    """Indices of sweeps whose position jumps more than ``max_step`` metres
+    from the previous one — the signature of KISS-ICP losing track."""
+    import numpy as np
+
+    if len(poses) < 2:
+        return np.array([], dtype=int)
+    t = np.array([np.asarray(p)[:3, 3] for p in poses])
+    return np.nonzero(np.linalg.norm(np.diff(t, axis=0), axis=1) > max_step)[0] + 1
+
+
+# Odometry tilt drift worth warning about. On the 20260527212832 champion the
+# KISS trajectory stays within 2.6 deg of IMU gravity; on the Clinic scan
+# 20261122201854 it slipped 35 deg at ~60 s without a single jump, which
+# stacked the scan as two tilted copies of the room.
+ODOMETRY_TILT_DEG = 15.0
+
+
+def gravity_up(imu_ts, imu_a, ts, half_window_ns=500_000_000):
+    """Unit 'up' (mean specific force) in the IMU/LiDAR sensor frame around
+    each time in ``ts``; NaN rows where the IMU has no samples. Averaging a
+    second of samples cancels most of the walking acceleration."""
+    import numpy as np
+
+    it = np.asarray(imu_ts, dtype=np.int64)
+    a = np.asarray(imu_a, dtype=np.float64)
+    out = np.full((len(ts), 3), np.nan)
+    for i, t in enumerate(ts):
+        lo, hi = np.searchsorted(it, [int(t) - half_window_ns, int(t) + half_window_ns])
+        if hi - lo >= 10:
+            g = a[lo:hi].mean(0)
+            out[i] = g / np.linalg.norm(g)
+    return out
+
+
+def tilt_vs_gravity(poses, ups):
+    """Degrees between each pose's world-frame 'up' (pose rotation applied to
+    the sensor-frame gravity) and their consensus. Pose drift in roll/pitch
+    shows up directly; heading drift is invisible to gravity."""
+    import numpy as np
+
+    w = np.array([np.asarray(P)[:3, :3] @ u for P, u in zip(poses, ups)])
+    ok = np.isfinite(w).all(1)
+    if not ok.any():
+        return np.full(len(poses), np.nan)
+    ref = np.median(w[ok], axis=0)
+    ref /= np.linalg.norm(ref)
+    out = np.full(len(poses), np.nan)
+    out[ok] = np.degrees(np.arccos(np.clip(w[ok] @ ref, -1, 1)))
+    return out
+
+
+def _rot_between(a, b):
+    """Rotation matrix taking unit vector a onto unit vector b."""
+    import numpy as np
+
+    v = np.cross(a, b)
+    c = float(a @ b)
+    if np.linalg.norm(v) < 1e-12:
+        return np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + vx + vx @ vx / (1 + c)
+
+
+def sweep_poses_from_sfm(viewmats, cam_ts, T_lidar_cam, lidar_ts, scale=1.0,
+                         cam_time_offset=-0.025, max_gap_s=1.0):
+    """LiDAR sensor→world pose for each sweep, from the SfM camera path.
+
+    The photos are solved independently of the odometry, so where KISS-ICP
+    slips (cramped rooms, doorways) the cameras still carry the right pose.
+    ``viewmats`` are world→cam; a camera frame at ``cam_ts`` sees the LiDAR
+    at ``cam_ts + cam_time_offset`` (process_sfm's convention), so sweep time
+    ``t`` reads the camera path at ``t - offset``. ``scale`` multiplies the
+    camera centres (world origin fixed) to make the path metric. Sweeps more
+    than ``max_gap_s`` from any camera frame get ``None``: interpolation would
+    clamp them to an endpoint and stack them in the wrong place.
+    """
+    import numpy as np
+
+    from process_splat import _interp_pose
+
+    cam_ts = np.asarray(cam_ts, dtype=np.int64)
+    order = np.argsort(cam_ts)
+    cam_ts = cam_ts[order]
+    c2w = []
+    for vm in np.asarray(viewmats, dtype=np.float64)[order]:
+        P = np.linalg.inv(vm)
+        P[:3, 3] *= scale
+        c2w.append(P)
+    c2w = np.array(c2w)
+    off = int(round(cam_time_offset * 1e9))
+    gap_ns = int(max_gap_s * 1e9)
+    out = []
+    for t in lidar_ts:
+        tc = int(t) - off
+        j = int(np.searchsorted(cam_ts, tc))
+        near = min(abs(tc - cam_ts[k]) for k in (j - 1, j) if 0 <= k < len(cam_ts))
+        if near > gap_ns:
+            out.append(None)
+            continue
+        Pc, _, _ = _interp_pose(cam_ts, c2w, tc)
+        out.append(Pc @ T_lidar_cam)
+    return out
+
+
+def sfm_scale_from_odometry(viewmats, cam_ts, T_lidar_cam, odo_ts, odo_poses,
+                            cam_time_offset=-0.025, window=7):
+    """Metric scale for an SfM path: median ratio of odometry to SfM camera
+    displacement over ``window``-frame spans. Local ratios stay right through
+    an odometry slip (a rotation) that ruins a global sim(3) fit."""
+    import numpy as np
+
+    from process_splat import _interp_pose
+
+    cam_ts = np.asarray(cam_ts, dtype=np.int64)
+    order = np.argsort(cam_ts)
+    V = np.asarray(viewmats, dtype=np.float64)[order]
+    c_sfm = np.array([-vm[:3, :3].T @ vm[:3, 3] for vm in V])
+    off = int(round(cam_time_offset * 1e9))
+    o_ts = np.asarray(odo_ts, dtype=np.int64)
+    c_odo = []
+    for t in cam_ts[order]:
+        P, _, _ = _interp_pose(o_ts, odo_poses, int(t) + off)
+        vm = T_lidar_cam @ np.linalg.inv(P)
+        c_odo.append(-vm[:3, :3].T @ vm[:3, 3])
+    c_odo = np.array(c_odo)
+    d_s = np.linalg.norm(c_sfm[window:] - c_sfm[:-window], axis=1)
+    d_o = np.linalg.norm(c_odo[window:] - c_odo[:-window], axis=1)
+    ok = d_s > 0.05 * np.median(d_s)
+    return float(np.median(d_o[ok] / d_s[ok]))
+
+
 def _level_transform(imu_a, n0=100):
     """4×4 transform that rotates the integrated map so gravity points down."""
     import numpy as np
@@ -787,13 +933,30 @@ def main():
         "(ccw verified best by multi-view colour consistency)",
     )
     parser.add_argument(
-        "--max-range", type=float, default=50.0, help="KISS-ICP max LiDAR range (m)"
+        "--max-range", type=float, default=None,
+        help="KISS-ICP max LiDAR range (m); default 50. Setting this or "
+        "--kiss-voxel disables the automatic retry when odometry loses track"
     )
     parser.add_argument(
         "--kiss-voxel",
         type=float,
         default=None,
         help="KISS-ICP map voxel size (m); default auto",
+    )
+    parser.add_argument(
+        "--sfm-poses",
+        default=None,
+        help="place each sweep from this process_sfm.py camera-pose npz "
+        "instead of the LiDAR odometry — for scans where KISS-ICP slips. "
+        "Odometry still runs, for metric scale. Also writes "
+        "<npz stem>_relevelled.npz next to it, in the cloud's frame, for "
+        "training the splat",
+    )
+    parser.add_argument(
+        "--sfm-scale",
+        type=float,
+        default=None,
+        help="metric scale for --sfm-poses; default: estimated from the odometry",
     )
     parser.add_argument(
         "--no-slam",
@@ -948,16 +1111,57 @@ def main():
     if not args.no_slam:
         try:
             progress(40, "Registering scans with KISS-ICP…")
-            raw_poses = register_with_kiss(
-                all_xyz,
-                all_ts=(all_pt_ts if kiss_deskew else None),
-                max_range=args.max_range,
-                voxel_size=args.kiss_voxel,
-                deskew=kiss_deskew,
-                progress_cb=lambda i, n: progress(
-                    40 + int(15 * i / n), f"KISS-ICP registering {i}/{n}…"
-                ),
+            def _register(max_range, voxel, label):
+                return register_with_kiss(
+                    all_xyz,
+                    all_ts=(all_pt_ts if kiss_deskew else None),
+                    max_range=max_range,
+                    voxel_size=voxel,
+                    deskew=kiss_deskew,
+                    progress_cb=lambda i, n: progress(
+                        40 + int(15 * i / n), f"{label} {i}/{n}…"
+                    ),
+                )
+
+            explicit = args.max_range is not None or args.kiss_voxel is not None
+            raw_poses = _register(
+                args.max_range if args.max_range is not None else 50.0,
+                args.kiss_voxel,
+                "KISS-ICP registering",
             )
+            jumps = odometry_jumps(raw_poses)
+            if len(jumps) and not explicit:
+                print(
+                    f"  WARNING: odometry lost track — {len(jumps)} sweep-to-"
+                    f"sweep jumps over {ODOMETRY_JUMP_M} m, first at sweep "
+                    f"{jumps[0]}. Retrying with a {ODOMETRY_RESCUE['max_range']:g} m "
+                    f"range and {ODOMETRY_RESCUE['voxel_size']:g} m map voxels "
+                    "(suits cramped rooms)…",
+                    flush=True,
+                )
+                raw_poses = _register(
+                    ODOMETRY_RESCUE["max_range"],
+                    ODOMETRY_RESCUE["voxel_size"],
+                    "KISS-ICP retry",
+                )
+                jumps = odometry_jumps(raw_poses)
+                if not len(jumps):
+                    print("  Retry held track: no jumps.", flush=True)
+            if len(jumps):
+                # A cloud stacked on a lost trajectory is smeared across tens of
+                # metres; a splat seeded from it trains into faint needles and
+                # runs out of GPU memory an hour later. Stop here instead.
+                raise SystemExit(
+                    f"ERROR: LiDAR odometry lost track ({len(jumps)} jumps over "
+                    f"{ODOMETRY_JUMP_M} m between sweeps, first at sweep "
+                    f"{jumps[0]} ≈ {(lidar_timestamps[jumps[0]] - lidar_timestamps[0]) / 1e9:.0f} s "
+                    "into the scan), so the cloud would be smeared. "
+                    + ("Try other --max-range / --kiss-voxel values."
+                       if explicit else
+                       "The automatic retry failed too. The capture may "
+                       "give the LiDAR too little structure: rescan more "
+                       "slowly, keeping walls and furniture in view.")
+                )
             poses = [L @ P for P in raw_poses]  # level the whole trajectory
             mode = (
                 "IMU-deskewed"
@@ -983,6 +1187,88 @@ def main():
                 f"({sys.executable}). Install it (pip install kiss-icp), or pass "
                 "--no-slam for a stationary/tripod gyro-only stack."
             ) from exc
+
+    if poses is not None and imu_ts is not None and len(imu_ts) > 1:
+        ups = gravity_up(imu_ts, imu_a, lidar_timestamps)
+        tilt = tilt_vs_gravity(poses, ups)
+        if np.isfinite(tilt).any():
+            worst = int(np.nanargmax(tilt))
+            t_s = (lidar_timestamps[worst] - lidar_timestamps[0]) / 1e9
+            print(
+                f"  odometry tilt vs gravity: median {np.nanmedian(tilt):.1f}°, "
+                f"max {tilt[worst]:.1f}° at {t_s:.0f} s",
+                flush=True,
+            )
+            if tilt[worst] > ODOMETRY_TILT_DEG and not args.sfm_poses:
+                print(
+                    f"  WARNING: the odometry tilted {tilt[worst]:.0f}° off "
+                    f"gravity around {t_s:.0f} s into the scan, so parts of "
+                    "the cloud will be doubled or tilted against each other. "
+                    "Rebuild it with --sfm-poses (camera poses from the "
+                    "photos) once SfM has run.",
+                    flush=True,
+                )
+
+    if args.sfm_poses:
+        if calib is None:
+            raise SystemExit("ERROR: --sfm-poses needs the scan calibration "
+                             "(LiDAR→camera transform).")
+        T_lc = calib["T"].astype(np.float64)
+        sfm = np.load(args.sfm_poses)
+        s_vm, s_ts = sfm["viewmats"], sfm["bag_ts_ns"]
+        if args.sfm_scale:
+            k = float(args.sfm_scale)
+        elif poses is not None:
+            k = sfm_scale_from_odometry(s_vm, s_ts, T_lc, lidar_timestamps, poses)
+        else:
+            raise SystemExit("ERROR: --sfm-poses without odometry needs --sfm-scale.")
+        placed = sweep_poses_from_sfm(s_vm, s_ts, T_lc, lidar_timestamps, scale=k)
+        # Level the world with IMU gravity: the SfM frame inherits its
+        # orientation from whatever trajectory it was first aligned to, which
+        # is the broken one when this option is needed.
+        ups = gravity_up(imu_ts, imu_a, lidar_timestamps) if imu_ts is not None \
+            else np.full((len(placed), 3), np.nan)
+        w_up = np.array([P[:3, :3] @ u for P, u in zip(placed, ups)
+                         if P is not None and np.isfinite(u).all()])
+        W = np.eye(4)
+        if len(w_up):
+            m = np.median(w_up, axis=0)
+            W[:3, :3] = _rot_between(m / np.linalg.norm(m), np.array([0.0, 0.0, 1.0]))
+        placed = [None if P is None else W @ P for P in placed]
+        n_out = sum(P is None for P in placed)
+        tilt = tilt_vs_gravity([P for P in placed if P is not None],
+                               [u for P, u in zip(placed, ups) if P is not None])
+        print(
+            f"  placed {len(placed) - n_out} sweeps from SfM camera poses "
+            f"(scale {k:.4f}; {n_out} outside camera coverage dropped); "
+            f"tilt vs gravity median {np.nanmedian(tilt):.1f}°, "
+            f"max {np.nanmax(tilt):.1f}°",
+            flush=True,
+        )
+        # The splat must train on the SAME frame as this cloud: write the
+        # camera poses rescaled + levelled alongside.
+        vm_new = []
+        for vm in s_vm:
+            P = np.linalg.inv(vm.astype(np.float64))
+            P[:3, 3] *= k
+            vm_new.append(np.linalg.inv(W @ P))
+        extra = {f: sfm[f] for f in sfm.files if f != "viewmats"}
+        rel = Path(args.sfm_poses)
+        rel = rel.with_name(rel.stem + "_relevelled.npz")
+        np.savez(rel, viewmats=np.array(vm_new), **extra)
+        print(f"  wrote matching splat poses: {rel}", flush=True)
+        empty = np.zeros((0, 3), dtype=np.float32)
+        for i, P in enumerate(placed):
+            if P is None:
+                all_xyz[i] = empty
+                if all_intensity[i] is not None:
+                    all_intensity[i] = all_intensity[i][:0]
+        keep_idx = [i for i, P in enumerate(placed) if P is not None]
+        poses = [placed[i] if placed[i] is not None else np.eye(4)
+                 for i in range(len(placed))]
+        poses_keep_idx = keep_idx
+    else:
+        poses_keep_idx = None
 
     # Self-view filter: the handheld unit's own handle/mount (and the operator's
     # hand gripping it) sit at a FIXED position in the sensor frame, so every
@@ -1021,7 +1307,14 @@ def main():
         all_xyz_world = [
             apply_pose(P, xyz) for P, xyz in zip(poses, all_xyz, strict=False)
         ]
-        save_trajectory(output, lidar_timestamps, poses)
+        if poses_keep_idx is None:
+            save_trajectory(output, lidar_timestamps, poses)
+        else:
+            save_trajectory(
+                output,
+                [lidar_timestamps[i] for i in poses_keep_idx],
+                [poses[i] for i in poses_keep_idx],
+            )
     elif imu_ts is not None and len(imu_ts) > 1:
         _, quats = integrate_orientation(imu_ts, imu_w, imu_a)
         Rs = frame_rotations(lidar_timestamps, imu_ts, quats)
@@ -1101,10 +1394,13 @@ def main():
             total = f"/{n}" if n else ""
             progress(min(pct, 89), f"Colouring from photo {i}{total}…")
 
+        # Sweeps dropped by --sfm-poses carry a placeholder pose; keep them
+        # out of the photo-pose lookup.
+        ci = poses_keep_idx if poses_keep_idx is not None else range(len(poses))
         rgb, _ = colour_points_multiview(
             combined_xyz,
-            poses,
-            lidar_timestamps,
+            [poses[i] for i in ci],
+            [lidar_timestamps[i] for i in ci],
             image_bag,
             calib,
             camera=args.camera,

@@ -821,6 +821,26 @@ async def _job_pointcloud(project_path, scan_path, options, queue, job=None):
     ts = stem.split("_", 1)[1] if "_" in stem else stem
     output_file = out_dir / f"pointcloud_{ts}.ply"
 
+    if await _run_lidar_pointcloud(
+        scan, contents, output_file, options, queue, job, "Point cloud generation"
+    ):
+        size_mb = round(output_file.stat().st_size / 1_048_576, 1)
+        await queue.put({"event": "progress", "percent": 100, "message": "Complete!"})
+        await queue.put(
+            {
+                "event": "result",
+                "type": "pointcloud",
+                "path": str(output_file),
+                "filename": output_file.name,
+                "size_mb": size_mb,
+            }
+        )
+
+
+async def _run_lidar_pointcloud(scan, contents, output_file, options, queue, job,
+                                label):
+    """Run process_pointcloud.py for a LiDAR scan. True when the cloud was
+    written; otherwise the cancel/error event has already been queued."""
     cmd = _pointcloud_cmd(
         scan,
         contents,
@@ -851,7 +871,7 @@ async def _job_pointcloud(project_path, scan_path, options, queue, job=None):
                 "message": "process_pointcloud.py not found — see the stub script.",
             }
         )
-        return
+        return False
 
     job["proc"] = proc
     if job.get("cancelled"):
@@ -861,28 +881,17 @@ async def _job_pointcloud(project_path, scan_path, options, queue, job=None):
     job["proc"] = None
 
     if job.get("cancelled"):
-        await queue.put(
-            {"event": "cancelled", "message": "Point cloud generation stopped."}
-        )
-    elif rc == 0 and output_file.exists():
-        size_mb = round(output_file.stat().st_size / 1_048_576, 1)
-        await queue.put({"event": "progress", "percent": 100, "message": "Complete!"})
-        await queue.put(
-            {
-                "event": "result",
-                "type": "pointcloud",
-                "path": str(output_file),
-                "filename": output_file.name,
-                "size_mb": size_mb,
-            }
-        )
-    else:
-        await queue.put(
-            {
-                "event": "error",
-                "message": err or f"process_pointcloud.py exited with code {rc}",
-            }
-        )
+        await queue.put({"event": "cancelled", "message": f"{label} stopped."})
+        return False
+    if rc == 0 and output_file.exists():
+        return True
+    await queue.put(
+        {
+            "event": "error",
+            "message": err or f"process_pointcloud.py exited with code {rc}",
+        }
+    )
+    return False
 
 
 def _mesh_cmd(scan, contents, cloud_file, output_file, options, sfm_poses=None):
@@ -1898,6 +1907,32 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
         trainable = [p for p in pc_files if edit_ops._find_traj(p)]
         if trainable:
             pc_files = trainable
+        if not pc_files:
+            # No cloud yet: build the coloured one from the scan, as the
+            # point-cloud job would, rather than send the user off to run it.
+            # Always coloured: a mono seed would only be recoloured below.
+            auto_cloud = pc_dir / f"pointcloud_{ts}.ply"
+            await queue.put(
+                {
+                    "event": "log",
+                    "message": (
+                        "No point cloud in the project yet — generating the "
+                        f"coloured seed {auto_cloud.name} from the scan first…"
+                    ),
+                }
+            )
+            pc_dir.mkdir(exist_ok=True)
+            # 1 cm, the GUI's point-cloud default and what the champion seed
+            # was built at. NOT the 5 cm _pointcloud_cmd fallback: seed knn
+            # spacing sets each gaussian's starting size, and 5 cm seeds are
+            # ~20x the screen area per splat — the 2026-11-22 Clinic run
+            # OOM'd at 3M splats where the 1 cm champion peaked at 9 GB.
+            if not await _run_lidar_pointcloud(
+                scan, contents, auto_cloud, {"voxel_size": 0.01}, queue, job,
+                "Splat generation",
+            ):
+                return
+            pc_files = [auto_cloud]
 
     # Monochromatic seed (the fast --mono generator, or an import without photo
     # colour): a grey seed trains a grey splat, so colour it from the scan

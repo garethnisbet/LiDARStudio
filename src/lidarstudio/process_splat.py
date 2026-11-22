@@ -2092,8 +2092,10 @@ def main():
         print(
             f"ERROR: GPU ran out of memory at {frames[0]['image'].shape[1]}×"
             f"{frames[0]['image'].shape[0]}, {args.cap_max // 1_000_000}M splats. "
-            "Lower the quality — set downscale to 2, reduce max splats (e.g. 3M), "
-            "or lower sharpen× — then retry.",
+            "Lower the quality — set downscale to 2, reduce max splats below "
+            f"{args.cap_max / 1e6:g}M, or lower sharpen× — then retry. If the "
+            "seed cloud reaches far beyond where the cameras went (LiDAR seen "
+            "through windows/doors), crop it to the scanned space first.",
             flush=True,
         )
         sys.exit(1)
