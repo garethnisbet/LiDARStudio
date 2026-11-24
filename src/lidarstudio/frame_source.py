@@ -16,7 +16,14 @@ to sys.path.
 """
 
 import csv
+import hashlib
+import json
 from pathlib import Path
+
+# The user's include/exclude markers from the photo viewer, beside the
+# manifest. Sections name their end frames rather than indexing them, so the
+# file means the same thing to every reader whatever else is filtered.
+SELECTION_FILE = "selection.json"
 
 
 def is_image_set(scan: Path) -> bool:
@@ -35,9 +42,94 @@ def read_manifest(scan: Path):
         return list(csv.DictReader(f))
 
 
+def read_selection(scan: Path) -> list:
+    """The marked sections, ``[{"start", "end", "mode"}]`` with ``mode`` either
+    'include' or 'exclude' — empty when nothing is marked or the file is bad
+    (a corrupt selection must not silently empty the capture)."""
+    f = Path(scan) / SELECTION_FILE
+    if not f.is_file():
+        return []
+    try:
+        sections = json.loads(f.read_text()).get("sections") or []
+    except (OSError, ValueError, AttributeError):
+        return []
+    return [
+        s for s in sections
+        if isinstance(s, dict) and s.get("mode") in ("include", "exclude")
+        and s.get("start") and s.get("end")
+    ]
+
+
+def apply_selection(names, sections) -> list:
+    """``names`` (manifest order) less what the sections drop.
+
+    Include sections, if there are any, say what to keep and everything
+    outside them goes; exclude sections then cut from what is left, so an
+    exclude inside an include carves a gap. A section whose end frame is not
+    in ``names`` (a stale file) is ignored rather than guessed at.
+    """
+    names = list(names)
+    pos = {n: i for i, n in enumerate(names)}
+    inc, exc = [], []
+    for s in sections:
+        a, b = pos.get(s["start"]), pos.get(s["end"])
+        if a is None or b is None:
+            continue
+        (inc if s["mode"] == "include" else exc).append((min(a, b), max(a, b)))
+
+    def inside(i, ranges):
+        return any(a <= i <= b for a, b in ranges)
+
+    return [
+        n for i, n in enumerate(names)
+        if (not inc or inside(i, inc)) and not inside(i, exc)
+    ]
+
+
+def selected_rows(scan: Path) -> list:
+    """Manifest rows the user's markers keep, in file order."""
+    rows = read_manifest(scan)
+    sections = read_selection(scan)
+    if not sections:
+        return rows
+    keep = set(apply_selection([r["name"] for r in rows], sections))
+    return [r for r in rows if r["name"] in keep]
+
+
+def selection_digest(scan: Path) -> str:
+    """Identity of the frame set the markers select: '' when nothing is
+    marked, so a reconstruction from before markers existed still matches an
+    unmarked capture. Hashes the RESULT, not the file, so moving a marker in a
+    way that keeps the same frames does not cost a re-run of SfM."""
+    if not read_selection(scan):
+        return ""
+    names = "\n".join(r["name"] for r in selected_rows(scan))
+    return hashlib.sha1(names.encode()).hexdigest()
+
+
+def selection_stamp(npz: Path) -> Path:
+    """Sidecar recording which selection a reconstruction was solved from
+    (``sfm_viewmats_X.npz`` → ``sfm_viewmats_X.selection``)."""
+    npz = Path(npz)
+    return npz.with_name(npz.stem + ".selection")
+
+
+def selection_matches(npz: Path, scan: Path) -> bool:
+    """Whether the reconstruction at ``npz`` was solved from the frames the
+    markers select now. One with no sidecar predates markers, so it was solved
+    from every frame — a match exactly when nothing is marked."""
+    f = selection_stamp(npz)
+    try:
+        done = f.read_text().strip() if f.is_file() else ""
+    except OSError:
+        done = ""
+    return done == selection_digest(scan)
+
+
 def image_set_keys(scan: Path) -> dict:
-    """name → key_ns for an ingested image set."""
-    return {r["name"]: int(r["key_ns"]) for r in read_manifest(scan)}
+    """name → key_ns for an ingested image set, less any frames the user's
+    markers exclude."""
+    return {r["name"]: int(r["key_ns"]) for r in selected_rows(scan)}
 
 
 def find_image_bag(scan: Path) -> Path:
@@ -57,7 +149,7 @@ def find_image_bag(scan: Path) -> Path:
 
 def frame_count(scan: Path, camera: str = "front") -> int:
     if is_image_set(scan):
-        return len(read_manifest(scan))
+        return len(selected_rows(scan))
     import process_pointcloud as ppc
 
     return sum(
@@ -77,7 +169,7 @@ def open_frames(scan: Path, camera: str = "front", rot: str = "ccw"):
         import cv2
 
         images = scan / "images"
-        for row in read_manifest(scan):
+        for row in selected_rows(scan):
             path = images / row["name"]
             if not path.exists():
                 continue  # filtered out after the manifest was written

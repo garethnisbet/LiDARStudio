@@ -83,13 +83,13 @@ function _buildSTLPayload(entry, bufferFn, includeSplatBuffers) {
 
 export function buildScenePayload() {
   const stls = State.importedSTLs.map(entry => _buildSTLPayload(entry, _arrayBufferToBase64, false));
-  return { version: 1, stls, camera: _buildCameraPayload(), floorSize: State.floorSize, pointSize: _pointSize, pointShape: _pointShapeName };
+  return { version: 1, stls, camera: _buildCameraPayload(), floorSize: State.floorSize, viewDistance: State.camera.far, pointSize: _pointSize, pointShape: _pointShapeName };
 }
 
 // DB variant — stores raw ArrayBuffers (no base64), used by IndexedDB auto-save.
 export function buildScenePayloadForDB() {
   const stls = State.importedSTLs.map(entry => _buildSTLPayload(entry, buf => buf, true));
-  return { version: 1, stls, camera: _buildCameraPayload(), floorSize: State.floorSize, pointSize: _pointSize, pointShape: _pointShapeName };
+  return { version: 1, stls, camera: _buildCameraPayload(), floorSize: State.floorSize, viewDistance: State.camera.far, pointSize: _pointSize, pointShape: _pointShapeName };
 }
 
 // Metadata-only DB payload — omits the heavy mesh/point-cloud/splat buffers,
@@ -97,7 +97,7 @@ export function buildScenePayloadForDB() {
 // Cheap enough to clone into IndexedDB on every auto-save tick.
 export function buildSceneMetadataForDB() {
   const stls = State.importedSTLs.map(entry => _buildSTLPayload(entry, null, false));
-  return { version: 1, stls, camera: _buildCameraPayload(), floorSize: State.floorSize, pointSize: _pointSize, pointShape: _pointShapeName };
+  return { version: 1, stls, camera: _buildCameraPayload(), floorSize: State.floorSize, viewDistance: State.camera.far, pointSize: _pointSize, pointShape: _pointShapeName };
 }
 
 // The heavy buffers only, keyed by stl id. Re-written only when the buffer set

@@ -1128,11 +1128,149 @@ export function initLidarPanel() {
     'object-fit:contain;background:#000;border-radius:4px' });
   const mvSlider = el('input', { type: 'range', min: '0', max: '0', value: '0', style: 'flex:1' });
   const mvNum = el('span', { class: 'muted', style: 'min-width:86px;text-align:right' }, '–');
-  let mvSource = null, mvTimer = null;   // {title, count, url(i)}
+  let mvSource = null, mvTimer = null;   // {title, count, url(i), select?}
+
+  // ── Frame markers (ingested photo captures only): the user marks sections
+  // of the capture to include or exclude, and every later stage (SfM, splat,
+  // mesh) uses only the frames they keep. Saved beside the manifest as frame
+  // names; a changed selection makes the next job re-run SfM. ──
+  let mkSections = [];      // [{start, end, mode}] in preview indices
+  let mkIn = null;          // pending section start, or null
+  let mkSaveTimer = null;
+  const mkCur = () => Math.min(mvSource.count - 1, Math.max(0, parseInt(mvSlider.value) || 0));
+  // Same rule as frame_source.apply_selection: include sections (if any) say
+  // what to keep, exclude sections then cut from it.
+  const mkKept = (i) => {
+    const inc = mkSections.filter(s => s.mode === 'include');
+    const inside = (m) => mkSections.some(s => s.mode === m && s.start <= i && i <= s.end);
+    return (!inc.length || inside('include')) && !inside('exclude');
+  };
+  const mkKeptCount = () => {
+    let n = 0;
+    for (let i = 0; i < mvSource.count; i++) if (mkKept(i)) n++;
+    return n;
+  };
+  const mkStrip = el('div', { title: 'Green = included section, red = excluded; '
+    + 'dim = dropped by the markers. Click to jump to a frame.', style:
+    'position:relative;height:16px;margin-top:4px;background:#2a2d36;'
+    + 'border-radius:3px;overflow:hidden;cursor:pointer' });
+  const mkBadge = el('div', { style:
+    'position:absolute;top:8px;left:50%;transform:translateX(-50%);display:none;'
+    + 'background:rgba(170,40,40,0.9);color:#fff;font-weight:600;padding:3px 10px;'
+    + 'border-radius:4px;pointer-events:none' }, 'EXCLUDED');
+  const mkStat = el('span', { class: 'muted', style: 'margin-left:8px' }, '');
+  const mkList = el('div', { style: 'display:flex;flex-wrap:wrap;gap:4px;margin-top:4px' });
+  const mkBtn = (label, title, onclick, extra = '') =>
+    el('button', { class: 'act', title, style: 'width:auto;padding:2px 8px;' + extra, onclick }, label);
+  const mkStartBtn = mkBtn('[ Mark start', 'Start a section at this frame (key: [ )',
+    () => { mkIn = mkCur(); mkRender(); });
+  const mkAdd = (mode) => {
+    const i = mkCur();
+    // No start marked: a one-click section from the start marker's absence
+    // would be surprising, so treat the current frame as both ends.
+    const a = mkIn == null ? i : Math.min(mkIn, i), b = mkIn == null ? i : Math.max(mkIn, i);
+    mkSections.push({ start: a, end: b, mode });
+    mkIn = null;
+    mkRender(); mkSave();
+  };
+  const mkIncBtn = mkBtn('Include ]', 'End the section here and KEEP it. With any include '
+    + 'section, only included frames are used (key: i)', () => mkAdd('include'), 'background:#2d6a3e');
+  const mkExcBtn = mkBtn('Exclude ]', 'End the section here and DROP it from SfM, splat and '
+    + 'mesh (key: x)', () => mkAdd('exclude'), 'background:#8a2f2f');
+  const mkClearBtn = mkBtn('Clear all', 'Remove every marker: all frames are used',
+    () => { mkSections = []; mkIn = null; mkRender(); mkSave(); });
+  const mkSaveStat = el('span', { class: 'muted', style: 'margin-left:auto' }, '');
+  const mkRow = el('div', { style: 'display:none;margin-top:6px' },
+    el('div', { class: 'row', style: 'align-items:center;gap:4px;flex-wrap:wrap' },
+      el('span', { style: 'font-weight:600;margin-right:4px' }, 'Frame markers'),
+      infoIcon('Mark the parts of the capture to use. Scrub to the first frame of a stretch '
+        + 'and press "[ Mark start", scrub to its last frame and press "Include ]" or '
+        + '"Exclude ]". Exclude drops a stretch (a blurred swing, someone walking through, '
+        + 'the floor between two passes). Include keeps ONLY the included stretches, and '
+        + 'excludes still cut gaps inside them. Markers save automatically; the next '
+        + 'splat, mesh or point cloud job re-runs SfM on the kept frames. Re-ingesting '
+        + 'clears them. Keys: [ start, i include, x exclude, ← → step.', 'Frame markers'),
+      mkStartBtn, mkIncBtn, mkExcBtn, mkClearBtn, mkStat, mkSaveStat),
+    mkStrip, mkList);
+  const mkRender = () => {
+    if (!mvSource || !mvSource.select) return;
+    const n = Math.max(1, mvSource.count);
+    const pct = (i) => `${(100 * i / n).toFixed(3)}%`;
+    const w = (a, b) => `${(100 * (b - a + 1) / n).toFixed(3)}%`;
+    mkStrip.replaceChildren();
+    // Dropped frames dimmed first, sections on top, then the markers.
+    let runStart = null;
+    for (let i = 0; i <= mvSource.count; i++) {
+      const drop = i < mvSource.count && !mkKept(i);
+      if (drop && runStart == null) runStart = i;
+      if (!drop && runStart != null) {
+        mkStrip.appendChild(el('div', { style: `position:absolute;top:0;bottom:0;left:${pct(runStart)};`
+          + `width:${w(runStart, i - 1)};background:rgba(0,0,0,0.55)` }));
+        runStart = null;
+      }
+    }
+    for (const sct of mkSections) {
+      mkStrip.appendChild(el('div', { style: `position:absolute;left:${pct(sct.start)};`
+        + `width:${w(sct.start, sct.end)};${sct.mode === 'include' ? 'top:0;height:5px;background:#3fae5a'
+          : 'bottom:0;height:5px;background:#d24b4b'}` }));
+    }
+    if (mkIn != null) {
+      const a = Math.min(mkIn, mkCur()), b = Math.max(mkIn, mkCur());
+      mkStrip.appendChild(el('div', { style: `position:absolute;top:0;bottom:0;left:${pct(a)};`
+        + `width:${w(a, b)};background:rgba(255,210,80,0.25);border-left:2px solid #ffd250` }));
+    }
+    mkStrip.appendChild(el('div', { style: `position:absolute;top:0;bottom:0;left:${pct(mkCur())};`
+      + 'width:2px;background:#fff' }));
+    mkList.replaceChildren(...mkSections.map((sct, k) => el('span', { style:
+      'display:inline-flex;align-items:center;gap:4px;padding:1px 6px;border-radius:10px;'
+      + `font-size:12px;background:${sct.mode === 'include' ? '#24502f' : '#5e2424'}` },
+      el('a', { href: '#', style: 'color:#ddd;text-decoration:none', title: 'Jump to this section',
+        onclick: (e) => { e.preventDefault(); mvSlider.value = String(sct.start); mvShow(); } },
+        `${sct.mode} ${sct.start}\u2013${sct.end}`),
+      el('a', { href: '#', style: 'color:#f99;text-decoration:none', title: 'Remove this section',
+        onclick: (e) => { e.preventDefault(); mkSections.splice(k, 1); mkRender(); mkSave(); } }, '\u2715'))));
+    const kept = mkKeptCount();
+    mkStat.textContent = (mkIn != null ? `start at ${mkIn} \u2014 ` : '')
+      + `${kept} / ${mvSource.count} frames used`;
+    const dropped = !mkKept(mkCur());
+    mkBadge.style.display = dropped ? 'block' : 'none';
+    mvImg.style.opacity = dropped ? '0.45' : '1';
+  };
+  const mkSave = () => {
+    if (!mvSource || !mvSource.select) return;
+    mkSaveStat.textContent = 'saving…';
+    clearTimeout(mkSaveTimer);
+    mkSaveTimer = setTimeout(async () => {
+      try {
+        const r = await api('/api/scan/selection', { ...mvSource.select, sections: mkSections });
+        mkSaveStat.textContent = mkSections.length ? `saved (${r.kept} kept)` : 'saved (all frames)';
+      } catch (e) { mkSaveStat.textContent = 'save failed: ' + e.message; }
+    }, 400);
+  };
+  mkStrip.addEventListener('click', (e) => {
+    if (!mvSource) return;
+    const r = mkStrip.getBoundingClientRect();
+    mvSlider.value = String(Math.floor((e.clientX - r.left) / r.width * mvSource.count));
+    mvShow();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (mvPanel.style.display === 'none' || !mvSource) return;
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) && e.target !== mvSlider) return;
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      if (e.target === mvSlider) return;   // the range input steps itself
+      mvStep(e.key === 'ArrowLeft' ? -1 : 1); e.preventDefault(); return;
+    }
+    if (!mvSource.select) return;
+    if (e.key === '[') { mkIn = mkCur(); mkRender(); e.preventDefault(); }
+    else if (e.key === 'i') { mkAdd('include'); e.preventDefault(); }
+    else if (e.key === 'x') { mkAdd('exclude'); e.preventDefault(); }
+  });
+
   const mvShow = () => {
     if (!mvSource) return;
     const i = Math.min(mvSource.count - 1, Math.max(0, parseInt(mvSlider.value) || 0));
     mvNum.textContent = `${i} / ${mvSource.count - 1}`;
+    if (mvSource.select) mkRender();
     // Debounce while scrubbing so we don't request every intermediate frame.
     clearTimeout(mvTimer);
     mvTimer = setTimeout(() => { mvImg.src = mvSource.url(i); }, 120);
@@ -1150,11 +1288,19 @@ export function initLidarPanel() {
       el('button', { class: 'act', style: 'width:34px', onclick: () => mvStep(1) }, '▶'),
       el('button', { class: 'act', style: 'width:30px;margin-left:8px;background:#a33',
         onclick: () => { mvPanel.style.display = 'none'; } }, '✕')),
-    mvImg,
-    el('div', { class: 'row', style: 'margin-top:6px' }, mvSlider, mvNum));
+    el('div', { style: 'position:relative' }, mvImg, mkBadge),
+    el('div', { class: 'row', style: 'margin-top:6px' }, mvSlider, mvNum),
+    mkRow);
   document.body.appendChild(mvPanel);
   const mvOpen = (source) => {
     mvSource = source;
+    mkSections = (source.sections || []).map(s => ({ ...s }));
+    mkIn = null;
+    mkSaveStat.textContent = '';
+    mkRow.style.display = source.select ? 'block' : 'none';
+    // The marker row takes ~80 px; give it room so it never falls off-screen.
+    mvImg.style.maxHeight = source.select ? 'calc(92vh - 200px)' : 'calc(92vh - 110px)';
+    if (!source.select) { mkBadge.style.display = 'none'; mvImg.style.opacity = '1'; }
     mvTitle.textContent = source.title;
     mvSlider.max = String(Math.max(0, source.count - 1));
     if (parseInt(mvSlider.value) >= source.count) mvSlider.value = '0';
@@ -1182,6 +1328,10 @@ export function initLidarPanel() {
         title: `Scan photos — ${r.count} frames`,
         count: r.count,
         url: q,
+        // Ingested frames can be marked for include/exclude; raw photos and
+        // bag frames are only previewed.
+        select: r.selectable ? { path: scan, project } : null,
+        sections: r.sections || [],
       });
     } catch (e) { photoStat.textContent = 'Error: ' + e.message; }
   } }, 'Load photos');
@@ -1300,7 +1450,7 @@ export function initLidarPanel() {
         else if (d.event === 'result' && d.type === 'ingest') {
           setBar(100, `Ingested ${d.frames} frames into ${d.filename} — now run 'splat'.`);
           // The frames just changed; 'Load photos' should offer the new ones.
-          photoStat.textContent = `${d.frames} ingested frames ready — 'Load photos' shows them.`;
+          photoStat.textContent = `${d.frames} ingested frames ready — 'Load photos' shows them, and can mark sections to include or exclude.`;
         }
         else if (d.event === 'result') {
           const many = (d.pieces || 1) > 1;
@@ -2069,6 +2219,7 @@ export function initLidarPanel() {
         + 'video) for photogrammetry; run it once, then choose splat.', 'Output type')),
     pSeed,
     hRecon,
+    pForceSfm,
     pRecon,
     hMesh,
     pMesh,

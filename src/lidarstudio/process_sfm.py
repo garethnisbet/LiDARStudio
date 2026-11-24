@@ -2486,6 +2486,30 @@ def main():
         if args.frames:
             keep = set(Path(args.frames).read_text().split())
             ts_by_name = {n: k for n, k in ts_by_name.items() if n in keep}
+        elif frame_source.read_selection(scan):
+            # The user marked sections to include or exclude in the photo
+            # viewer. Feature extraction, masking and ordered pairing all read
+            # the images FOLDER, so give them one holding only the kept
+            # frames, under their own names — then every name the database,
+            # masks and npz carry is still a manifest name. (A piece solved on
+            # its own is handed a database that already holds only these.)
+            sel_dir = ws / "images_selected"
+            if sel_dir.exists():
+                shutil.rmtree(sel_dir)
+            sel_dir.mkdir(parents=True)
+            for n in ts_by_name:
+                src, dst = images_dir / n, sel_dir / n
+                try:
+                    os.link(src, dst)
+                except OSError:
+                    try:
+                        dst.symlink_to(src.resolve())
+                    except OSError:
+                        shutil.copy2(src, dst)
+            n_all = sum(1 for f in images_dir.iterdir() if f.is_file())
+            log(f"frame selection: {len(ts_by_name)} of {n_all} frames kept by "
+                f"the viewer's include/exclude markers")
+            images_dir = sel_dir
         n_frames = len(ts_by_name)
         if n_frames < MIN_FRAMES:
             print(
@@ -2876,6 +2900,11 @@ def main():
         )
     tmp.rename(output)
     log(f"wrote {output} ({len(names)}/{n_frames} viewmats; {stats})")
+    if image_set and not args.database:
+        # Which frames this was solved from, so a later run can tell the
+        # markers have moved since and that these poses no longer apply.
+        frame_source.selection_stamp(output).write_text(
+            frame_source.selection_digest(scan) + "\n")
 
     if parts:
         progress(95, f"SfM poses: solving {len(parts)} more piece(s)…")

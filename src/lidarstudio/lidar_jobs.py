@@ -25,6 +25,8 @@ from pathlib import Path
 
 from aiohttp import web
 
+from lidarstudio import frame_source
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
 log = logging.getLogger("lidar-editor")
 
@@ -751,7 +753,10 @@ async def _photo_pointcloud(proj: Path, scan: Path, options, queue, job):
     canonical = proj / "sfm" / f"sfm_viewmats_{ts}.npz"
     cloud = proj / "pointclouds" / f"pointcloud_{ts}.ply"
     force_sfm = bool(options.get("force_sfm"))
-    if force_sfm or not canonical.exists() or not cloud.exists():
+    reselected = _selection_changed(canonical, ing)
+    if reselected:
+        await queue.put({"event": "log", "message": _SELECTION_RERUN})
+    if force_sfm or reselected or not canonical.exists() or not cloud.exists():
         if await _run_image_set_sfm(
             proj, ing, ts, contents, options, queue, job, force_sfm,
             "Point cloud generation",
@@ -1340,13 +1345,15 @@ async def _job_mesh(project_path, scan_path, options, queue, job=None):
         # missing) is exactly when the user reaches for it.
         force = bool(options.get("force_sfm"))
         stale = sfm_poses.exists() and not sparse_dir.is_dir()
-        if force or not sfm_poses.exists() or (stale and not has_splat):
+        reselected = _selection_changed(sfm_poses, scan)
+        if force or reselected or not sfm_poses.exists() or (stale and not has_splat):
             await queue.put(
                 {
                     "event": "log",
                     "message": (
                         f"No reconstruction for '{ts}' yet — running SfM now. "
                         if not sfm_poses.exists() else
+                        _SELECTION_RERUN + " " if reselected else
                         f"The reconstruction for '{ts}' predates dense stereo "
                         "and has no sparse model, so it is being rebuilt "
                         "(this REPLACES the existing poses). "
@@ -1780,6 +1787,18 @@ async def _job_ingest(project_path, scan_path, options, queue, job=None):
     if job.get("cancelled"):
         await queue.put({"event": "cancelled", "message": "Ingest stopped."})
     elif rc == 0 and manifest.exists():
+        # Re-ingesting rewrites the frames, so markers placed on the old ones
+        # no longer mark anything meaningful.
+        sel = out_dir / frame_source.SELECTION_FILE
+        if sel.exists():
+            sel.unlink()
+            await queue.put(
+                {
+                    "event": "log",
+                    "message": "Cleared the include/exclude markers: re-ingesting "
+                    "replaced the frames they were placed on.",
+                }
+            )
         n = (_scan_contents(out_dir).get("images") or {}).get("count", 0)
         await queue.put(
             {"event": "progress", "percent": 100, "message": f"Ingested {n} frames."}
@@ -1800,6 +1819,20 @@ async def _job_ingest(project_path, scan_path, options, queue, job=None):
                 "message": err or f"process_ingest.py exited with code {rc}",
             }
         )
+
+
+def _selection_changed(npz: Path, scan: Path) -> bool:
+    """True when ``npz`` exists but was solved from a different set of frames
+    than the viewer's include/exclude markers now select — its poses still
+    cover the frames the user has since cut, so it must be rebuilt."""
+    return npz.exists() and not frame_source.selection_matches(npz, scan)
+
+
+_SELECTION_RERUN = (
+    "The include/exclude markers have changed since this capture was "
+    "reconstructed, so SfM is being re-run on the frames they now keep "
+    "(this REPLACES the existing poses)."
+)
 
 
 async def _run_image_set_sfm(proj: Path, scan: Path, ts: str, contents,
@@ -2176,8 +2209,12 @@ async def _job_splat(project_path, scan_path, options, queue, job=None):
         # so both are (re)generated together — a poses file without its
         # matching cloud would train geometry against cameras from a different
         # reconstruction.
+        reselected = False
         if not sfm_poses and not force_sfm:
-            sfm_poses = str(canonical) if canonical.exists() else ""
+            reselected = _selection_changed(canonical, scan)
+            if reselected:
+                await queue.put({"event": "log", "message": _SELECTION_RERUN})
+            sfm_poses = str(canonical) if canonical.exists() and not reselected else ""
         need_sfm = force_sfm or not sfm_poses or not seed_cloud_path.exists()
         if need_sfm:
             if await _run_image_set_sfm(
@@ -2873,10 +2910,85 @@ async def scan_photos_handler(request):
         return web.json_response({"error": "scan folder not found"}, status=404)
     try:
         loop = asyncio.get_event_loop()
-        _bag, topic, ts = await loop.run_in_executor(
+        src, topic, ts = await loop.run_in_executor(
             None, _scan_photo_index, scan, Path(proj) if proj else None
         )
-        return web.json_response({"count": len(ts), "topic": topic})
+        out = {"count": len(ts), "topic": topic}
+        ing = _selection_target(src)
+        if ing is not None:
+            # Only ingested frames can carry markers: they are what every
+            # later stage reads, and their names are stable until re-ingest.
+            out["selectable"] = True
+            out["sections"] = _sections_to_indices(
+                frame_source.read_selection(ing), ts)
+        return web.json_response(out)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+def _selection_target(src: Path):
+    """The ingest dir behind a photo index source, or None when the preview
+    is of a bag or of raw, not-yet-ingested photos."""
+    src = Path(src)
+    if src.is_dir() and frame_source.is_image_set(src.parent):
+        return src.parent
+    return None
+
+
+def _sections_to_indices(sections, names):
+    """Stored sections (by frame name) → the viewer's (by preview index)."""
+    pos = {n: i for i, n in enumerate(names)}
+    out = []
+    for s in sections:
+        a, b = pos.get(s["start"]), pos.get(s["end"])
+        if a is not None and b is not None:
+            out.append({"start": min(a, b), "end": max(a, b), "mode": s["mode"]})
+    return out
+
+
+async def scan_selection_handler(request):
+    """POST /api/scan/selection {path, project, sections:[{start,end,mode}]}
+    — save the photo viewer's include/exclude markers beside the ingested
+    manifest. ``start``/``end`` are preview indices; they are stored as frame
+    names so the file stays meaningful to every reader. An empty list clears
+    the markers. Returns how many frames are now kept."""
+    data = await request.json()
+    scan = Path((data.get("path") or "").strip())
+    proj = (data.get("project") or "").strip()
+    if not scan.is_dir():
+        return web.json_response({"error": "scan folder not found"}, status=404)
+    try:
+        loop = asyncio.get_event_loop()
+        src, _topic, names = await loop.run_in_executor(
+            None, _scan_photo_index, scan, Path(proj) if proj else None
+        )
+        ing = _selection_target(src)
+        if ing is None:
+            return web.json_response(
+                {"error": "markers need an ingested capture — run 'ingest' "
+                 "first (with the project set)"}, status=400)
+        sections = []
+        for s in data.get("sections") or []:
+            try:
+                a, b = int(s["start"]), int(s["end"])
+            except (KeyError, TypeError, ValueError):
+                return web.json_response({"error": "bad section"}, status=400)
+            mode = s.get("mode")
+            if mode not in ("include", "exclude") or not (
+                0 <= a < len(names) and 0 <= b < len(names)
+            ):
+                return web.json_response({"error": "bad section"}, status=400)
+            a, b = min(a, b), max(a, b)
+            sections.append({"start": names[a], "end": names[b], "mode": mode})
+        target = ing / frame_source.SELECTION_FILE
+        if sections:
+            tmp = target.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"version": 1, "sections": sections}, indent=1))
+            tmp.replace(target)
+        else:
+            target.unlink(missing_ok=True)
+        kept = len(frame_source.apply_selection(names, sections))
+        return web.json_response({"ok": True, "kept": kept, "count": len(names)})
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
 
@@ -3371,5 +3483,6 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/scan/file", scan_file_handler)
     app.router.add_post("/api/scan/photos", scan_photos_handler)
     app.router.add_get("/api/scan/photo", scan_photo_handler)
+    app.router.add_post("/api/scan/selection", scan_selection_handler)
     app.router.add_post("/api/scan/sweeps", scan_sweeps_handler)
     app.router.add_get("/api/scan/sweep", scan_sweep_handler)

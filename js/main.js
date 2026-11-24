@@ -287,10 +287,13 @@ document.getElementById('floorSize').addEventListener('input', (e) => {
 });
 
 // View distance slider: log scale, 10 m to 10 km (value = log10 metres)
+function showViewDistance(far) {
+  document.getElementById('viewDistanceVal').textContent =
+    far >= 1000 ? `${(far / 1000).toPrecision(2) * 1} km` : `${far.toPrecision(2) * 1} m`;
+}
 document.getElementById('viewDistance').addEventListener('input', (e) => {
   const far = Math.pow(10, parseFloat(e.target.value));
-  const shown = far >= 1000 ? `${(far / 1000).toPrecision(2)} km` : `${far.toPrecision(2) * 1} m`;
-  document.getElementById('viewDistanceVal').textContent = shown;
+  showViewDistance(far);
   setViewDistance(far);
 });
 
@@ -562,6 +565,13 @@ async function restoreScene(data) {
     document.getElementById('floorSize').value = data.floorSize;
     document.getElementById('floorSizeVal').textContent = `${data.floorSize} m`;
   }
+
+  // Restore view distance (scenes saved before it existed keep the 50 m
+  // default, which is what they were drawn with)
+  const far = data.viewDistance > 0 ? data.viewDistance : 50;
+  setViewDistance(far);
+  document.getElementById('viewDistance').value = Math.log10(far);
+  showViewDistance(far);
 
   // Restore point size
   if (data.pointSize != null) {
