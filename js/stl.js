@@ -78,6 +78,8 @@ function _buildSTLPayload(entry, bufferFn, includeSplatBuffers) {
   if (bufferFn && (!entry.isSplat || includeSplatBuffers)) rec.buffer = bufferFn(entry._buffer);
   if (entry.isSplat && entry._fileName) rec.splatFile = entry._fileName;
   if (entry.isSplat) rec.splatTint = entry._splatTint ?? 0xffffff;
+  if (entry.brightness) rec.brightness = entry.brightness;
+  if (entry.contrast != null && entry.contrast !== 1) rec.contrast = entry.contrast;
   return rec;
 }
 
@@ -303,6 +305,9 @@ export async function restoreSTLsFromState(records) {
       if (rec.opacity !== undefined) entry.opacity = rec.opacity;
       if (rec.splatTint !== undefined) entry._splatTint = rec.splatTint;
     }
+    if (rec.brightness != null || rec.contrast != null) {
+      setColourAdjust(entry, rec.brightness ?? 0, rec.contrast ?? 1);
+    }
 
     console.log('[Restore]', rec.name,
       'pos:', [m.position.x.toFixed(4), m.position.y.toFixed(4), m.position.z.toFixed(4)],
@@ -425,6 +430,38 @@ export function setPointShape(name) {
 }
 
 export function getPointShape() { return _pointShapeName; }
+
+// ── Brightness / contrast, per object ───────────────────────
+// c' = clamp((c - 0.5) * contrast + 0.5 + brightness), applied to the colour
+// as displayed (sRGB, 0..1). edit_ops.adjust_colour bakes the same formula
+// into a file on Save As, so what is saved matches what is on screen.
+// Clouds carry the values as per-material uniforms; splats get them pushed
+// each frame in updateSplatClip().
+export function setColourAdjust(entry, brightness, contrast) {
+  if (!entry) return;
+  entry.brightness = brightness;
+  entry.contrast = contrast;
+  const u = entry.mesh?.material?.userData?._bcU;
+  if (u) { u.uBrightness.value = brightness; u.uContrast.value = contrast; }
+  State.requestRender();
+}
+
+export function getColourAdjust(entry) {
+  return { brightness: entry?.brightness ?? 0, contrast: entry?.contrast ?? 1 };
+}
+
+export function hasColourAdjust(entry) {
+  const { brightness, contrast } = getColourAdjust(entry);
+  return Math.abs(brightness) > 1e-6 || Math.abs(contrast - 1) > 1e-6;
+}
+
+// Only objects whose colours live in the file can be adjusted and saved:
+// coloured clouds and splats (a plain cloud is one material colour).
+export function canColourAdjust(entry) {
+  if (!entry) return false;
+  if (entry.isSplat) return true;
+  return !!(entry.isPointCloud && entry.mesh?.geometry?.hasAttribute('color'));
+}
 
 export function _addPointsToScene(geometry, buffer, name, color, stlId, transforms) {
   const hasVertexColors = geometry.hasAttribute('color');
@@ -674,14 +711,25 @@ export function setVisibilityClip(opts = {}) {
 // round/soft modes discard fragments outside the sprite's inscribed circle
 // (soft additionally fades alpha toward the rim).
 function _applyClipToPointsMaterial(material) {
+  // Per-material (not shared) so each cloud keeps its own brightness/contrast.
+  const bcU = { uBrightness: { value: 0 }, uContrast: { value: 1 } };
+  material.userData._bcU = bcU;
   material.onBeforeCompile = (shader) => {
+    shader.uniforms.uBrightness  = bcU.uBrightness;
+    shader.uniforms.uContrast    = bcU.uContrast;
     shader.uniforms.uClipEnabled = _clipUniforms.uClipEnabled;
     shader.uniforms.uClipInv     = _clipUniforms.uClipInv;
     shader.uniforms.uClipMode    = _clipUniforms.uClipMode;
     shader.uniforms.uPointShape  = _pointShapeU;
     shader.uniforms.uFgClipDist  = _fgClipU;
-    shader.fragmentShader = 'uniform float uPointShape;\n'
+    shader.fragmentShader = 'uniform float uPointShape;\nuniform float uBrightness;\nuniform float uContrast;\n'
       + shader.fragmentShader.replace(
+          '#include <colorspace_fragment>',
+          // after the linear→sRGB output conversion, so the adjustment works on
+          // the same 0..1 values the file stores
+          '#include <colorspace_fragment>\n'
+          + 'gl_FragColor.rgb = clamp((gl_FragColor.rgb - 0.5) * uContrast + 0.5 + uBrightness, 0.0, 1.0);\n')
+      .replace(
           '#include <clipping_planes_fragment>',
           '#include <clipping_planes_fragment>\n'
           + 'if (uPointShape > 0.5) {\n'
@@ -772,18 +820,22 @@ function _patchSplatAppearanceMaterial(material) {
 
   const patched = fs
     .replace('gl_FragColor = vec4(color.rgb, opacity);',
-             'gl_FragColor = vec4(color.rgb * splatTint, opacity * splatOpacity);')
+             'gl_FragColor = vec4(_splatBC(color.rgb) * splatTint, opacity * splatOpacity);')
     .replace('gl_FragColor = vec4(vColor.rgb, w);',
-             'gl_FragColor = vec4(vColor.rgb * splatTint, w * splatOpacity);');
+             'gl_FragColor = vec4(_splatBC(vColor.rgb) * splatTint, w * splatOpacity);');
   if (patched === fs) return; // output line not found — leave material untouched
 
-  const decl = 'uniform vec3 splatTint;\nuniform float splatOpacity;\n';
+  const decl = 'uniform vec3 splatTint;\nuniform float splatOpacity;\n'
+    + 'uniform float splatBright;\nuniform float splatContrast;\n'
+    + 'vec3 _splatBC(vec3 c) { return clamp((c - 0.5) * splatContrast + 0.5 + splatBright, 0.0, 1.0); }\n';
   material.fragmentShader = patched.includes('void main')
     ? patched.replace('void main', decl + 'void main')
     : decl + patched;
 
   material.uniforms.splatTint = material.uniforms.splatTint || { value: new THREE.Color(1, 1, 1) };
   material.uniforms.splatOpacity = material.uniforms.splatOpacity || { value: 1.0 };
+  material.uniforms.splatBright = material.uniforms.splatBright || { value: 0.0 };
+  material.uniforms.splatContrast = material.uniforms.splatContrast || { value: 1.0 };
   material.userData._appearancePatched = true;
   material.needsUpdate = true;
 }
@@ -844,6 +896,10 @@ export function updateSplatClip() {
     }
     if (mat.uniforms.splatOpacity) {
       mat.uniforms.splatOpacity.value = s.opacity ?? 1;
+    }
+    if (mat.uniforms.splatBright) {
+      mat.uniforms.splatBright.value = s.brightness ?? 0;
+      mat.uniforms.splatContrast.value = s.contrast ?? 1;
     }
   }
 }
@@ -1305,6 +1361,7 @@ export function selectSTL(entry, listItem) {
   stlModePanel.style.display = 'block';
   stlSelName.textContent = entry.name;
   syncSTLNumericInputs(entry);
+  syncColourInputs(entry);
 
   if (listItem) listItem.classList.add('selected');
 }
@@ -1323,6 +1380,20 @@ export function syncSTLNumericInputs(entry) {
   document.getElementById('stlScX').value = fmtScale(m.scale.x);
   document.getElementById('stlScY').value = fmtScale(m.scale.z);
   document.getElementById('stlScZ').value = fmtScale(m.scale.y);
+}
+
+// Show the brightness/contrast sliders for objects that can use them, set to
+// the object's own values.
+export function syncColourInputs(entry) {
+  const row = document.getElementById('stl-colour');
+  if (!row) return;
+  row.style.display = canColourAdjust(entry) ? 'block' : 'none';
+  const { brightness, contrast } = getColourAdjust(entry);
+  const b = Math.round(brightness * 100), c = Math.round(contrast * 100);
+  document.getElementById('brightness').value = b;
+  document.getElementById('brightnessVal').textContent = `${b > 0 ? '+' : ''}${b}%`;
+  document.getElementById('contrast').value = c;
+  document.getElementById('contrastVal').textContent = `${c}%`;
 }
 
 export function deselectSTL() {

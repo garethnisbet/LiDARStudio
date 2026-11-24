@@ -151,6 +151,77 @@ def apply_edit(in_path, out_path, op, params):
     }
 
 
+def _adjust(rgb, brightness, contrast):
+    """The viewer's brightness/contrast formula on 0..1 colours (see
+    setColourAdjust in js/stl.js): ``(c - 0.5) * contrast + 0.5 + brightness``."""
+    return np.clip((rgb - 0.5) * contrast + 0.5 + brightness, 0.0, 1.0)
+
+
+def adjust_colour(in_path, out_path, brightness=0.0, contrast=1.0):
+    """Bake a brightness/contrast change into a cloud's or splat's colours.
+
+    Works on the PLY record directly, so every other field (normals,
+    intensity, splat scale/rotation/opacity) and the file layout are kept.
+    Splats change their SH DC term so the displayed colour follows the same
+    formula, and their higher SH bands scale by ``contrast`` (the
+    view-dependent part is a colour difference, so only contrast applies).
+    Clouds change ``red/green/blue``. Returns a summary dict.
+    """
+    from plyfile import PlyData, PlyElement
+
+    brightness, contrast = float(brightness), float(contrast)
+    # mmap=False: read it all into memory, since out_path may be in_path and a
+    # memory-mapped source would be truncated under us when it is rewritten.
+    ply = PlyData.read(str(in_path), mmap=False)
+    v = ply["vertex"].data.copy()
+    names = v.dtype.names or ()
+    if "f_dc_0" in names:
+        kind = "splat"
+        dc = np.stack([v[f"f_dc_{i}"] for i in range(3)], 1).astype(np.float64)
+        rgb = _adjust(0.5 + splat_io.SH_C0 * dc, brightness, contrast)
+        dc = (rgb - 0.5) / splat_io.SH_C0
+        for i in range(3):
+            v[f"f_dc_{i}"] = dc[:, i]
+        for n in names:
+            if n.startswith("f_rest_"):
+                v[n] = v[n] * contrast
+    elif {"red", "green", "blue"} <= set(names):
+        kind = "cloud"
+        dt = v.dtype["red"]
+        rgb = np.stack([v["red"], v["green"], v["blue"]], 1).astype(np.float64)
+        if np.issubdtype(dt, np.integer):
+            scale = float(np.iinfo(dt).max)
+        else:  # float colours: 0..1, or 0..255 from some exporters
+            scale = 255.0 if rgb.size and rgb.max() > 1.0 else 1.0
+        rgb = _adjust(rgb / scale, brightness, contrast) * scale
+        if np.issubdtype(dt, np.integer):
+            rgb = np.rint(rgb)
+        for i, n in enumerate(("red", "green", "blue")):
+            v[n] = rgb[:, i].astype(dt)
+    else:
+        raise ValueError("this file has no colours to adjust")
+
+    elements = [
+        PlyElement.describe(v, "vertex") if el.name == "vertex" else el
+        for el in ply.elements
+    ]
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    PlyData(
+        elements,
+        text=ply.text,
+        byte_order=ply.byte_order,
+        comments=ply.comments,
+        obj_info=ply.obj_info,
+    ).write(str(out_path))
+    return {
+        "kind": kind,
+        "total": int(len(v)),
+        "brightness": brightness,
+        "contrast": contrast,
+        "output": str(out_path),
+    }
+
+
 def combine(items, out_path):
     """Join several clouds, or several splats, into one file, each baked at
     its in-scene placement.

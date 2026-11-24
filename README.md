@@ -23,6 +23,16 @@ Open `http://localhost:8080` and use the **LiDAR Workflow** panel.
 
 > **Low on home-directory space?** `source scratch-env.sh` before installing to redirect the uv/npm/pip caches, the downloaded Python, and the `.venv` onto scratch (`/scratch/$USER` by default, or set `SCRATCH` yourself) — nothing but a few dotfiles then touches `$HOME`. Source it in every shell where you use the project. Note that scratch is usually auto-purged, so re-run `uv sync` if the venv disappears, and keep generated clouds/splats somewhere persistent. If `node_modules/` is also a problem, clone the repo onto scratch too.
 
+> **Working from a Dropbox folder on several machines?** Dropbox does not sync the symlinks in `.venv/bin`, so a venv copied from another machine fails with `error: Project virtual environment directory '.venv' cannot be used because it is not a valid Python environment (no Python executable was found)`. Rebuild it on each machine and tell Dropbox to leave it alone:
+>
+> ```bash
+> rm -rf .venv && uv sync
+> python3 -c "import os; os.setxattr('.venv', 'user.com.dropbox.ignored', b'1')"   # Linux
+> # macOS: xattr -w com.dropbox.ignored 1 .venv
+> ```
+>
+> Every machine then keeps its own `.venv`. Do the same for `node_modules/` if it gives trouble.
+
 > **Network exposure:** the server binds `127.0.0.1` by default. Pass `--host 0.0.0.0` to serve the viewer to other devices (e.g. a VR headset) — the LiDAR `/api/*` endpoints, which browse and read/write the local filesystem, stay loopback-only even then unless you also pass `--allow-remote-fs`. Static serving is allowlisted (`js/`, `node_modules/`, and specific root-level asset types); the Python source, `.git`, and dotfiles are never served.
 
 ## LiDAR Workflow
@@ -171,6 +181,7 @@ Add a primitive and use it as an eraser volume:
 ### Save As & Workflow
 
 - **Save As** — export the selected object under a new name. Optionally **bake the transform into the coordinates** for a self-contained, portable file; otherwise a lossless copy plus a pose sidecar that reloads correctly here.
+- **Brightness / Contrast** — sliders under the selected object (coloured clouds and splats) change how its colours look straight away. They apply per object, are kept with the scene, and are written into the new file's colours on **Save As**: red/green/blue for a cloud, the SH colour terms for a splat. Every other field is kept. The saved file then reloads with neutral sliders, since the adjustment is now part of it.
 - **Save / Load Workflow** — remember the panel's settings (paths, parameters, options) in the browser and restore them on demand.
 
 ### How placement is preserved

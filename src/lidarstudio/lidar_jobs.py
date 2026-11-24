@@ -2733,12 +2733,25 @@ async def project_rename_handler(request):
     return web.json_response({"path": str(target), "name": target.name})
 
 
+def _colour_adjust_args(data):
+    """(brightness, contrast) from a request's optional ``colour`` object, or
+    None when absent or neutral (no change to make)."""
+    c = data.get("colour") or None
+    if not isinstance(c, dict):
+        return None
+    b, k = float(c.get("brightness", 0.0)), float(c.get("contrast", 1.0))
+    if abs(b) < 1e-6 and abs(k - 1.0) < 1e-6:
+        return None
+    return b, k
+
+
 async def edit_apply_handler(request):
     """POST /api/edit/apply — run one edit op on a cloud/splat PLY.
 
-    Body: {path, op, params, [output]}.  Writes a sibling *_edited.ply with a
-    unique numbered name (never overwriting an earlier edit) and returns the
-    edit summary so the UI can reload it.
+    Body: {path, op, params, [output], [colour]}.  Writes a sibling
+    *_edited.ply with a unique numbered name (never overwriting an earlier
+    edit) and returns the edit summary so the UI can reload it. ``colour``
+    ({brightness, contrast}) is baked into the result's colours afterwards.
     """
     data = await request.json()
     path = (data.get("path") or "").strip()
@@ -2759,6 +2772,9 @@ async def edit_apply_handler(request):
         result = await loop.run_in_executor(
             None, edit_ops.apply_edit, str(src), out, op, params
         )
+        colour = _colour_adjust_args(data)
+        if colour:
+            await loop.run_in_executor(None, edit_ops.adjust_colour, out, out, *colour)
         _write_pose_sidecar(out, data.get("pose"))
         return web.json_response(result)
     except Exception as exc:
@@ -3267,7 +3283,10 @@ async def edit_save_as_handler(request):
         given, the transform is baked into the coordinates, producing a
         self-contained file that's correctly oriented in any viewer (no sidecar).
 
-    Body: {path, output, [pose], [matrix]}. `output` must be a .ply path.
+    Either mode also bakes ``colour`` ({brightness, contrast}, as set by the
+    viewer's sliders) into the saved file's colours when it is given.
+
+    Body: {path, output, [pose], [matrix], [colour]}. `output` must be a .ply path.
     """
     data = await request.json()
     src = Path((data.get("path") or "").strip())
@@ -3306,9 +3325,19 @@ async def edit_save_as_handler(request):
             # changes the frame and deliberately does NOT carry it.) No-ops if
             # the source has no sidecar.
             edit_ops._copy_traj(str(src), str(out_path))
+        colour = _colour_adjust_args(data)
+        if colour:
+            await asyncio.get_event_loop().run_in_executor(
+                None, edit_ops.adjust_colour, str(out_path), str(out_path), *colour
+            )
         trainable = edit_ops._find_traj(out_path) is not None if matrix is None else False
         return web.json_response(
-            {"output": str(out_path), "baked": matrix is not None, "trainable": trainable}
+            {
+                "output": str(out_path),
+                "baked": matrix is not None,
+                "trainable": trainable,
+                "colour_adjusted": colour is not None,
+            }
         )
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)

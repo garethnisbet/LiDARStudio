@@ -3,7 +3,8 @@
 // by the Python backend (lidar_jobs.py) and loads results straight into the
 // three.js + GaussianSplats3D viewer via the existing PLY loader.
 
-import { loadPLYFile, deselectSTL, selectSTL, setVisibilityClip } from './stl.js';
+import { loadPLYFile, deselectSTL, selectSTL, setVisibilityClip,
+  getColourAdjust, hasColourAdjust, setColourAdjust } from './stl.js';
 import * as State from './state.js';
 import * as THREE from 'three';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
@@ -1748,11 +1749,13 @@ export function initLidarPanel() {
   async function runEdit(endpoint, body, li, doneMsg, transforms = null) {
     applyEditBtn.disabled = true;
     let entry = null;
+    const prevColour = State.selectedSTL ? getColourAdjust(State.selectedSTL) : null;
     try {
       // Persist the object's pose so a later Library reload restores placement.
       const r = await api(endpoint, { ...body, pose: transforms });
       editStat.textContent = doneMsg(r);
       entry = await loadPlyFromServer(r.output, r.output.split('/').pop(), transforms);
+      if (entry && prevColour) setColourAdjust(entry, prevColour.brightness, prevColour.contrast);
       if (li) li.querySelector('button[title="Remove"]')?.click();  // drop the pre-edit object
       reselect(entry);   // keep the result selected for follow-up edits
     } catch (e) { editStat.textContent = 'Error: ' + e.message; }
@@ -1868,6 +1871,9 @@ export function initLidarPanel() {
     const erA = entry.isPointCloud ? entry.mesh.geometry.getAttribute('aErased') : null;
     const erased = [];
     if (erA) { const a = erA.array; for (let i = 0; i < a.length; i++) if (a[i] > 0.5) erased.push(i); }
+    // Brightness/contrast set on screen are written into the new file's colours.
+    const colour = hasColourAdjust(entry) ? getColourAdjust(entry) : null;
+    const colourNote = colour ? ', colours adjusted' : '';
 
     saveAsBtn.disabled = true;
     editStat.textContent = `Saving as ${name}…`;
@@ -1875,16 +1881,17 @@ export function initLidarPanel() {
       if (erased.length) {
         // Commit live erasures: keep all but the erased indices, into the new file.
         await api('/api/edit/apply', { path: srcPath, op: 'drop', params: { drop: erased },
-          output, pose: poseOf(entry.mesh, entry) });
-        editStat.textContent = `Saved as ${name} (${erased.length.toLocaleString()} erased)`;
+          output, pose: poseOf(entry.mesh, entry), colour });
+        editStat.textContent = `Saved as ${name} (${erased.length.toLocaleString()} erased${colourNote})`;
       } else {
         // Bake = self-contained file with the transform baked into the coords;
         // otherwise a lossless copy plus a pose sidecar that reloads here.
-        const body = { path: srcPath, output };
+        const body = { path: srcPath, output, colour };
         if (bakeCb.checked) body.matrix = Array.from(cloudWorldMatrix(entry).elements);
         else body.pose = poseOf(entry.mesh, entry);
         await api('/api/edit/save_as', body);
-        editStat.textContent = `Saved as ${name}${bakeCb.checked ? ' (baked)' : ''}`;
+        const notes = [bakeCb.checked && 'baked', colour && 'colours adjusted'].filter(Boolean);
+        editStat.textContent = `Saved as ${name}${notes.length ? ` (${notes.join(', ')})` : ''}`;
       }
       refresh();
     } catch (e) { editStat.textContent = 'Error: ' + e.message; }

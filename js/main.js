@@ -26,6 +26,7 @@ import {
   setPointSize, setPointShape,
   addPrimitive,
   selectSTL, deselectSTL, setSTLTransformMode, syncSTLNumericInputs,
+  setColourAdjust, syncColourInputs,
 } from './stl.js';
 import { dbSave, BUFFERS_KEY } from './storage.js';
 import { initVR, updateVR } from './vr.js';
@@ -216,6 +217,23 @@ document.getElementById('stlDeselect').addEventListener('click', deselectSTL);
 
 document.getElementById('lockAspectCb').addEventListener('change', (e) => {
   State.setLockAspect(e.target.checked);
+});
+
+// Brightness / contrast of the selected cloud or splat (sliders in percent)
+function _applyColourInputs() {
+  const entry = State.selectedSTL;
+  if (!entry) return;
+  setColourAdjust(entry,
+    parseFloat(document.getElementById('brightness').value) / 100,
+    parseFloat(document.getElementById('contrast').value) / 100);
+  syncColourInputs(entry);
+}
+document.getElementById('brightness').addEventListener('input', _applyColourInputs);
+document.getElementById('contrast').addEventListener('input', _applyColourInputs);
+document.getElementById('colourResetBtn').addEventListener('click', () => {
+  if (!State.selectedSTL) return;
+  setColourAdjust(State.selectedSTL, 0, 1);
+  syncColourInputs(State.selectedSTL);
 });
 
 document.getElementById('stlResetPos').addEventListener('click', () => {
