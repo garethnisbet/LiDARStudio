@@ -608,6 +608,65 @@ async def _job_refine_join(project_path, options, queue, job):
     })
 
 
+class _LoggedQueue(asyncio.Queue):
+    """A job's event queue that also appends every event to a log file in
+    the project (``<project>/logs/<type>_<time>_<id>.log``), so a job's output
+    can be read after the fact. The browser was the only consumer, and the
+    SSE handler forgets the job when it disconnects. Logging is best effort:
+    an unwritable project never fails the job."""
+
+    def __init__(self, log_path: Path | None = None):
+        super().__init__()
+        self.log_path = None
+        self._fh = None
+        if log_path is not None:
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                self._fh = open(log_path, "a", encoding="utf-8", buffering=1)
+                self.log_path = log_path
+            except OSError as exc:
+                log.warning("job log disabled (%s): %s", log_path, exc)
+
+    def _write(self, event):
+        if self._fh is None or event is None:
+            return
+        import time
+
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        kind = event.get("event")
+        msg = event.get("message", "")
+        if kind == "log":
+            line = msg
+        elif kind == "progress":
+            line = f"[{event.get('percent', 0)}%] {msg}"
+        else:
+            rest = {k: v for k, v in event.items() if k not in ("event", "message")}
+            line = f"[{kind}] {msg}" + (f" {json.dumps(rest)}" if rest else "")
+        try:
+            self._fh.write(f"{stamp} {line}\n")
+        except (OSError, ValueError):
+            pass
+
+    # Queue.put() funnels through put_nowait(), so this one hook sees every event.
+    def put_nowait(self, item):
+        self._write(item)
+        super().put_nowait(item)
+
+    def close(self):
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+
+def _job_log_path(project_path, job_type: str, job_id: str) -> Path | None:
+    if not project_path:
+        return None
+    import time
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return Path(project_path) / "logs" / f"{job_type}_{stamp}_{job_id}.log"
+
+
 async def process_start_handler(request):
     """POST /api/process/start — launch a background processing job."""
     data = await request.json()
@@ -628,7 +687,7 @@ async def process_start_handler(request):
         )
 
     job_id = uuid.uuid4().hex[:8]
-    queue: asyncio.Queue = asyncio.Queue()
+    queue = _LoggedQueue(_job_log_path(project_path, job_type, job_id))
     jobs[job_id] = {"queue": queue, "done": False}
 
     asyncio.create_task(_run_job(job_id, job_type, project_path, scan_path, options))
@@ -639,6 +698,9 @@ async def process_start_handler(request):
 async def _run_job(job_id, job_type, project_path, scan_path, options):
     job = jobs[job_id]
     queue = job["queue"]
+    if getattr(queue, "log_path", None):
+        await queue.put({"event": "log", "message": (
+            f"Job log: {queue.log_path}")})
     try:
         if job_type == "pointcloud":
             await _job_pointcloud(project_path, scan_path, options, queue, job)
@@ -655,6 +717,8 @@ async def _run_job(job_id, job_type, project_path, scan_path, options):
     finally:
         job["done"] = True
         await queue.put(None)  # sentinel
+        if isinstance(queue, _LoggedQueue):
+            queue.close()
 
 
 async def process_cancel_handler(request):
