@@ -313,6 +313,7 @@ def build_camera_frames(
     memmap_frames: bool = False,
     frame_cache_dir=None,
     fisheye_intrinsics=None,
+    ram_frames: bool = True,
 ):
     """
     Return a list of {image HxWx3 uint8 RGB, K 3x3, viewmat 4x4 (world→cam)}.
@@ -465,8 +466,21 @@ def build_camera_frames(
     # RAM (~size × count — 56 GB at downscale-1/us-1.5), stream them to a single
     # memmap file and hand out memmap views. The OS page cache keeps hot frames
     # resident, so RSS stays bounded by RAM regardless of resolution × count.
+    #
+    # With memmap_frames, frames are held in RAM while MemAvailable (measured
+    # once, up front) leaves an 8 GB / 15% margin, and only the overflow is
+    # written to disk. Deciding the tier HERE, not after loading, matters:
+    # copying frames out of a just-written cache file left its 48 GB in the
+    # page cache competing with the RAM copies, and the kernel swapped the
+    # copies out — slower than reading the disk. ram_frames=False spills
+    # everything (the old all-disk behaviour).
     mm_file = mm_path = mm_shape = None
     mm_count = 0
+    ram_left = 0
+    if memmap_frames and ram_frames:
+        avail = _mem_available_bytes()
+        ram_left = max(0, avail - max(8 * 1024**3, int(0.15 * avail)))
+    n_ram = 0
     for bag_i, (ts, img) in enumerate(
         frame_source.open_frames(scan, camera, rot=image_rot)
     ):
@@ -569,7 +583,12 @@ def build_camera_frames(
                 diag["gap_ns"].append(gap)
                 diag["snap_err_ns"].append(min(a, 1.0 - a) * gap)
 
-        if memmap_frames:
+        if memmap_frames and ram_left >= rgb.nbytes:
+            ram_left -= rgb.nbytes
+            n_ram += 1
+            frame = {"image": np.ascontiguousarray(rgb), "K": K.astype(np.float64),
+                     "viewmat": viewmat}
+        elif memmap_frames:
             if mm_file is None:
                 mm_shape = rgb.shape  # (H, W, 3), shared by all frames this run
                 root = _frame_cache_root(frame_cache_dir)
@@ -579,7 +598,8 @@ def build_camera_frames(
                 mm_file = open(mm_path, "wb", buffering=1 << 20)
                 print(
                     f"  frame cache: disk memmap at {cdir} "
-                    f"({int(np.prod(mm_shape)) / 1e6:.0f} MB/frame → host RAM stays flat)",
+                    f"({int(np.prod(mm_shape)) / 1e6:.0f} MB/frame; {n_ram} earlier "
+                    "frame(s) held in RAM, the rest spill here)",
                     flush=True,
                 )
             if rgb.shape != mm_shape:
@@ -646,7 +666,8 @@ def build_camera_frames(
             mm_path, dtype=np.uint8, mode="r", shape=(mm_count, *mm_shape)
         )
         for f in frames:
-            f["image"] = mm[f.pop("idx")]
+            if "idx" in f:
+                f["image"] = mm[f.pop("idx")]
     n_masked = sum(1 for f in frames if f.get("mask_png") is not None)
     if n_masked:
         kind = "subject" if mask_by_key is not None else "dynamic-object"
@@ -1027,6 +1048,85 @@ def export_ply(params, path: Path, crop_aabb=None):
 # ── Training ─────────────────────────────────────────────────────────
 
 
+def _mem_available_bytes():
+    """Host RAM the kernel says a new allocation can have (free + reclaimable
+    page cache), from /proc/meminfo. 0 if unknown — the caller then keeps
+    frames where they already are."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def place_frames(frames, device, cap_max, store="auto"):
+    """Promote frames into VRAM while it fits beside training; the rest stay
+    where build_camera_frames put them (host RAM, then the disk memmap).
+
+    Per-step frame upload was the training bottleneck on big cards: each step
+    read a ~60 MB frame from the disk cache and copied it over PCIe on the main
+    thread, so the GPU idled between renders (RTX 5090: ~40% bursts, then 0%).
+
+    The VRAM budget is what's free minus an estimate of training's own peak
+    (measured 9.1 GB at downscale-1 / 3.5M full-frame → ~3 GB + 1.8 KB per
+    gaussian at the cap, +30% for heap fragmentation). Disk-tier frames are
+    promoted first — they gain the most, and their memmap view is a free
+    fallback. Each promoted frame keeps its host view under ``_host`` so it can
+    be demoted if training later OOMs (see demote_vram_frames).
+
+    store: "auto" (VRAM→RAM→disk), "ram" / "disk" (no VRAM; "disk" also
+    skips the RAM tier at load time).
+    Returns the per-tier frame counts."""
+    import numpy as np
+    import torch
+
+    counts = {"vram": 0, "ram": 0, "disk": 0}
+    if not frames:
+        return counts
+    fbytes = int(np.prod(frames[0]["image"].shape))
+    vram_left = 0
+    if store == "auto" and torch.cuda.is_available():
+        free, _total = torch.cuda.mem_get_info()
+        reserve = int(1.3 * (3 * 1024**3 + cap_max * 1800))
+        vram_left = max(0, free - reserve)
+    # memmap (disk) frames first, then RAM frames
+    for f in sorted(frames, key=lambda f: not isinstance(f["image"], np.memmap)):
+        if vram_left < fbytes:
+            break
+        img = f["image"]
+        f["_host"] = img
+        f["image"] = torch.from_numpy(np.array(img)).to(device)
+        vram_left -= fbytes
+    for f in frames:
+        img = f["image"]
+        if torch.is_tensor(img):
+            counts["vram"] += 1
+        elif isinstance(img, np.memmap):
+            counts["disk"] += 1
+        else:
+            counts["ram"] += 1
+    print(
+        f"  frame store: {counts['vram']} in VRAM, {counts['ram']} in RAM, "
+        f"{counts['disk']} on disk ({fbytes / 1e6:.0f} MB/frame, store={store})",
+        flush=True,
+    )
+    return counts
+
+
+def demote_vram_frames(frames):
+    """Hand every VRAM-resident frame back to its host/disk copy, freeing that
+    VRAM for training. Returns how many were moved."""
+    n = 0
+    for f in frames:
+        if "_host" in f:
+            f["image"] = f.pop("_host")
+            n += 1
+    return n
+
+
 def train_splat(
     frames,
     pts,
@@ -1059,6 +1159,7 @@ def train_splat(
     depth_loss: float = 0.0,
     means_lr_decay: float = 0.01,
     antialiased: bool = True,
+    frame_store: str = "auto",
 ):
     import cv2
     import numpy as np
@@ -1303,15 +1404,31 @@ def train_splat(
             return _se3_exp(pose_delta[fi]) @ f["viewmat_t"]
         return f["viewmat_t"]
 
-    # Images stay uint8 on the host; only the sampled frame is uploaded and
-    # converted each step (~10 MB — negligible next to the render). Pre-pinning
-    # float32 copies of every frame doubled a tens-of-GB cache and OOM-killed
-    # the host at downscale 2.
+    # Images stay uint8 (VRAM, RAM or disk — see place_frames) and are
+    # converted to float only for the sampled crop. Pre-pinning float32 copies
+    # of every frame doubled a tens-of-GB cache and OOM-killed the host at
+    # downscale 2. Disk-tier frames are read one step ahead on a background
+    # thread (_prefetch) so the disk read overlaps the previous render.
     def frame_gt(f, y0=0, x0=0, ch=None, cw=None):
         img = f["image"]
+        if torch.is_tensor(img):  # VRAM-resident: crop on the GPU, no copy
+            if ch is not None:
+                img = img[y0 : y0 + ch, x0 : x0 + cw]
+            return img.float().div_(255.0)
+        fut = f.pop("_pref", None)
+        if fut is not None:
+            img = fut.result()
         if ch is not None:
-            img = np.ascontiguousarray(img[y0 : y0 + ch, x0 : x0 + cw])
-        return torch.from_numpy(img).to(device).float().div_(255.0)
+            img = img[y0 : y0 + ch, x0 : x0 + cw]
+        return torch.from_numpy(np.ascontiguousarray(img)).to(device).float().div_(255.0)
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    _pref_pool = ThreadPoolExecutor(max_workers=1)
+
+    def prefetch(f):
+        if isinstance(f["image"], np.memmap) and "_pref" not in f:
+            f["_pref"] = _pref_pool.submit(np.array, f["image"])
 
     # Effective render-patch cap. Starts at the requested --patch-size but
     # auto-shrinks if a training step hits a CUDA OOM (huge frames + a full 6M
@@ -1347,6 +1464,8 @@ def train_splat(
             f["radial_t"] = torch.tensor(
                 f["radial"], dtype=torch.float32, device=device
             )[None]
+
+    place_frames(frames, device, cap_max, frame_store)
 
     rng = np.random.default_rng(0)
     order = rng.permutation(len(frames))
@@ -1534,6 +1653,8 @@ def train_splat(
         fi = int(order[cur])
         f = frames[fi]
         cur += 1
+        if cur < len(order):  # read the next disk-tier frame during this step
+            prefetch(frames[int(order[cur])])
         try:
             loss = run_step(step, fi, f)
         except RuntimeError as exc:
@@ -1555,6 +1676,18 @@ def train_splat(
 
             gc.collect()
             torch.cuda.empty_cache()
+            # Cheapest give-back first: frames cached in VRAM are only a speed
+            # optimisation, so hand that memory to training before trading
+            # away render size.
+            n_dem = demote_vram_frames(frames)
+            if n_dem:
+                torch.cuda.empty_cache()
+                print(
+                    f"  step {step}: CUDA out of memory — moved {n_dem} "
+                    "VRAM-cached frame(s) back to host and continuing",
+                    flush=True,
+                )
+                continue
             H, W = f["image"].shape[:2]
             base = eff_patch[0] or max(H, W)
             if base <= MIN_PATCH:
@@ -1614,6 +1747,7 @@ def train_splat(
             pct = 10 + int(85 * step / max(iters, 1))
             progress(min(pct, 95), f"Training splat {step}/{iters}…")
     print(f"PROGRESS {iters}/{iters}", flush=True)
+    _pref_pool.shutdown(wait=False, cancel_futures=True)
 
     # Train-view PSNR readout (cheap sanity / quality gauge). Uses the per-frame
     # appearance transform so PSNR reflects fit, not exposure mismatch.
@@ -1653,6 +1787,13 @@ def train_splat(
 
 
 def main():
+    # The app cancels a job with SIGTERM, whose default action skips atexit —
+    # leaking the tens-of-GB frame/depth caches in <project>/cache on every
+    # cancel. Turning it into SystemExit lets the registered cleanup run.
+    import signal
+
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+
     p = argparse.ArgumentParser()
     p.add_argument("--scan", required=True)
     p.add_argument("--output", required=True)
@@ -1732,10 +1873,18 @@ def main():
     p.add_argument(
         "--memmap-frames",
         action="store_true",
-        help="stream undistorted frames to an on-disk memmap instead of holding "
-        "them all in host RAM — keeps RSS flat regardless of resolution × frame "
-        "count (essential for downscale-1 / high undistort-scale, where the RAM "
-        "cache can exceed host memory).",
+        help="hold undistorted frames in host RAM only while it has room and "
+        "spill the rest to an on-disk memmap — bounds RSS regardless of "
+        "resolution × frame count (essential for downscale-1 / high "
+        "undistort-scale, where the frames can exceed host memory).",
+    )
+    p.add_argument(
+        "--frame-store",
+        choices=["auto", "ram", "disk"],
+        default="auto",
+        help="where training keeps the frames: auto = VRAM while it fits "
+        "beside the model, then host RAM, then the disk cache; ram = skip "
+        "VRAM; disk = leave them in the --memmap-frames cache (old behaviour).",
     )
     p.add_argument(
         "--frame-cache-dir",
@@ -2028,6 +2177,7 @@ def main():
         frame_masks=args.frame_masks,
         memmap_frames=args.memmap_frames,
         frame_cache_dir=args.frame_cache_dir,
+        ram_frames=args.frame_store != "disk",
         fisheye_intrinsics=(
             [float(v) for v in args.fisheye_intrinsics.split(",")]
             if args.fisheye_intrinsics
@@ -2073,6 +2223,7 @@ def main():
             pose_reg=args.pose_reg,
             patch_size=args.patch_size,
             densify_strategy=args.densify_strategy,
+            frame_store=args.frame_store,
             aniso_cap=args.aniso_cap,
             depth_loss=args.depth_loss,
             means_lr_decay=args.means_lr_decay,
